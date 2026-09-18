@@ -1,0 +1,93 @@
+name: Package Windows and Linux
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.platform }} x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows
+          - os: ubuntu-22.04
+            platform: linux
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      BUILD_OUTPUT: ${{ github.workspace }}/.ci-build
+      PUBLISH_OUTPUT: ${{ github.workspace }}/.ci-artifacts
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt 'pyinstaller>=6.11,<7'
+
+      - name: Build and lint frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          npm --prefix frontend run lint
+
+      - name: Run backend regression tests
+        run: python -m unittest test_perf test_adb
+
+      - name: Locate Windows installer compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $compiler)) {
+            throw 'Inno Setup 6 is missing from the Windows runner'
+          }
+          Split-Path $compiler | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Check Linux installer tools
+        if: runner.os == 'Linux'
+        run: |
+          command -v dpkg-deb
+          test "$(dpkg --print-architecture)" = amd64
+
+      - name: Build native packages
+        run: python packaging/build.py --skip-frontend --output-dir "$BUILD_OUTPUT"
+
+      - name: Verify checksums and smoke-test extracted application
+        run: python packaging/verify_build.py --output-dir "$BUILD_OUTPUT" --publish-dir "$PUBLISH_OUTPUT"
+
+      - name: Upload verified packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: SysMonitor-${{ matrix.platform }}-x64-${{ github.run_number }}
+          path: ${{ env.PUBLISH_OUTPUT }}/*
+          if-no-files-found: error
+          retention-days: 30
