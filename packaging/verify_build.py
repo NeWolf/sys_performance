@@ -1,8 +1,10 @@
 """Verify release checksums and smoke-test the extracted portable application."""
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import platform
+import plistlib
 import re
 import shutil
 import socket
@@ -63,14 +65,48 @@ def smoke(command, folder):
             print(log.read())
 
 
+def verify_payload(payload, folder, system):
+    resource = payload / "_internal/frontend/src/sysmonitor_test/sysmonitor"
+    if not resource.is_file() or not resource.stat().st_size:
+        raise RuntimeError("Android collector missing from application")
+    executable = payload / ("SysMonitor.exe" if system == "Windows" else "SysMonitor")
+    if not executable.is_file():
+        raise RuntimeError("Packaged server is missing")
+    if system == "Darwin":
+        subprocess.run(["lipo", str(executable), "-verify_arch", platform.machine()], check=True)
+    smoke([str(executable)], folder)
+
+
+def verify_dmg(archive, folder):
+    mount = folder / "mounted image"
+    mount.mkdir()
+    subprocess.run(["hdiutil", "attach", str(archive.resolve()), "-readonly",
+                    "-nobrowse", "-mountpoint", str(mount)], check=True)
+    try:
+        contents = mount / "SysMonitor.app/Contents"
+        with (contents / "Info.plist").open("rb") as handle:
+            info = plistlib.load(handle)
+        if info.get("CFBundleExecutable") != "SysMonitor" or info.get("CFBundlePackageType") != "APPL":
+            raise RuntimeError("Invalid macOS application metadata")
+        for launcher in (contents / "MacOS/SysMonitor", contents / "Resources/Start.command"):
+            if not launcher.is_file() or not os.access(launcher, os.X_OK):
+                raise RuntimeError(f"Missing or non-executable macOS launcher: {launcher}")
+        verify_payload(contents / "Resources/server", folder, "Darwin")
+    finally:
+        # Detach even when metadata, resource or server checks fail.
+        result = subprocess.run(["hdiutil", "detach", str(mount)])
+        if result.returncode:
+            subprocess.run(["hdiutil", "detach", "-force", str(mount)], check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--publish-dir", required=True, type=Path)
     args = parser.parse_args()
     system = platform.system()
-    if system not in ("Windows", "Linux"):
-        parser.error("Release verification supports Windows and Linux")
+    if system not in ("Windows", "Linux", "Darwin"):
+        parser.error("Release verification supports Windows, Linux and macOS")
     manifests = list(args.output_dir.glob("*/SHA256SUMS"))
     if len(manifests) != 1:
         raise RuntimeError("Expected exactly one build in the output directory")
@@ -82,28 +118,30 @@ def main():
             raise RuntimeError("Invalid checksum manifest entry")
         artifact = manifest.parent / name
         with artifact.open("rb") as handle:
-            actual = hashlib.file_digest(handle, "sha256").hexdigest()
+            checksum = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                checksum.update(chunk)
+            actual = checksum.hexdigest()
         if actual != digest:
             raise RuntimeError(f"Checksum mismatch: {name}")
         artifacts.append(artifact)
-    suffixes = (".zip", "-setup.exe") if system == "Windows" else (".tar.gz", ".deb")
-    if len(artifacts) != 2 or any(sum(p.name.endswith(s) for p in artifacts) != 1 for s in suffixes):
-        raise RuntimeError("Both portable archive and native installer are required")
+    suffixes = {"Windows": (".zip", "-setup.exe"), "Linux": (".tar.gz", ".deb"),
+                "Darwin": (".dmg",)}[system]
+    if len(artifacts) != len(suffixes) or any(sum(p.name.endswith(s) for p in artifacts) != 1 for s in suffixes):
+        raise RuntimeError("Required release artifacts missing: " + ", ".join(suffixes))
     archive = next(p for p in artifacts if p.name.endswith(suffixes[0]))
     with tempfile.TemporaryDirectory(prefix="sysmonitor smoke ") as temporary:
         folder = Path(temporary)
-        if system == "Windows":
-            with zipfile.ZipFile(archive) as bundle:
-                bundle.extractall(folder)
+        if system == "Darwin":
+            verify_dmg(archive, folder)
         else:
-            with tarfile.open(archive) as bundle:
-                bundle.extractall(folder, filter="data")
-        payload = folder / "SysMonitor"
-        resource = payload / "_internal/frontend/src/sysmonitor_test/sysmonitor"
-        if not resource.is_file() or not resource.stat().st_size:
-            raise RuntimeError("Android collector missing from portable archive")
-        executable = payload / ("SysMonitor.exe" if system == "Windows" else "SysMonitor")
-        smoke([str(executable)], folder)
+            if system == "Windows":
+                with zipfile.ZipFile(archive) as bundle:
+                    bundle.extractall(folder)
+            else:
+                with tarfile.open(archive) as bundle:
+                    bundle.extractall(folder, filter="data")
+            verify_payload(folder / "SysMonitor", folder, system)
     args.publish_dir.mkdir(parents=True, exist_ok=False)
     for artifact in [*artifacts, manifest]:
         shutil.copy2(artifact, args.publish_dir / artifact.name)

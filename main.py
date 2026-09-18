@@ -1,6 +1,7 @@
 """Start the local sysmonitor analysis workspace."""
 import argparse
 import os
+import sys
 import threading
 import time
 import webbrowser
@@ -12,6 +13,11 @@ from perf_api import create_app
 
 
 def main():
+    # Frozen Python may ignore PYTHONIOENCODING; redirected Windows streams
+    # otherwise use a locale encoding that cannot represent Chinese messages.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description="sysmonitor 本地离线分析工具")
     parser.add_argument("--port", type=int, default=8765, help="本机服务端口，默认 8765")
     parser.add_argument("--database", type=Path, default=Path.home() / ".sysmonitor" / "sessions.sqlite3",

@@ -1370,6 +1370,7 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(client.get("/api/sessions", headers=self.headers).status_code, 403)
 
     def test_real_http_cli_and_static_assets(self):
+        import os
         import re
         import socket
         import subprocess
@@ -1382,7 +1383,8 @@ class ApiTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, "main.py", "--port", str(port), "--database",
              str(Path(self.temp.name) / "smoke.sqlite3")],
-            cwd=Path(__file__).parent, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cwd=Path(__file__).parent, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={**os.environ, "PYTHONUTF8": "0", "PYTHONIOENCODING": "cp1252:strict"})
         try:
             with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5, trust_env=False) as client:
                 deadline = time.monotonic() + 10
