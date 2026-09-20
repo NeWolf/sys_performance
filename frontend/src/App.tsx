@@ -19,15 +19,15 @@ export default function App() {
 }
 
 const workspaceViews = [
-  { id: 'analysis', label: '性能分析', description: '系统总览、进程排行与日志质量' },
-  { id: 'report', label: '配置与导出', description: '保留分析配置 · 全部进程统计，离线展开逐进程 CPU 整机对比与 RSS（不含配置与组）' },
-  {id: 'capture', label: '数据采集', description: '本地导入与 ADB 设备采集' },
+  { id: 'capture', label: '数据集', description: 'ADB 设备采集 · 本地日志导入' },
+  { id: 'analysis', label: '性能分析', description: '系统资源、进程排行、趋势叠加与精确合并' },
+  { id: 'report', label: '配置与导出', description: '分析配置与离线交互 HTML 报告下载' },
   { id: 'advanced', label: '高级功能', description: '采样间隔与采集写入选项' },
 ] as const
 type WorkspaceView = typeof workspaceViews[number]['id']
 
 function Workspace() {
-  const [view, setView] = useState<WorkspaceView>('analysis')
+  const [view, setView] = useState<WorkspaceView>('capture')
   const currentView = workspaceViews.find((item) => item.id === view)!
   const guard = useEditGuard()
   const [revision, setRevision] = useState(0)
@@ -104,7 +104,7 @@ function Workspace() {
   }
 
   function exportReport() {
-    if (!activeId || !guard.confirm('有未保存的分析配置或进程组。精简报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃当前草稿。是否继续下载？')) return
+    if (!activeId || !guard.confirm('有未保存的分析配置或进程组。离线交互报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃当前草稿。是否继续下载？')) return
     void perform('正在生成 HTML 报告…', async (signal) => {
       const response = await apiResponse(`${sessionPath(activeId)}/report`, { signal })
       const blob = await response.blob()
@@ -146,10 +146,13 @@ function Workspace() {
         <header className="topbar"><span>性能工作台 <b>/</b> {currentView.label}</span><span className="badge">本地服务 · 127.0.0.1</span></header>
         <div className="main-content">
           <div className="page-heading"><div><p className="eyebrow">ANDROID / {currentView.label}</p><h1>{currentView.label}</h1><p>{currentView.description}{active && (view === 'analysis' || view === 'report') ? ` · 当前会话：${active.name}` : ''}</p></div>
-            <div className="actions">{view === 'report' && <button className="primary" disabled={!activeId || guard.busy} onClick={exportReport}>导出精简 HTML 报告</button>}{(view === 'analysis' || view === 'report') && <button className="danger" disabled={!activeId || guard.busy} onClick={deleteSession}>删除会话</button>}</div>
+            <div className="actions">{view === 'report' && <button className="primary" disabled={!activeId || guard.busy} onClick={exportReport}>导出离线交互 HTML 报告</button>}{(view === 'analysis' || view === 'report') && <button className="danger" disabled={!activeId || guard.busy} onClick={deleteSession}>删除会话</button>}</div>
           </div>
+          <Devices view={view} onAdvanced={() => setView('advanced')} disabled={guard.busy} onImported={(id) => { setSelected(id); setRevision((value) => value + 1); setView('analysis') }} />
           <ViewPanel active={view === 'capture'}>
-            <form className="panel import-form capture-import" onSubmit={importFiles}>
+            <details className="panel local-import">
+              <summary>导入本地日志 <span>已有日志文件时展开</span></summary>
+            <form className="import-form capture-import" onSubmit={importFiles}>
               <h2>导入本地日志</h2><p>每次最多 5 个文件，单文件最大 1 GB，仅发送给本地分析服务。大文件解析需要较长时间及足够磁盘空间。</p>
               <label className="file-picker">选择日志文件<input ref={fileInput} type="file" multiple disabled={guard.busy} onChange={(event) => setFiles(Array.from(event.target.files || []))} /></label>
               {files.length > 0 && <div className="file-selection"><strong>已选择 {files.length} 个文件</strong><ul>{files.map((file, index) => <li key={index} title={file.name}>{file.name} · {formatMemory(file.size / 1024)}</li>)}</ul></div>}
@@ -157,14 +160,14 @@ function Workspace() {
               <input id="session-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={160} placeholder="例如：冷启动 · 第一次采集" disabled={guard.busy} />
               <button className="primary" type="submit" disabled={!files.length || guard.busy}>{busy.startsWith('正在本地') ? '正在解析…' : '导入并分析'}</button>
             </form>
+            </details>
           </ViewPanel>
-          <Devices view={view} onAdvanced={() => setView('advanced')} disabled={guard.busy} onImported={(id) => { setSelected(id); setRevision((value) => value + 1); setView('analysis') }} />
-          {guard.dirty && <div className="banner warning" role="status">有未保存的进程组或人工分析配置，请在对应表单保存以保留用于分析。精简报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃草稿。</div>}
+          {guard.dirty && <div className="banner warning" role="status">有未保存的进程组或人工分析配置，请在对应表单保存以保留用于分析。离线交互报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃草稿。</div>}
           {busy &&<div className="banner info" role="status">{busy} 请勿关闭页面。</div>}
           {error && <div className="banner error" role="alert">{error}</div>}
           {notice && <div className="banner success" role="status">{notice}</div>}
           <ViewPanel active={view === 'analysis' || view === 'report'}>
-            {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} /> : <section className="empty-state panel"><img className="empty-symbol" src="/tj.png" alt="sysmonitor 标志" /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据采集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据采集</button></section>}
+            {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} /> : <section className="empty-state panel"><img className="empty-symbol" src="/tj.png" alt="sysmonitor 标志" /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据集</button></section>}
           </ViewPanel>
         </div>
       </main>

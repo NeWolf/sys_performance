@@ -22,9 +22,9 @@ export function ReportConfig({ id, disabled, onSaved }: { id: string; disabled: 
   const path = `${sessionPath(id)}/report-settings`
   const { data, loading, error } = useResource<Partial<ReportSettings>>(path, revision)
   return <>
-    <div className="section-heading"><h2>人工分析配置（原报告配置）</h2><span>保留用于分析 · 不写入精简报告</span></div>
+    <div className="section-heading"><h2>人工分析配置（原报告配置）</h2><span>保留用于分析 · 不写入离线交互报告</span></div>
     <section className="panel config-panel">
-      <p>精简 HTML 报告直接取原始数据，展示全部进程的统计数据；点击各进程详情可展开 CPU（整机口径）与系统总 CPU 对比图及进程 RSS 图。报告无脚本，可离线查看。</p>
+      <p>离线交互 HTML 报告直接取原始数据，展示系统资源、全部同段同名进程和 Excel 49项核对，包含 CPU、RSS、物理与逻辑 I/O。支持离线搜索排序、曲线叠加和同段精确合并；未采集标记缺失，I/O 不作判定。脚本关闭时仍可查看静态表格和进程图。</p>
       <p className="banner info">原有配置与进程组仍可保存用于分析。下载不再包含六章节、人工环境与结论、进程组或配置（无论是否已保存）；草稿不会自动保存。</p>
       {loading && <p role="status">正在读取人工分析配置…</p>}
       {error && <p className="banner error" role="alert">{error} <button disabled={disabled} onClick={() => setRevision((v) => v + 1)}>重试读取</button></p>}
@@ -73,6 +73,6 @@ function ReportForm({ path, initial, disabled, reload, onSaved }: { path: string
       <span>{dirty ? '有未保存改动' : '无未保存改动'}</span>
     </div></fieldset>
     {mutation.error && <p className="banner error" role="alert">{mutation.error} 草稿已保留，请再次点击保存重试。</p>}
-    {saved && !dirty && <p className="banner success" role="status">人工分析配置已保存，保留用于分析；精简 HTML 报告直接取原始数据，不包含这些配置。</p>}
+    {saved && !dirty && <p className="banner success" role="status">人工分析配置已保存，保留用于分析；离线交互 HTML 报告直接取原始数据，不包含这些配置。</p>}
   </form>
 }

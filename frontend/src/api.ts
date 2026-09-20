@@ -46,6 +46,7 @@ export interface ProcessRow {
   pid: number
   name: string
   samples: number
+  // Process ranking CPU fields use raw cpu1c samples, not whole-device cpu.
   cpu_peak: MetricValue
   cpu_avg: MetricValue
   cpu_p95: MetricValue

@@ -11,7 +11,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   const [devices, setDevices] = useState<{ data: Device[]; loading: boolean; error: string }>({ data: [], loading: true, error: '' })
   const [serial, setSelected] = useState('')
   const connected = !devices.error && devices.data.some((device) => device.serial === serial && device.state === 'device')
-  const [interval, setInterval] = useState(1)
+  const [interval, setInterval] = useState(30)
   const [tologcat, setTologcat] = useState(false)
   const [asyncWrite, setAsyncWrite] = useState(false)
   const [busy, setBusy] = useState('')

@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "0.1.1"
+VERSION = "1.0.0"
 
 
 def run(*args):
@@ -41,7 +41,10 @@ def main():
         run(npm, "--prefix", "frontend", "ci")
         run(npm, "--prefix", "frontend", "run", "build")
         run(npm, "--prefix", "frontend", "run", "lint")
-    for resource in ("frontend/dist/index.html", "frontend/src/sysmonitor_test/sysmonitor"):
+    for resource in ("frontend/dist/index.html", "frontend/src/sysmonitor_test/sysmonitor",
+                     "report_assets/report.css", "report_assets/report.js",
+                     "report_assets/vendor/echarts.min.js", "report_assets/vendor/ECHARTS-LICENSE",
+                     "report_assets/vendor/ECHARTS-NOTICE"):
         if not (ROOT / resource).is_file():
             parser.error("Missing resource: " + resource)
     arch = platform.machine().lower()
@@ -54,6 +57,7 @@ def main():
         "--workpath", output / "work", "--specpath", output,
         "--add-data", str(ROOT / "frontend/dist") + ":frontend/dist",
         "--add-data", str(ROOT / "frontend/src/sysmonitor_test/sysmonitor") + ":frontend/src/sysmonitor_test",
+        "--add-data", str(ROOT / "report_assets") + ":report_assets",
         ROOT / "main.py")
     payload = output / "portable" / "SysMonitor"
     artifacts = []

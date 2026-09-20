@@ -1,1 +1,3 @@
 - [sysmonitor 性能工具的项目目标与实施决策](project_direction.md) — 用户确认跨平台 PC 分析 Android sysmonitor 日志，先离线分析再 ADB 和实时，上传与 AI 后置。
+
+- [区分整机CPU百分比与进程单核算力口径](feedback_report_cpu_basis.md) — 整体概览整机满载100%，进程统计及KDMIPS换算仍使用单核CPU

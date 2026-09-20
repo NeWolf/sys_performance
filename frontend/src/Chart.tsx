@@ -13,10 +13,15 @@ export interface Metric {
   field: string
   label: string
 }
+export interface ReferenceMetric extends Metric {
+  data?: SeriesData
+  scale?: number
+}
 interface ChartProps {
   title: string
   unit: string
   metrics: Metric[]
+  references?: ReferenceMetric[]
   data?: SeriesData
   loading?: boolean
   error?: string
@@ -29,15 +34,16 @@ interface ChartProps {
 
 // 数值格式化与请求类型统一来自 API 层。
 
-export function SeriesChart({ title, unit, metrics, data, loading, error, mode = 'line', note, percentiles, defaultShowPercentiles = false }: ChartProps) {
+export function SeriesChart({ title, unit, metrics, references, data, loading, error, mode = 'line', note, percentiles, defaultShowPercentiles = false }: ChartProps) {
   const [showPercentiles, setShowPercentiles] = useState(defaultShowPercentiles)
   const hasPercentiles = metrics.some(({ field }) => [percentiles?.[field]?.p95, percentiles?.[field]?.p99].some((value) => typeof value === 'number' && Number.isFinite(value)))
   const host = useRef<HTMLDivElement>(null)
   const memoryUnit = unit === 'MB' ? 'MB' : unit.startsWith('KB') ? 'KB' : null
   const displayUnit = memoryUnit ? `容量（自动换算）${unit.includes('周期') ? ' / 周期' : ''}` : unit
-  const hasData = Boolean(data?.points.some((point) => metrics.some(({ field }) => typeof point[field] === 'number')))
+  const hasData = Boolean(data?.points.some((point) => metrics.some(({ field }) => typeof point[field] === 'number' && Number.isFinite(point[field])))
+    || references?.some(({ data: source, field }) => source?.points.some((point) => typeof point[field] === 'number' && Number.isFinite(point[field]))))
   useEffect(() => {
-    if (!host.current || !data || !hasData || loading || error) return
+    if (!host.current || !hasData || loading || error) return
     const element = host.current
     let chart: ReturnType<typeof init> | undefined
     const option: EChartsOption = {
@@ -65,6 +71,7 @@ export function SeriesChart({ title, unit, metrics, data, loading, error, mode =
       xAxis: {
         type: 'time', min: 'dataMin', max: 'dataMax', name: '本地时间', nameLocation: 'middle', nameGap: 47,
         axisLabel: { hideOverlap: true, formatter: (value: number) => formatTime(value, 'axis') },
+        axisPointer: { label: { formatter: (params) => formatTime(Number(params.value)) } },
         splitLine: { show: false }, axisLine: { lineStyle: { color: '#d9e1ec' } },
       },
       yAxis: {
@@ -73,22 +80,27 @@ export function SeriesChart({ title, unit, metrics, data, loading, error, mode =
         splitLine: { lineStyle: { color: '#edf1f6', type: 'dashed' } },
       },
       dataZoom: [{ type: 'inside' }, { type: 'slider', height: 16, bottom: 2, borderColor: 'transparent', labelFormatter: (value: number) => formatTime(value) }],
-      series: metrics.map(({ field, label }) => {
+      series: [
+        ...metrics.map((metric) => ({ ...metric, data, scale: 1, reference: false })),
+        ...(references ?? []).map((metric) => ({ ...metric, reference: true })),
+      ].map(({ field, label, data: source, scale = 1, reference }) => {
+        const seriesMode = reference ? 'line' : mode
         const values: (number | null)[][] = []
-        data.points.forEach((point, index) => {
-          const previous = data.points[index - 1]
-          // 不连接缺失周期；采样后的间隔也不伪造连续值。
-          if (mode === 'line' && previous && (point.segment !== previous.segment || point.pid !== previous.pid || point.cycle > previous.cycle + 1)) {
+        source?.points.forEach((point, index) => {
+          const previous = source.points[index - 1]
+          // 各曲线保留自身时间与周期，不对独立降采样的数据按数组下标拼接。
+          if (seriesMode === 'line' && previous && (point.segment !== previous.segment || point.pid !== previous.pid || point.cycle > previous.cycle + 1 || point.ts <= previous.ts)) {
             values.push([point.ts, null])
           }
           const value = point[field]
-          values.push([point.ts, typeof value === 'number' && Number.isFinite(value) ? value : null])
+          values.push([point.ts, typeof value === 'number' && Number.isFinite(value) ? value * scale : null])
         })
         return {
-          name: label, type: mode, data: values, connectNulls: false,
-          showSymbol: true, symbolSize: mode === 'scatter' ? 6 : 3,
-          lineStyle: { width: 2 }, emphasis: { focus: 'series' },
-          markLine: showPercentiles ? {
+          name: label, type: seriesMode, data: values, connectNulls: false,
+          showSymbol: true, symbolSize: seriesMode === 'scatter' ? 6 : 3,
+          lineStyle: { width: reference ? 3 : 2, type: reference ? 'dashed' : 'solid' },
+          z: reference ? 4 : 3, emphasis: { focus: 'series' },
+          markLine: showPercentiles && !reference ? {
             silent: true, symbol: 'none',
             lineStyle: { type: 'dashed', width: 1 },
             label: { show: true, position: 'insideEndTop', formatter: '{b}' },
@@ -114,7 +126,7 @@ export function SeriesChart({ title, unit, metrics, data, loading, error, mode =
     observer.observe(element)
     resize()
     return () => { observer.disconnect(); chart?.dispose() }
-  }, [data, metrics, title, unit, mode, hasData, loading, error, memoryUnit, displayUnit, percentiles, showPercentiles])
+  }, [data, metrics, references, title, unit, mode, hasData, loading, error, memoryUnit, displayUnit, percentiles, showPercentiles])
 
   return (
     <section className="panel chart-panel" aria-label={title}>

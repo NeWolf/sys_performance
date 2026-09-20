@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from perf_metrics import resource_settings
 
 from perf_adb import AdbController, AdbError
-from perf_report import render_report
+from perf_report import REPORT_CSP, render_report
 from perf_store import Store
 
 MAX_FILE_BYTES = 1024 * 1024 * 1024
@@ -256,6 +256,12 @@ def create_app(database, port=8765, development=False, frontend=None):
                name: Optional[str] = Query(None, max_length=1024 * 1024)):
         return store.series(session_id, kind, limit, pid, segment, name)
 
+    @app.get("/api/sessions/{session_id}/process-references")
+    def process_references(session_id: str,
+                           segment: int = Query(..., ge=0, le=2**63 - 1),
+                           limit: int = Query(1500, ge=64, le=5000)):
+        return store.process_references(session_id, segment, limit)
+
     @app.get("/api/sessions/{session_id}/statistics")
     def statistics(session_id: str, kind: Literal["S", "P", "D", "DE", "DP"],
                    pid: Optional[int] = Query(None, ge=0, le=2**63 - 1),
@@ -323,7 +329,7 @@ def create_app(database, port=8765, development=False, frontend=None):
     def report(session_id: str):
         return HTMLResponse(render_report(store, session_id), headers={
             "Content-Disposition": 'attachment; filename="sysmonitor-report.html"',
-            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+            "Content-Security-Policy": REPORT_CSP + "; sandbox allow-scripts",
         })
 
     @app.get("/api/{remaining:path}")

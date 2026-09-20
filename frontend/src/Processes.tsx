@@ -14,11 +14,12 @@ const sortOptions: { value: Sort; label: string }[] = [
   { value: 'write_kb', label: '累计写入' }, { value: 'wait_peak', label: 'wait 峰值' },
   { value: 'dmabuf_peak_kb', label: 'dmabuf 峰值' },
 ]
-const cpuMetrics = [{ field: 'cpu', label: 'CPU' }, { field: 'cpu1c', label: 'cpu1c（单核口径）' }]
+const cpuMetrics = [{ field: 'cpu1c', label: '进程 CPU（单核口径）' }]
 const rssMetrics = [{ field: 'rss_kb', label: 'RSS' }]
 const ioMetrics = [{ field: 'rd_kb', label: '周期读取' }, { field: 'wr_kb', label: '周期写入' }]
 const dmaMetrics = [{ field: 'size_kb', label: '进程 dmabuf' }]
 type ProcessPage = { items: ProcessRow[]; total: number; all_total: number }
+const kdmips = (value: ProcessRow['cpu_p95']) => n(value == null ? null : value / 100 * 28.75, 2)
 const identity = (row: ProcessRow) => JSON.stringify([row.segment, row.name])
 const pidLabel = (row: ProcessRow) => row.pid_changes > 3
   ? `PID变化${row.pid_changes}次`
@@ -54,7 +55,7 @@ export function Processes({ id, segment, onSegment, disabled, members = [], memb
   const pagingDisabled = disabled || resource.loading || searching || Boolean(resource.error)
   const active = selected?.segment === segment ? selected : null
   return <>
-    <div className="section-heading"><div><h2>进程资源排行</h2><p>同一时间段内按名称合并全部 PID，跨段不合并；统计原始样本，不按周期求和。点击进程查看趋势。</p></div>
+    <div className="section-heading"><div><h2>进程资源排行</h2><p>同一时间段内按名称合并全部 PID，跨段不合并；统计原始样本，不按周期求和。CPU 统计及排序均采用 cpu1c 单核口径，缺失不回退；P95K / P99K = 对应 CPU 百分比 ÷ 100 × 28.75，单位 KDMIPS（派生估算）。点击进程查看趋势。</p></div>
       <label>降序排列 <select value={sort} disabled={disabled} onChange={(event) => { setSort(event.target.value as Sort); setPage(0) }}>{sortOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
     </div>
     <section className="panel process-panel" aria-label="进程资源排行">
@@ -72,7 +73,7 @@ export function Processes({ id, segment, onSegment, disabled, members = [], memb
       {resource.loading ? <div className="loading-state" role="status">正在读取进程排行…</div>
         : resource.error ? <div className="banner error" role="alert">{resource.error} <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>
         : <div className="table-scroll"><table><thead><tr>
-          <th>序号</th>{onToggle && <th>加入组</th>}<th>进程名称 / PID</th><th>时间段</th><th>样本</th><th>CPU 峰值 %</th><th>CPU 均值 %</th><th>CPU P95 %</th><th>CPU P99 %</th><th>RSS 峰值</th><th>读取总量</th><th>写入总量</th><th>wait 峰值</th><th>dmabuf 峰值</th>
+          <th>序号</th>{onToggle && <th>加入组</th>}<th>进程名称 / PID</th><th>样本</th><th>CPU 峰值 %</th><th>CPU 均值 %</th><th>CPU P95 %</th><th>CPU P95K</th><th>CPU P99 %</th><th>CPU P99K</th><th>RSS 峰值</th><th>RSS P95</th><th>RSS P99</th><th>读取总量</th><th>写入总量</th><th>wait 峰值</th><th>dmabuf 峰值</th>
         </tr></thead><tbody>{rows.map((row, index) => (
           <tr key={identity(row)} className={active && identity(row) === identity(active) ? 'selected-row' : ''}>
             <td>{page * pageSize + index + 1}</td>
@@ -83,7 +84,7 @@ export function Processes({ id, segment, onSegment, disabled, members = [], memb
               })}</div>
             </details></td>}
             <td><button className="process-name" disabled={disabled} aria-pressed={Boolean(active && identity(row) === identity(active))} onClick={() => { setSelected(row); onSegment(row.segment) }}><strong>{row.name}</strong><small>{pidLabel(row)} · 查看趋势</small>{row.concurrent_pids && <small>存在并发同名 PID（变化不等于重启次数）</small>}</button></td>
-            <td>{row.segment}</td><td>{n(row.samples, 0)}</td><td>{n(row.cpu_peak)}</td><td>{n(row.cpu_avg)}</td><td>{n(row.cpu_p95)}</td><td>{n(row.cpu_p99)}</td><td>{formatMemory(row.rss_peak_kb)}</td><td>{formatMemory(row.read_kb)}</td><td>{formatMemory(row.write_kb)}</td><td>{n(row.wait_peak)}</td><td>{formatMemory(row.dmabuf_peak_kb)}</td>
+            <td>{n(row.samples, 0)}</td><td>{n(row.cpu_peak)}</td><td>{n(row.cpu_avg)}</td><td>{n(row.cpu_p95)}</td><td>{kdmips(row.cpu_p95)}</td><td>{n(row.cpu_p99)}</td><td>{kdmips(row.cpu_p99)}</td><td>{formatMemory(row.rss_peak_kb)}</td><td>{formatMemory(row.rss_p95_kb)}</td><td>{formatMemory(row.rss_p99_kb)}</td><td>{formatMemory(row.read_kb)}</td><td>{formatMemory(row.write_kb)}</td><td>{n(row.wait_peak)}</td><td>{formatMemory(row.dmabuf_peak_kb)}</td>
           </tr>
         ))}</tbody></table>{!rows.length && <div className="loading-state">{query ? '没有匹配的进程，请调整名称或 PID。' : '本页没有进程记录。'}</div>}</div>}
       <div className="pagination"><span>{resource.data ? `第 ${page + 1} / ${pageCount} 页 · 共 ${total} 条` : `第 ${page + 1} 页`} · 每页 {pageSize} 条 · — 表示未采集</span><div>
@@ -102,13 +103,24 @@ function ProcessDetail({ id, process, disabled, onClose }: { id: string; process
   const [revision, setRevision] = useState(0)
   const filters = { name: process.name }
   const resource = useResource<SeriesData>(seriesPath(id, 'P', process.segment, filters), revision)
+  const references = useResource<SeriesData>(`${sessionPath(id)}/process-references?segment=${process.segment}`, revision)
+  const referenceData = references.data
+  const cpuReferences = [{ field: 'cpu_total', label: '整机 CPU（总占用 ×8）', data: referenceData, scale: 8 }]
+  const memoryReferences = [{ field: 'mem_used_mb', label: '系统已使用内存', data: referenceData, scale: 1024 }]
+  const ioReferences = [
+    { field: 'rd_kb', label: '已采集进程 IO 合计 · 物理读', data: referenceData },
+    { field: 'wr_kb', label: '已采集进程 IO 合计 · 物理写', data: referenceData },
+  ]
   return <section className="process-detail" aria-label="选中进程明细">
     <div className="section-heading"><div><span className="eyebrow">进程深度分析</span><h2 className="wrap-text">{process.name}</h2><p>{pidLabel(process)} · 时间段 {process.segment} · 同名全部 PID 的原始样本统计，不按周期求和。</p><p>变化按相邻有效周期的 PID 集合计算，缺失周期不计变化。{process.concurrent_pids ? '存在并发同名 PID，集合变化不等于重启次数；趋势展示混合样本。' : ''}</p></div><button disabled={disabled} onClick={onClose}>收起明细</button></div>
     {resource.error && <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试进程趋势</button>}
+    {referenceData && <p className="chart-caption">参照范围：时间段 {process.segment} · {referenceData.sampled ? '周期合计后降采样' : '全部周期'} · 展示 {n(referenceData.points.length, 0)} / {n(referenceData.total, 0)} 个周期；参照与进程样本按各自时间戳绘制，不跨段连接。</p>}
+    {references.loading && <p role="status">正在读取系统与 IO 合计参照，进程趋势不受影响…</p>}
+    {references.error && <p role="alert" className="error">参照读取失败：{references.error} <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试参照</button></p>}
     <div className="chart-grid">
-      <SeriesChart title="进程 CPU / cpu1c" unit="%" metrics={cpuMetrics} {...resource} mode={process.concurrent_pids ? 'scatter' : 'line'} />
-      <SeriesChart title="进程驻留内存 RSS" unit="KB" metrics={rssMetrics} {...resource} mode={process.concurrent_pids ? 'scatter' : 'line'} />
-      <SeriesChart title="I/O 周期增量" unit="KB / 周期" metrics={ioMetrics} {...resource} mode="scatter" note="原始 rd_kb / wr_kb 增量，不再次差分；零值可能源于权限限制。" />
+      <SeriesChart title="进程与整机 CPU" unit="%" metrics={cpuMetrics} {...resource} references={cpuReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note="默认对比单核 CPU：整机总占用 ×8，满载 800%；进程使用 cpu1c，缺失不回退。点击图例可隐藏参照。" />
+      <SeriesChart title="进程 RSS 与系统已使用内存" unit="KB" metrics={rssMetrics} {...resource} references={memoryReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note="系统已使用内存＝总内存−MemAvailable，统一换算容量后与 RSS 对比；缺失不补零。" />
+      <SeriesChart title="I/O 周期增量" unit="KB / 周期" metrics={ioMetrics} {...resource} references={ioReferences} mode="scatter" note="原始读写增量，不再次差分；参照按同周期全部已采集 P 进程分别汇总物理读、物理写，不受排行搜索或分页影响。仅汇总有效值，可能不完整；无有效值时断开，零值可能源于权限限制。" />
       <Trend path={seriesPath(id, 'DP', process.segment, filters)} title="进程 dmabuf" unit="KB" metrics={dmaMetrics} mode="scatter" note="仅展示实际记录，不以零补齐缺失周期。" />
     </div>
     <StatisticsPanel title="选中进程 · P 全字段统计" path={statisticsPath(id, 'P', process.segment, filters)} trendPath={seriesPath(id, 'P', process.segment, filters)} disabled={disabled} />

@@ -1,6 +1,11 @@
+import base64
+import hashlib
 import io
+import json
+import re
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 
 from perf_parser import iter_records, parse_line, rotation_key
@@ -13,6 +18,97 @@ DE,946684800123,qcom_hgsl,1201.10,2394
 DE,946684800123,qcom system,1082.20,412
 DP,946684800123,1361,413664,78,/system/bin/surfaceflinger
 """
+
+
+class ReportMarkup(HTMLParser):
+    def __init__(self, report):
+        super().__init__()
+        self.tags = []
+        self.scripts = []
+        self.styles = []
+        self.processes = []
+        self.capture = None
+        self.feed(report)
+        self.close()
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self.tags.append((tag, attrs))
+        if tag == "details" and "process" in attrs.get("class", "").split():
+            self.processes.append(attrs)
+        if tag == "script":
+            self.scripts.append([attrs, ""])
+            self.capture = "script"
+        elif tag == "style":
+            self.capture = "style"
+
+    def handle_endtag(self, tag):
+        if tag == self.capture:
+            self.capture = None
+
+    def handle_data(self, data):
+        if self.capture == "script":
+            self.scripts[-1][1] += data
+        elif self.capture == "style":
+            self.styles.append(data)
+
+
+class ReportAssertions:
+    def assert_report(self, report):
+        from perf_report_ui import JS, REPORT_CSP
+
+        markup = ReportMarkup(report)
+        self.assertEqual(len(markup.scripts), 2)
+        (json_attrs, raw), (js_attrs, script) = markup.scripts
+        self.assertEqual(json_attrs, {"type": "application/json", "id": "report-data"})
+        self.assertEqual(js_attrs, {})
+        self.assertEqual(script, JS)
+        digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+        directives = dict(part.strip().split(" ", 1) for part in REPORT_CSP.split(";"))
+        self.assertEqual(directives["script-src"], "'sha256-" + digest + "'")
+        self.assertEqual(directives["default-src"], "'none'")
+        self.assertNotRegex(raw, r"[<>&]")
+        data = json.loads(raw)
+        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual(data["process_fields"],
+                         ["cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb"])
+        self.assertEqual(data["full_cycle_schema"], ["cycle", "ts", *data["process_fields"],
+                         "pids", "duplicate_pids", "p_records", "dp_records",
+                         "first_record_id", "last_record_id", "timestamp_conflict"])
+        self.assertEqual(data["cycle_axis_schema"], ["cycle", "ts"])
+        self.assertEqual(len(markup.processes), len(data["processes"]))
+        self.assertEqual({p["id"] for p in markup.processes},
+                         {"detail-" + p["id"] for p in data["processes"]})
+        forbidden = {"link", "iframe", "img", "object", "embed", "base", "form",
+                     "audio", "video", "source", "foreignobject", "use", "image", "animate", "set"}
+        self.assertFalse(forbidden.intersection(tag for tag, _ in markup.tags))
+        for tag, attrs in markup.tags:
+            self.assertFalse(any(key.startswith("on") for key in attrs), (tag, attrs))
+            self.assertFalse({"src", "srcset", "xlink:href", "srcdoc", "action"}.intersection(attrs))
+            if "href" in attrs:
+                self.assertTrue(attrs["href"].startswith("#"), attrs)
+            if "style" in attrs:
+                self.assertNotRegex(attrs["style"].lower(), r"url\s*\(|@import|expression\s*\(")
+            if tag == "meta":
+                self.assertNotEqual(attrs.get("http-equiv", "").lower(), "refresh")
+        policies = [attrs["content"] for tag, attrs in markup.tags
+                    if tag == "meta" and attrs.get("http-equiv", "").lower() == "content-security-policy"]
+        self.assertEqual(policies, [REPORT_CSP])
+        self.assertNotRegex("".join(markup.styles).lower(), r"url\s*\(|@import|expression\s*\(")
+        return data
+
+    def assert_metric(self, metric, count, values):
+        self.assertEqual(metric["count"], count)
+        self.assertEqual([metric[key] for key in ("min", "avg", "p95", "p99", "max")], values)
+
+    def report_svg(self, report, title):
+        import xml.etree.ElementTree as ET
+
+        roots = [ET.fromstring(svg) for svg in re.findall(r"<svg.*?</svg>", report)]
+        matches = [root for root in roots if root.get("aria-label") == title]
+        self.assertEqual(len(matches), 1, title)
+        self.assertEqual(matches[0].get("viewBox"), "0 0 900 240")
+        return matches[0]
 
 
 class ParserTests(unittest.TestCase):
@@ -41,7 +137,7 @@ class ParserTests(unittest.TestCase):
                          ["perf.4.log", "perf.1.log", "perf.log"])
 
 
-class StoreTests(unittest.TestCase):
+class StoreTests(ReportAssertions, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -49,6 +145,283 @@ class StoreTests(unittest.TestCase):
 
     def import_sample(self, text=SAMPLE):
         return self.store.import_files([("perf.log", io.BytesIO(text.encode()))])
+
+    def test_report_system_overview_100_percent_and_memory(self):
+        from perf_report_data import build_report_data
+        from perf_report_ui import prepare_display
+        from perf_report import render_report
+
+        # S-only logs must not need process ratios or inferred core counts.
+        rows = [f"S,{946684800000 + i * 30000},7,{i},20,10,2,3,{1000 - i},1000,999\n"
+                for i in range(1, 101)]
+        sid = self.import_sample("".join(rows))["id"]
+        raw = build_report_data(self.store, sid)
+        display = prepare_display(raw)
+        system = display["systems"][0]
+        metrics = system["metrics"]
+        for field, expected in (("cpu_total", [95, 99, 100]), ("cpu_idle", [94, 98, 99]),
+                                ("mem_used_mb", [95, 99, 100]), ("mem_total_mb", [1000] * 3),
+                                ("mem_avail_mb", [994, 998, 999])):
+            self.assertEqual(metrics[field]["count"], 100)
+            self.assertEqual([metrics[field][k] for k in ("p95", "p99", "max")], expected)
+        for field, expected in (("cpu_user", 20), ("cpu_sys", 10), ("cpu_iow", 2), ("cpu_irq", 3)):
+            self.assertEqual(metrics[field]["avg"], expected)
+        self.assertEqual(metrics["cpu_total"]["unit"], "%")
+        self.assertNotIn("core_evidence", system)
+        self.assertEqual([t["count"] for t in system["cpu_exceedances"]["thresholds"]], [10, 5, 1])
+        for point in system["series"]["points"]:
+            self.assertEqual(point["cpu_idle"], 100 - point["cpu_total"])
+            self.assertEqual(point["mem_used_mb"], point["mem_total_mb"] - point["mem_avail_mb"])
+            self.assertIsInstance(point["mem_used_mb"], int)
+        self.assertIn("mem_percent", raw["systems"][0]["metrics"])
+        self.assertNotIn("mem_percent", metrics)
+        self.assertEqual(prepare_display(display), display)
+        html = render_report(self.store, sid)
+        markup = ReportMarkup(html)
+        payload = json.loads(markup.scripts[0][1])
+        self.assertEqual(payload["systems"][0]["metrics"], metrics)
+        for phrase in ("整机 CPU 总占用", "满载 100%", "irq+softirq", "MemTotal", "MemAvailable", "P95", "P99"):
+            self.assertIn(phrase, html)
+        self.assertNotIn("核数证据", html)
+        from perf_report_ui import segment_html, time_label
+        section = segment_html(display, system).split('</section>', 1)[0]
+        self.assertIn("开始测试：2000年01月01日 00:00:30", section)
+        self.assertIn("结束时间：2000年01月01日 00:50:00", section)
+        self.assertIn("采集0小时49分钟30秒", section)
+        for removed in ("独立时段 · 时间回拨隔离", "全部周期", "系统样本", "进程名称（含 DP-only）", "存在活跃周期"):
+            self.assertNotIn(removed, section)
+        self.assertIn("内存指标", section)
+        self.assertNotIn("单位</th>", section)
+        total_row = section.split('>总内存</td>', 1)[1].split('</tr>', 1)[0]
+        self.assertEqual(total_row.count('>—</td>'), 2)
+        self.assertIn("采集0小时0分钟0秒", time_label({"cycle_axis": [[0, 0]]}))
+        self.assertIn("采集时长：—", time_label({"cycle_axis": [[0, None]]}))
+        self.assertIn("采集25小时1分钟1秒", time_label({"cycle_axis": [[0, 0], [1, 90061999]]}))
+
+    def test_report_overview_cpu_card_threshold_colors(self):
+        from copy import deepcopy
+        from perf_report_data import build_report_data
+        from perf_report_ui import CSS, prepare_display, segment_html
+
+        data = prepare_display(build_report_data(self.store, self.import_sample()["id"]))
+        for value, level in ((0, "low"), (69.99, "low"), (70, "medium"),
+                             (79.99, "medium"), (80, "high"), (80.01, "high"),
+                             (100, "high"), (None, "unknown")):
+            with self.subTest(value=value):
+                system = deepcopy(data["systems"][0])
+                system["metrics"]["cpu_total"]["avg"] = value
+                html = segment_html(data, system)
+                self.assertIn('class="overview-primary cpu-' + level + '"', html)
+                self.assertEqual(system["metrics"]["cpu_total"]["avg"], value)
+        for level, color in (("low", "#6bcb77"), ("medium", "#ffd93d"), ("high", "#ff6b6b")):
+            self.assertIn('.overview-primary.cpu-' + level + '{--cpu-color:' + color, CSS)
+        self.assertIn('.overview-primary .stat-header strong{font-size:32px;color:var(--cpu-color)}', CSS)
+
+    def test_report_overview_chart_percentiles_and_time(self):
+        import shutil
+        import subprocess
+        if not shutil.which("node"):
+            self.skipTest("Node.js is required for report chart checks")
+        source = Path("report_assets/report.js").read_text(encoding="utf-8")
+        prefix = source[:source.index("  const observer =")]
+        harness = """
+const assert = require('node:assert/strict');
+global.document = {
+  getElementById: () => ({textContent: JSON.stringify({process_fields:[],full_cycle_schema:[],cycle_axis_schema:[]})}),
+  documentElement: {classList:{add:()=>{}}}
+};
+"""
+        checks = """
+assert.equal(timeLabel(Date.UTC(2026,8,20,13,7,59)), '13:07:59');
+assert.equal(timeLabel(Date.UTC(2026,8,20,13,8,0)), '13:08:00');
+assert.equal(timeLabel(Date.UTC(2026,8,21,0,0,1,999)), '00:00:01');
+assert.equal(timeLabel(0), '00:00:00');
+assert.equal(timeLabel(null), '—');
+assert.equal(timeLabel(NaN), '—');
+assert.equal(timeLabel(1e20), '—');
+const points = [
+ {segment:0,cycle:1,ts:1000,cpu_total:10,_run_cpu_total:1},
+ {segment:0,cycle:3,ts:3000,cpu_total:20,_run_cpu_total:1},
+ {segment:0,cycle:4,ts:4000,cpu_total:30,_run_cpu_total:2},
+ {segment:0,cycle:5,ts:null,cpu_total:40,_run_cpu_total:3}
+];
+const series = overviewSeries(points,'cpu_total',{p95:95,p99:99},'#ff6b6b','%',true);
+assert.equal(series.length,2);
+assert.deepEqual(series[0].data, [[1000,10],[3000,20]]);
+assert.equal(series[0].lineStyle.width,3);
+assert.equal(series[0].markLine.lineStyle.type,'dashed');
+assert.deepEqual(series[0].markLine.data.map(x=>x.yAxis),[95,99]);
+assert.equal(series[1].markLine,undefined);
+assert.deepEqual(overviewSeries([], 'cpu_total', {p95:null,p99:null},'red','%',true),[]);
+const memory = overviewSeries([{segment:0,cycle:1,ts:1000,mem_used_mb:50}],
+ 'mem_used_mb',{p95:900,p99:990},'green','MB',true);
+assert.deepEqual(memory[0].markLine.data.map(x=>x.yAxis),[900,990]);
+data.system_fields = ['cpu_total','cpu_user','cpu_sys','cpu_iow','cpu_irq','cpu_idle','mem_total_mb','mem_avail_mb','mem_used_mb'];
+const overview = overviewOptions({series:{points:[{segment:0,cycle:1,ts:1000,
+ ...Object.fromEntries(data.system_fields.map(f => [f,50]))}]},
+ metrics:Object.fromEntries(data.system_fields.map(f => [f,{p95:80,p99:90}]))});
+assert.deepEqual(Object.entries(overview.cpu.legend.selected).filter(([,v])=>v),[['整机 CPU 总占用',true]]);
+assert.equal(overview.cpu.series.length,6);
+assert.deepEqual(overview.memory.legend.selected,{'已使用内存':true,'空闲内存':false});
+assert.deepEqual(overview.memory.series.map(s=>s.name),['已使用内存','空闲内存']);
+assert.equal(overview.memory.yAxis.name,undefined);
+for (const s of overview.memory.series) assert.deepEqual(s.markLine.data.map(x=>x.yAxis),[80,90]);
+assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
+})();
+"""
+        subprocess.run(["node", "-e", harness + prefix + checks], check=True, capture_output=True, text=True)
+
+    def test_report_process_table_and_reference_curves(self):
+        import shutil
+        import subprocess
+        from perf_report import render_report
+        from perf_report_ui import PROCESS_HEADERS, process_row
+
+        html = render_report(self.store, self.import_sample()["id"])
+        payload = json.loads(ReportMarkup(html).scripts[0][1])
+        self.assertLess(html.index("全进程 ·"), html.index("关联进程 ·"))
+        self.assertEqual(PROCESS_HEADERS[:2], ["序号", "原始进程名"])
+        self.assertEqual(PROCESS_HEADERS[-1], "PID变化")
+        self.assertFalse(any("覆盖" in h or "最大并发" in h for h in PROCESS_HEADERS))
+        for n, p in enumerate(payload["processes"], 1):
+            row = process_row(p, n)
+            self.assertEqual(len(row), len(PROCESS_HEADERS))
+            self.assertEqual(row[:2], [n, p["name"]])
+            self.assertEqual(row[-1], p["pid_changes"])
+        for removed in ("状态", "单核均值 %", "单核P95 %", "单核P99 %", "单核峰值 %", "物理读累计 KB", "物理写累计 KB"):
+            self.assertNotIn(removed, PROCESS_HEADERS)
+        rss_column = PROCESS_HEADERS.index("RSS峰值 MB")
+        self.assertEqual(PROCESS_HEADERS[rss_column + 1:rss_column + 3], ["累计读 KB", "累计写 KB"])
+        for p in payload["processes"]:
+            cells = dict(zip(PROCESS_HEADERS, process_row(p, 1)))
+            self.assertEqual(cells["活跃P99 %"], p["active"]["metrics"]["cpu1c"]["p99"])
+            self.assertEqual(cells["活跃峰值 %"], p["active"]["metrics"]["cpu1c"]["max"])
+            for header, field in (("累计读 KB", "rd_kb"), ("累计写 KB", "wr_kb"),
+                                  ("逻辑读累计 KB", "rchar_kb"), ("逻辑写累计 KB", "wchar_kb")):
+                self.assertEqual(cells[header], p["metrics"][field]["total"])
+        self.assertNotIn("不是整机实测 IO", html)
+        self.assertEqual(html.count("IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；"), 2)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is required for report chart checks")
+        source = Path("report_assets/report.js").read_text(encoding="utf-8")
+        prefix = source[:source.index("  data.systems.forEach(setupSegment);")]
+        harness = """
+const assert = require('node:assert/strict');
+class Node {
+  constructor() { this.children=[]; this.events={}; this.dataset={}; this.value='';
+    this.classList={add(){},toggle(){}}; this.nodes=new Map(); }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children=nodes; }
+  setAttribute() {}
+  addEventListener(type, callback) { this.events[type]=callback; }
+  getClientRects() { return []; }
+  querySelector(selector) {
+    if (!this.nodes.has(selector)) this.nodes.set(selector,new Node());
+    return this.nodes.get(selector);
+  }
+  querySelectorAll() { return []; }
+}
+const nodes = new Map();
+global.document = {
+  documentElement:new Node(), createElement:()=>new Node(),
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id,new Node());
+    return nodes.get(id);
+  }
+};
+global.setTimeout = callback => callback();
+document.getElementById('report-data').textContent = PAYLOAD;
+""".replace("PAYLOAD", json.dumps(json.dumps(payload)))
+        checks = """
+const system = data.systems[0], snapshot=JSON.stringify(data);
+const points = collectedIO(system,data.processes);
+assert.equal(points[0].rd_kb,0);
+assert.equal(points[0].wr_kb,156);
+assert.equal(points[0].rchar_kb,469);
+assert.equal(points[0].wchar_kb,184);
+const cpu=referenceSeries(system,points,['cpu1c']);
+assert.equal(cpu[0].data[0][1],42.04*8);
+assert.equal(referenceSeries(system,points,['rss_kb'])[0].data[0][1],5399);
+assert.equal(referenceSeries(system,points,io).length,4);
+assert.equal(JSON.stringify(data),snapshot);
+setupSegment(system);
+const option = role => instances.get(document.getElementById(system.id+'-'+role)).option;
+for (const {option: chart} of instances.values()) {
+  if (chart.xAxis.type !== 'time') continue;
+  const ts = Date.UTC(2026,8,20,13,7,59);
+  assert.equal(chart.xAxis.axisLabel.formatter(ts), '13:07:59');
+  assert.equal(chart.dataZoom.find(z => z.type === 'slider').labelFormatter(ts), '13:07:59');
+  assert.ok(chart.xAxis.axisPointer.label.formatter({value:ts}).includes('13:07:59'));
+}
+for (const mode of ['overlay','merge']) {
+  assert.equal(option(mode+'-cpu').series[0].data[0][1],42.04*8);
+  assert.equal(option(mode+'-rss').series[0].data[0][1],5399);
+  assert.equal(option(mode+'-io').series.length,4);
+}
+const root=document.getElementById(system.id);
+const candidates=root.querySelector('.candidate-list');
+const chosen=candidates.children.find(label=>label.children[0].value===data.processes.find(p=>!p.dp_only).id).children[0];
+chosen.checked=true; chosen.events.change();
+root.querySelector('.merge-apply').events.click();
+assert.equal(option('merge-cpu').series.length,2);
+assert.equal(option('merge-cpu').series[1].data[0][1],116.30);
+assert.equal(option('merge-io').series.length,8);
+root.querySelector('.merge-clear').events.click();
+assert.equal(option('merge-cpu').series.length,1);
+assert.equal(option('merge-io').series.length,4);
+assert.equal(JSON.stringify(data),snapshot);
+const row = (cycle, ts, values, records=1) => {
+  const r=Array(data.full_cycle_schema.length).fill(null);
+  Object.entries({cycle,ts,p_records:records,...values}).forEach(([f,v])=>r[index[f]]=v);
+  return r;
+};
+const segment={segment:0,cycle_axis:[[1,1000],[2,2000],[3,3000],[4,4000],[5,null]]};
+const members=[
+  {segment:0,full_cycles:[row(1,1000,{rd_kb:2,wr_kb:0}),row(2,2000,{rd_kb:null}),row(4,4000,{rd_kb:9})]},
+  {segment:0,full_cycles:[row(1,1000,{rd_kb:3}),row(2,2000,{rd_kb:4}),row(5,5000,{rd_kb:100})]},
+  {segment:1,full_cycles:[row(1,1000,{rd_kb:1000})]},
+  {segment:0,full_cycles:[row(1,1000,{rd_kb:999},0),row(4,4500,{rd_kb:100})]}
+];
+const summed=collectedIO(segment,members);
+assert.deepEqual(summed.map(p=>p.rd_kb),[5,4,null,9,null]);
+assert.equal(summed[0].wr_kb,0);
+assert.equal(summed[0].rchar_kb,null);
+assert.notEqual(summed[1]._run_rd_kb,summed[3]._run_rd_kb);
+assert.equal(lineSeries(summed,'rd_kb','IO','red').length,2);
+assert.ok(collectedIO(segment,[]).every(p=>io.every(f=>p[f]===null)));
+const longAxis=Array.from({length:1200},(_,i)=>[i+1,(i+1)*1000]);
+const longSystem={segment:0,cycle_axis:longAxis};
+const longProcess={segment:0,full_cycles:longAxis.map(([c,t])=>row(c,t,{rd_kb:c===501?null:1}))};
+const sampled=collectedIO(longSystem,[longProcess]);
+assert.equal(sampled.length,600);
+assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
+})();
+"""
+        subprocess.run(["node", "-e", harness + prefix + checks], check=True, capture_output=True, text=True)
+
+    def test_report_overview_missing_inputs_and_process_basis(self):
+        from perf_report import render_report
+        from perf_report_data import build_report_data
+        from perf_report_ui import prepare_display
+        sid = self.import_sample()["id"]
+        data = prepare_display(build_report_data(self.store, sid))
+        process = next(p for p in data["processes"] if not p["dp_only"])
+        self.assertEqual(process["metrics"]["cpu1c"]["p95"], 116.30)
+        self.assertEqual(data["systems"][0]["metrics"]["cpu_total"]["avg"], 42.04)
+        for field in ("cpu_total", "cpu_user", "cpu_irq", "mem_avail_mb", "mem_total_mb"):
+            with self.subTest(field=field):
+                missing_sid = self.import_sample(SAMPLE.splitlines()[0] + "\n")["id"]
+                with self.store.connect() as db:
+                    db.execute("UPDATE records SET data=json_set(data,?,NULL) "
+                               "WHERE session=? AND kind='S'", ("$." + field, missing_sid))
+                html = render_report(self.store, missing_sid)
+                system = json.loads(ReportMarkup(html).scripts[0][1])["systems"][0]
+                self.assertEqual(system["metrics"][field]["count"], 0)
+                derived = "cpu_idle" if field == "cpu_total" else "mem_used_mb" if field.startswith("mem") else field
+                self.assertIsNone(system["metrics"][derived]["p95"])
+                self.assertIsNone(system["series"]["points"][0][derived])
+        empty = self.import_sample(SAMPLE.splitlines()[-1] + "\n")["id"]
+        self.assertIn("整体概览", render_report(self.store, empty))
 
     def test_group_api_contract(self):
         from fastapi.testclient import TestClient
@@ -202,17 +575,15 @@ class StoreTests(unittest.TestCase):
             report = render_report(self.store, sid)
         groups.assert_not_called()
         settings.assert_not_called()
-        self.assertEqual(re.findall(r"<h2>(.*?)</h2>", report), ["全部进程资源统计"])
-        self.assertEqual(report.count('<details class="process">'), 2)
-        self.assertEqual(report.count('<summary>'), 2)
+        data = self.assert_report(report)
+        self.assertEqual(len(data["processes"]), 2)
+        self.assertEqual(len(data["systems"]), 1)
         self.assertIn(text(METHOD), report)
         for removed in ("1 测试环境", "6 准入结论", "附录 A", "组同周期合计统计", "请先配置准入进程组"):
             self.assertNotIn(removed, report)
-        for phrase in ("进程 CPU + 总 CPU", "内存占用（RSS）", "cpu / cpu_total", "离线查看"):
+        for phrase in ("进程 CPU + 系统 CPU（整机）", "RSS 内存", "cpu / cpu_total", "纯离线文件"):
             self.assertIn(phrase, report)
-        self.assertNotRegex(report.lower(), r"<script|<link|<iframe|<img|<object|<embed")
-        # 精简展示不删除系统资源底层统计的验证。
-        metrics = self.store.statistics(sid, "S")["metrics"]
+        metrics = data["systems"][0]["metrics"]
         for field, expected in (("cpu_total", [95, 99, 100]), ("mem_used_mb", [190, 198, 200])):
             self.assertEqual(metrics[field]["count"], 100)
             self.assertEqual([metrics[field][key] for key in ("p95", "p99", "max")], expected)
@@ -246,6 +617,57 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(series["sampled"])
         self.assertLessEqual(len(series["points"]), 60)
         self.assertEqual(max(point["cpu_total"] for point in series["points"]), 99)
+
+    def test_process_references_full_cycle_scope(self):
+        from fastapi.testclient import TestClient
+        from perf_api import create_app
+        p = GroupStoreTests.p
+        text = 'S,1,7,25,0,0,0,0,100,300,999\n'
+        text += p(1, 1, 'selected', rd_kb=2, wr_kb=0, rchar_kb=7, wchar_kb=9)
+        text += p(1, 2, 'other', rd_kb=3, wr_kb=0, rchar_kb=11, wchar_kb=13)
+        text += 'S,2,7,0,0,0,0,0,100,300,999\n'
+        text += p(3, 1, 'selected', rd_kb=0, wr_kb=4)
+        text += 'S,0,7,100,0,0,0,0,0,300,999\n' + p(0, 9, 'other', rd_kb=999)
+        sid = self.import_sample(text)['id']
+        with self.store.connect() as db:
+            db.execute("UPDATE records SET data=json_set(data,'$.wr_kb',NULL) WHERE session=? AND ts=1 AND pid=2", (sid,))
+            db.execute("UPDATE records SET data=json_set(data,'$.mem_avail_mb',NULL) WHERE session=? AND ts=2 AND kind='S'", (sid,))
+            db.execute("UPDATE records SET data=json_set(data,'$.rd_kb',NULL) WHERE session=? AND ts=3 AND kind='P'", (sid,))
+        result = self.store.process_references(sid, 0)
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['total'], 3)
+        first, absent, orphan = result['points']
+        self.assertEqual(first['cpu_total'], 25)
+        self.assertEqual(first['mem_used_mb'], 200)  # derive, do not trust logged used
+        self.assertEqual([first[f] for f in ('rd_kb', 'wr_kb', 'rchar_kb', 'wchar_kb')], [5, 0, 18, 22])
+        self.assertIsNone(absent['rd_kb'])
+        self.assertIsNone(absent['mem_used_mb'])
+        self.assertEqual(absent['cpu_total'], 0)
+        self.assertIsNone(orphan['cpu_total'])
+        self.assertIsNone(orphan['mem_used_mb'])
+        self.assertIsNone(orphan['rd_kb'])
+        self.assertEqual(orphan['wr_kb'], 4)
+        self.assertEqual(self.store.process_references(sid, 1)['points'][0]['rd_kb'], 999)
+        self.assertEqual(self.store.process_references(sid, 99)['points'], [])
+        with TestClient(create_app(self.store.path), base_url='http://127.0.0.1:8765') as client:
+            client.headers['X-Session-Token'] = client.get('/api/token').json()['token']
+            path = f'/api/sessions/{sid}/process-references'
+            response = client.get(path, params={'segment': 0})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), result)
+            self.assertEqual(client.get(path).status_code, 422)
+            self.assertEqual(client.get(path, params={'segment': -1}).status_code, 422)
+
+    def test_process_references_aggregate_before_sampling(self):
+        p = GroupStoreTests.p
+        text = ''.join(GroupStoreTests.s(i) + p(i, 1, 'a', rd_kb=70 if i == 451 else 1)
+                       + p(i, 2, 'b', rd_kb=80 if i == 451 else 2) for i in range(1000))
+        sid = self.import_sample(text)['id']
+        result = self.store.process_references(sid, 0, limit=64)
+        self.assertTrue(result['sampled'])
+        self.assertEqual(result['total'], 1000)
+        self.assertLessEqual(len(result['points']), 64)
+        self.assertEqual(max(point['rd_kb'] for point in result['points']), 150)
 
     def test_small_series_is_not_sampled(self):
         result = self.import_sample("".join("S,%d,7,1,0,0,0,0,100,200,100\n" % i for i in range(100)))
@@ -305,7 +727,7 @@ class StoreTests(unittest.TestCase):
         template = SAMPLE.splitlines()[1].split(",")
         def row(ts, name, cpu, delta, policy, core):
             values = template.copy()
-            for field, value in dict(ts=ts, name=name, cpu=cpu, rss_delta_kb=delta,
+            for field, value in dict(ts=ts, name=name, cpu=cpu, cpu1c=cpu + 200, rss_delta_kb=delta,
                                      pol=policy, cpu_core=core, rd_kb=2**63-1).items():
                 values[fields.index(field) + 1] = str(value)
             return ",".join(values) + "\n"
@@ -323,7 +745,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.statistics(sid, "P", pid=1)["samples"], 0)
         for sort in ("cpu_p95", "cpu_p99"):
             rows = self.store.processes(sid, sort=sort)
-            self.assertEqual([r[sort] for r in rows], [100, 99, 2])
+            self.assertEqual([r[sort] for r in rows], [300, 299, 202])
             self.assertEqual(self.store.processes(sid, sort=sort, limit=1, offset=1)[0]["name"], "b")
 
     def test_process_search_pagination_and_persistent_cache(self):
@@ -365,7 +787,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.processes(other, with_total=True)["total"], 2)
         self.store.delete(sid)
         with self.store.connect() as db:
-            for table in ("process_rank_v2", "process_rank_ready_v2"):
+            for table in ("process_rank_v3", "process_rank_ready_v3"):
                 self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {table} WHERE session=?", (sid,)).fetchone()[0], 0)
         with self.assertRaises(KeyError):
             reopened.processes(sid)
@@ -382,9 +804,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(row['pid_path'], [[pid] for pid in sequence[:4]])
             self.assertEqual(row['pids'], sequence)
             self.assertFalse(row['concurrent_pids'])
-        text = p(1, 111, 'same', cpu=1) + p(2, 111, 'same', cpu=2)
-        text += p(3, 222, 'same', cpu=99) + p(4, 111, 'same', cpu=3)
-        text += p(0, 333, 'same', cpu=100)  # rollback creates a separate segment
+        text = p(1, 111, 'same', cpu=1, cpu1c=8) + p(2, 111, 'same', cpu=2, cpu1c=16)
+        text += p(3, 222, 'same', cpu=99, cpu1c=792) + p(4, 111, 'same', cpu=3, cpu1c=24)
+        text += p(0, 333, 'same', cpu=100, cpu1c=800)  # rollback creates a separate segment
         text += 'DP,0,888,100,1,dma-only\n'
         sid = self.import_sample(text)['id']
         result = self.store.processes(sid, merge_names=True, with_total=True)
@@ -393,11 +815,11 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(row['pid_path'], [[111], [222], [111]])
         self.assertEqual(row['pid_changes'], 2)
         self.assertEqual(row['samples'], 4)
-        self.assertEqual(row['cpu_avg'], 26.25)
-        self.assertEqual(row['cpu_p95'], 99)
-        self.assertEqual(row['cpu_p99'], 99)
+        self.assertEqual(row['cpu_avg'], 210)
+        self.assertEqual(row['cpu_p95'], 792)
+        self.assertEqual(row['cpu_p99'], 792)
         stats = self.store.statistics(sid, 'P', segment=0, name='same')
-        self.assertEqual(stats['metrics']['cpu']['avg'], row['cpu_avg'])
+        self.assertEqual(stats['metrics']['cpu1c']['avg'], row['cpu_avg'])
         self.assertEqual(stats['metrics']['rd_kb']['total'], row['read_kb'])
         series = self.store.series(sid, 'P', segment=0, name='same')
         self.assertEqual([r['pid'] for r in series['points']], [111, 111, 222, 111])
@@ -454,7 +876,7 @@ class StoreTests(unittest.TestCase):
                          {'items': [], 'total': 0, 'all_total': 0})
         self.store.delete(sid)
         with self.store.connect() as db:
-            for table in ('process_name_rank_v1', 'process_name_ready_v1'):
+            for table in ('process_name_rank_v2', 'process_name_ready_v2'):
                 self.assertEqual(db.execute(f'SELECT COUNT(*) FROM {table} WHERE session=?', (sid,)).fetchone()[0], 0)
 
     def test_rss_raw_distribution_segment_and_legacy_cache(self):
@@ -514,6 +936,59 @@ class StoreTests(unittest.TestCase):
             for table in ('process_rss_rank_v1', 'process_rss_ready_v1'):
                 self.assertEqual(db.execute(f'SELECT COUNT(*) FROM {table} WHERE session=?', (sid,)).fetchone()[0], 0)
 
+    def test_process_cpu1c_ranking_and_legacy_cache(self):
+        from fastapi.testclient import TestClient
+        from perf_api import create_app
+        p = GroupStoreTests.p
+        text = ''.join(p(i, 1, 'same', cpu=1, cpu1c=i * 8) for i in range(1, 101))
+        text += p(101, 2, 'same', cpu=1, cpu1c=1600)
+        text += p(102, 3, 'rival', cpu=99, cpu1c=1)
+        text += p(103, 4, 'zero', cpu=99, cpu1c=0)
+        text += p(104, 5, 'missing', cpu=99) + 'DP,104,6,10,1,dma\n'
+        text += p(1, 7, 'same', cpu=99, cpu1c=2)
+        sid = self.import_sample(text)['id']
+        with self.store.connect() as db:
+            db.execute("UPDATE records SET data=json_remove(data,'$.cpu1c') WHERE session=? AND pid=5", (sid,))
+        single = self.store.processes(sid, q='1', segment=0)[0]
+        self.assertEqual([single[k] for k in ('cpu_peak', 'cpu_avg', 'cpu_p95', 'cpu_p99')],
+                         [800, 404, 760, 792])
+        merged = self.store.processes(sid, merge_names=True, q='same', segment=0)[0]
+        self.assertEqual((merged['cpu_peak'], merged['cpu_p95'], merged['cpu_p99']), (1600, 768, 800))
+        self.assertAlmostEqual(merged['cpu_avg'], 42000 / 101)
+        self.assertEqual(merged['samples'], 101)
+        for merge in (False, True):
+            for sort in ('cpu_peak', 'cpu_avg', 'cpu_p95', 'cpu_p99'):
+                rows = self.store.processes(sid, merge_names=merge, sort=sort, segment=0)
+                self.assertEqual(rows[0]['name'], 'same')  # cpu would incorrectly put rival first
+                self.assertEqual([r['name'] for r in rows[-4:]],
+                                 ['rival', 'zero'] + (['dma', 'missing'] if merge else ['missing', 'dma']))
+                self.assertEqual(rows[-3][sort], 0)
+                self.assertIsNone(rows[-2][sort])  # no fallback to cpu
+                self.assertIsNone(rows[-1][sort])
+                page = self.store.processes(sid, merge_names=merge, sort=sort, segment=0, limit=1, offset=1)
+                self.assertEqual(page, rows[1:2])
+        self.assertEqual(self.store.processes(sid, merge_names=True, segment=1)[0]['cpu_peak'], 2)
+        # Simulate populated pre-upgrade caches, with stale cpu-based results.
+        versions = (('process_rank_v3', 'process_rank_v2'),
+                    ('process_rank_ready_v3', 'process_rank_ready_v2'),
+                    ('process_name_rank_v2', 'process_name_rank_v1'),
+                    ('process_name_ready_v2', 'process_name_ready_v1'))
+        with self.store.connect() as db:
+            for current, old in versions:
+                db.execute(f'ALTER TABLE {current} RENAME TO {old}')
+            for old in ('process_rank_v2', 'process_name_rank_v1'):
+                db.execute(f'UPDATE {old} SET cpu_peak=-999,cpu_avg=-999,cpu_p95=-999,cpu_p99=-999')
+        reopened = Store(self.store.path)
+        self.assertEqual(reopened.processes(sid, q='1', segment=0), [single])
+        self.assertEqual(reopened.processes(sid, merge_names=True, q='same', segment=0), [merged])
+        with TestClient(create_app(self.store.path), base_url='http://127.0.0.1:8765') as client:
+            client.headers['X-Session-Token'] = client.get('/api/token').json()['token']
+            for sort in ('cpu_peak', 'cpu_avg', 'cpu_p95', 'cpu_p99'):
+                response = client.get(f'/api/sessions/{sid}/processes', params=dict(
+                    sort=sort, segment=0, merge_names='true', limit=1))
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), [merged])
+
     def test_process_cache_concurrent_and_empty(self):
         from concurrent.futures import ThreadPoolExecutor
         sid = self.import_sample()["id"]
@@ -521,7 +996,7 @@ class StoreTests(unittest.TestCase):
             results = list(pool.map(lambda _: self.store.processes(sid), range(8)))
         self.assertTrue(all(result == results[0] for result in results))
         with self.store.connect() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM process_rank_v2").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM process_rank_v3").fetchone()[0], 2)
         empty = self.import_sample("D,1,2,3\n")["id"]
         for _ in range(2):
             self.assertEqual(self.store.processes(empty, with_total=True),
@@ -540,7 +1015,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(summary["duplicate_files"], 1)
 
 
-class GroupStoreTests(unittest.TestCase):
+class GroupStoreTests(ReportAssertions, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -577,20 +1052,21 @@ class GroupStoreTests(unittest.TestCase):
         sid = self.load(rows)
         with patch.object(self.store, "processes", side_effect=AssertionError("不得使用排行截断")):
             report = render_report(self.store, sid)
-        summaries = re.findall(r"<summary>(.*?)</summary>", report)
-        self.assertEqual(len(summaries), 106)
-        self.assertEqual(len(set(summaries)), 106)
+        data = self.assert_report(report)
+        processes = {p["name"]: p for p in data["processes"]}
+        self.assertEqual(len(processes), 106)
+        self.assertEqual(set(processes), {f"worker-{pid}" for pid in range(1, 106)} | {"dma-only"})
         for pid in range(1, 106):
-            self.assertTrue(any(f"段 0 · PID {pid} · worker-{pid} ·" in item for item in summaries))
-        self.assertIn("共 106 个进程身份，全部列出。", report)
-        dma = next(block for block in re.findall(r"<details.*?</details>", report)
-                   if "PID 999 · dma-only" in block)
-        for metric in ("CPU（整机）", "RSS"):
-            self.assertIn(f"<td>{metric}</td><td>0</td>" + "<td>—</td>" * 5, dma)
-        self.assertIn("仅有 DP 记录，无 P 样本", dma)
-        self.assertNotIn("进程 CPU ·", dma)
-        self.assertNotIn("RSS ·", dma)
-        self.assertIn("总 CPU ·", dma)
+            self.assertEqual(processes[f"worker-{pid}"]["pids"], [pid])
+            self.assertEqual(processes[f"worker-{pid}"]["metrics"]["cpu"]["count"], 1)
+        self.assertEqual(processes["worker-1"]["dp_records"], 1)
+        dma = processes["dma-only"]
+        self.assertEqual(dma["pids"], [999])
+        self.assertTrue(dma["dp_only"])
+        for metric in dma["metrics"].values():
+            self.assert_metric(metric, 0, [None] * 5)
+        self.assertIn("仅 DP 记录，无 P 样本", report)
+        self.assertIn("系统 CPU ·", report)
 
     def test_report_exact_identity_and_system_series_reuse(self):
         import re
@@ -604,20 +1080,23 @@ class GroupStoreTests(unittest.TestCase):
         sid = self.load(rows)
         with patch.object(self.store, "report_series", wraps=self.store.report_series) as series:
             report = render_report(self.store, sid)
-        blocks = re.findall(r"<details.*?</details>", report)
-        expected = [(0, 1, "a", 11, 101), (0, 1, "renamed", 22, 202),
-                    (0, 2, "a", 33, 303), (1, 1, "a", 44, 404)]
-        self.assertEqual(len(blocks), len(expected))
-        for block, (segment, pid, name, cpu, rss) in zip(blocks, expected):
-            self.assertIn(f"段 {segment} · PID {pid} · {name} ·", block)
-            self.assertIn("<td>CPU（整机）</td><td>1</td>" + f"<td>{cpu} %</td>" * 5, block)
-            self.assertIn("<td>RSS</td><td>1</td>" + f"<td>{rss} KB</td>" * 5, block)
-            self.assertIn(f" · {cpu} %</title>", block)
-            self.assertIn(f" · {rss} KB</title>", block)
-        self.assertEqual([call.kwargs for call in series.call_args_list if call.args[1] == "S"],
-                         [dict(segment=0), dict(segment=1)])
-        self.assertEqual([call.kwargs for call in series.call_args_list if call.args[1] == "P"],
-                         [dict(segment=segment, pid=pid, name=name) for segment, pid, name, _, _ in expected])
+        data = self.assert_report(report)
+        expected = {(0, "a"): ([1, 2], 44, 404),
+                    (0, "renamed"): ([1], 22, 202), (1, "a"): ([1], 44, 404)}
+        self.assertEqual(len(data["processes"]), 3)
+        self.assertEqual([s["segment"] for s in data["systems"]], [0, 1])
+        self.assertEqual([s["samples"] for s in data["systems"]], [1, 1])
+        for process in data["processes"]:
+            pids, cpu, rss = expected[(process["segment"], process["name"])]
+            self.assertEqual(process["pids"], pids)
+            self.assert_metric(process["metrics"]["cpu"], 1, [cpu] * 5)
+            self.assert_metric(process["metrics"]["rss_kb"], 1, [rss] * 5)
+            self.assertEqual(len(process["full_cycles"]), 1)
+            cycle = dict(zip(data["full_cycle_schema"], process["full_cycles"][0]))
+            self.assertEqual((cycle["cpu"], cycle["rss_kb"], cycle["pids"]), (cpu, rss, pids))
+            self.assertEqual(process["concurrent"], len(pids) > 1)
+        # 完整载荷一次生成；不再按PID调用旧采样接口。
+        series.assert_not_called()
 
     def test_report_zero_null_and_actual_cpu_plot_coordinates(self):
         import re
@@ -632,18 +1111,22 @@ class GroupStoreTests(unittest.TestCase):
             db.execute("UPDATE records SET data=json_set(data,'$.cpu',NULL,'$.rss_kb',NULL) "
                        "WHERE session=? AND kind='P' AND ts=3", (sid,))
         report = render_report(self.store, sid)
-        self.assertIn("<td>CPU（整机）</td><td>2</td><td>0 %</td><td>10 %</td>" +
-                      "<td>20 %</td>" * 3, report)
-        self.assertIn("<td>RSS</td><td>2</td>" + "<td>0 KB</td>" * 5, report)
-        cpu_svg, rss_svg = [ET.fromstring(svg) for svg in re.findall(r"<svg.*?</svg>", report)]
+        data = self.assert_report(report)
+        process_data = data["processes"][0]
+        self.assert_metric(process_data["metrics"]["cpu"], 2, [0, 10, 20, 20, 20])
+        self.assert_metric(process_data["metrics"]["rss_kb"], 2, [0] * 5)
+        self.assertEqual([row[2] for row in process_data["full_cycles"]], [20, 0, None])
+        self.assertEqual(process_data["active"]["cycles"], 1)
+        cpu_svg = self.report_svg(report, "进程 CPU + 系统 CPU（整机）")
+        rss_svg = self.report_svg(report, "RSS 内存")
         process = [dot for dot in cpu_svg.findall("circle") if dot.findtext("title").startswith("进程 CPU ·")]
-        system = [dot for dot in cpu_svg.findall("circle") if dot.findtext("title").startswith("总 CPU ·")]
+        system = [dot for dot in cpu_svg.findall("circle") if dot.findtext("title").startswith("系统 CPU ·")]
         self.assertEqual([(dot.get("cx"), dot.get("cy")) for dot in process],
-                         [("110.00", "142.50"), ("535.00", "230.00")])
-        self.assertEqual([dot.get("cy") for dot in system], ["55.00"] * 3)
-        self.assertEqual([dot.get("cy") for dot in rss_svg.findall("circle")], ["230.00"] * 2)
-        self.assertEqual(len(cpu_svg.findall("line")), 3)
-        self.assertEqual(len(rss_svg.findall("line")), 1)
+                         [("85.00", "112.50"), ("482.50", "200.00")])
+        self.assertEqual([dot.get("cy") for dot in system], ["25.00"] * 3)
+        self.assertEqual([dot.get("cy") for dot in rss_svg.findall("circle")], ["200.00"] * 2)
+        self.assertEqual(len(cpu_svg.findall("path")) - 1, 3)
+        self.assertEqual(len(rss_svg.findall("path")) - 1, 1)
 
     def test_report_series_metric_gaps_and_cycle_boundaries(self):
         import xml.etree.ElementTree as ET
@@ -694,6 +1177,18 @@ class GroupStoreTests(unittest.TestCase):
                             for a, b in zip(continuous["points"], continuous["points"][1:])))
         chart = ET.fromstring(report_chart([(continuous, "cpu", "CPU")], "CPU", "%"))
         self.assertEqual(len(chart.findall(".//line")), len(continuous["points"]) - 1)
+        full_report = render_report(self.store, sid)
+        full_data = self.assert_report(full_report)
+        self.assertEqual(len(full_data["processes"][0]["full_cycles"]), 1001)
+        self.assert_metric(full_data["processes"][0]["metrics"]["cpu"],
+                           1001, [1, 501, 951, 991, 1001])
+        full_svg = self.report_svg(full_report, "进程 CPU + 系统 CPU（整机）")
+        full_dots = [dot for dot in full_svg.findall("circle")
+                     if dot.findtext("title").startswith("进程 CPU ·")]
+        self.assertGreater(len(full_dots), 2)
+        self.assertLessEqual(len(full_dots), 600)
+        self.assertEqual(len([p for p in full_svg.findall("path")
+                             if p.get("stroke") == full_dots[0].get("fill")]), len(full_dots) - 1)
         with self.store.connect() as db:
             db.execute("UPDATE records SET data=json_set(data,'$.cpu',NULL) "
                        "WHERE session=? AND kind='P' AND ts=501", (sid,))
@@ -714,18 +1209,43 @@ class GroupStoreTests(unittest.TestCase):
                             system["points"][-1]["_run_cpu_total"])
         report = render_report(self.store, sid)
         self.assertIn("已降采样", report)
-        self.assertIn("<td>CPU（整机）</td><td>1000</td><td>1 %</td><td>501 %</td>"
-                      "<td>951 %</td><td>991 %</td><td>1,001 %</td>", report)
-        for svg in re.findall(r"<svg.*?</svg>", report):
-            root = ET.fromstring(svg)
-            for label in ("进程 CPU", "总 CPU", "RSS"):
-                dots = [dot for dot in root.findall("circle")
-                        if dot.findtext("title").startswith(label + " ·")]
-                self.assertLessEqual(len(dots), 600)
-            # 缺失点位于时间轴中央；CPU 两条曲线都不能跨越它。
-            if root.get("aria-label") == "进程 CPU + 总 CPU":
-                for line in root.findall("line"):
-                    self.assertFalse(float(line.get("x1")) < 535 < float(line.get("x2")))
+        data = self.assert_report(report)
+        process = data["processes"][0]
+        self.assertEqual(len(process["full_cycles"]), 1001)
+        self.assert_metric(process["metrics"]["cpu"], 1000, [1, 501, 951, 991, 1001])
+        self.assert_metric(process["metrics"]["rss_kb"], 1001, [1, 501, 951, 991, 1001])
+        self.assertEqual(process["full_cycles"][500][2], None)
+        cpu_svg = self.report_svg(report, "进程 CPU + 系统 CPU（整机）")
+        for series, field, label in ((process["series"], "cpu", "进程 CPU"),
+                                      (data["systems"][0]["series"], "cpu_total", "系统 CPU")):
+            self.assertTrue(series["sampled"])
+            self.assertEqual(series["total"], 1001)
+            self.assertLessEqual(len(series["points"]), 600)
+            self.assertNotIn(501, [p["ts"] for p in series["points"]], "真实null缺口应隐藏在采样点之间")
+            valid = [p for p in series["points"] if p[field] is not None]
+            self.assertGreater(len(valid), 2)
+            self.assertLess(valid[0]["ts"], 501)
+            self.assertGreater(valid[-1]["ts"], 501)
+            self.assertNotEqual(valid[0]["_run_" + field], valid[-1]["_run_" + field])
+            # 选择真实缺口两侧相邻采样点；即使null没有入选也不能连线。
+            left = max((p for p in valid if p["ts"] < 501), key=lambda p: p["ts"])
+            right = min((p for p in valid if p["ts"] > 501), key=lambda p: p["ts"])
+            self.assertNotEqual(left["_run_" + field], right["_run_" + field])
+            dots = [dot for dot in cpu_svg.findall("circle")
+                    if dot.findtext("title").startswith(label + " ·")]
+            self.assertEqual(len(dots), len(valid))
+            color = dots[0].get("fill")
+            paths = [p for p in cpu_svg.findall("path") if p.get("stroke") == color]
+            self.assertGreater(len(paths), 0)
+            self.assertEqual(len(paths), len(dots) - 2)
+            for path in paths:
+                coords = re.fullmatch(r"M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)", path.get("d"))
+                self.assertIsNotNone(coords)
+                self.assertFalse(float(coords[1]) < 482.50 < float(coords[3]))
+        rss_svg = self.report_svg(report, "RSS 内存")
+        self.assertGreater(len(rss_svg.findall("circle")), 2)
+        self.assertLessEqual(len(rss_svg.findall("circle")), 600)
+        self.assertEqual(len(rss_svg.findall("path")) - 1, len(rss_svg.findall("circle")) - 1)
 
     def test_report_chart_requires_same_segment_known_run_and_increasing_time(self):
         import xml.etree.ElementTree as ET
@@ -750,26 +1270,6 @@ class GroupStoreTests(unittest.TestCase):
         from html.parser import HTMLParser
         from perf_report import render_report
 
-        class Markup(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.tags = []
-                self.styles = []
-                self.in_style = False
-
-            def handle_starttag(self, tag, attrs):
-                self.tags.append((tag, dict(attrs)))
-                if tag == "style":
-                    self.in_style = True
-
-            def handle_endtag(self, tag):
-                if tag == "style":
-                    self.in_style = False
-
-            def handle_data(self, data):
-                if self.in_style:
-                    self.styles.append(data)
-
         payload = '</summary><script>alert("x")</script><img src="https://example.invalid/x" onerror="alert(1)">&'
         sid = self.load(self.p(1, name=payload))
         with self.store.connect() as db:
@@ -777,35 +1277,177 @@ class GroupStoreTests(unittest.TestCase):
         report = render_report(self.store, sid)
         self.assertNotIn(payload, report)
         self.assertGreaterEqual(report.count(escape(payload, quote=True)), 3)
-        markup = Markup()
-        markup.feed(report)
-        tags = [tag for tag, _ in markup.tags]
-        self.assertEqual(tags.count("details"), 1)
-        self.assertEqual(tags.count("summary"), 1)
-        self.assertIn("svg", tags)
-        forbidden = {"script", "link", "iframe", "img", "object", "embed", "base", "form",
-                     "audio", "video", "source", "foreignobject", "use", "image", "animate", "set"}
-        self.assertFalse(forbidden.intersection(tags))
-        for tag, attrs in markup.tags:
-            self.assertFalse(any(key.startswith("on") for key in attrs), (tag, attrs))
-            self.assertFalse({"src", "srcset", "href", "xlink:href", "srcdoc", "action"}.intersection(attrs))
-            if tag == "meta":
-                self.assertNotEqual(attrs.get("http-equiv", "").lower(), "refresh")
-        policies = [attrs["content"] for tag, attrs in markup.tags
-                    if tag == "meta" and attrs.get("http-equiv", "").lower() == "content-security-policy"]
-        self.assertEqual(policies, ["default-src 'none'; style-src 'unsafe-inline'"])
-        self.assertNotRegex("".join(markup.styles).lower(), r"url\s*\(|@import|expression\s*\(")
+        data = self.assert_report(report)
+        self.assertEqual(data["session"]["name"], payload)
+        self.assertEqual(data["processes"][0]["name"], payload)
+        self.assertEqual(len(ReportMarkup(report).processes), 1)
+        self.assertIn("<svg", report)
 
     def test_report_only_dp_without_system_does_not_fabricate_samples(self):
         from perf_report import render_report
 
         sid = self.load("DP,1,8,1024,1,dma\n")
         report = render_report(self.store, sid)
-        self.assertIn("共 1 个进程身份，全部列出。", report)
-        self.assertIn("仅有 DP 记录，无 P 样本", report)
+        data = self.assert_report(report)
+        self.assertEqual(len(data["processes"]), 1)
+        process = data["processes"][0]
+        self.assertTrue(process["dp_only"])
+        self.assertEqual((process["p_records"], process["dp_records"]), (0, 1))
+        self.assertEqual(process["full_cycles"][0][2:9], [None] * 7)
+        self.assertEqual(data["systems"][0]["samples"], 0)
+        self.assertEqual(data["systems"][0]["series"]["points"], [])
+        self.assertIn("仅 DP 记录，无 P 样本", report)
         self.assertNotIn("<svg", report)
-        for metric in ("CPU（整机）", "RSS"):
-            self.assertIn(f"<td>{metric}</td><td>0</td>" + "<td>—</td>" * 5, report)
+        for metrics in (process["metrics"], data["systems"][0]["metrics"]):
+            for metric in metrics.values():
+                self.assert_metric(metric, 0, [None] * 5)
+
+    def test_report_merged_cycles_reject_duplicate_and_dp_missing_members(self):
+        from perf_report import render_report
+
+        fields = ["cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb"]
+        def member(ts, pid, value):
+            return self.p(ts, pid, **dict.fromkeys(fields, value))
+
+        rows = self.s(100) + member(100, 1, 2) + member(100, 2, 3)
+        rows += "DP,100,1,999999,1,a\n"  # 同一成员的DP不是额外数值来源。
+        rows += self.s(101) + member(101, 1, 10) * 2 + member(101, 2, 20)
+        rows += self.s(102) + member(102, 1, 10) + "DP,102,2,999999,1,a\n"
+        rows += self.s(103) + member(103, 1, 0) + self.s(104)
+        rows += self.s(1) + member(1, 1, 9)  # 回拨开启新段，不能合并统计。
+        data = self.assert_report(render_report(self.store, self.load(rows)))
+        self.assertEqual(len(data["processes"]), 2)
+        first, second = sorted(data["processes"], key=lambda p: p["segment"])
+        self.assertEqual((first["segment"], second["segment"]), (0, 1))
+        cycles = [dict(zip(data["full_cycle_schema"], row)) for row in first["full_cycles"]]
+        self.assertEqual([c["ts"] for c in cycles], [100, 101, 102, 103])
+        self.assertEqual([c["pids"] for c in cycles], [[1, 2], [1, 2], [1, 2], [1]])
+        self.assertEqual([c["duplicate_pids"] for c in cycles], [[], [1], [], []])
+        self.assertEqual([c["p_records"] for c in cycles], [2, 3, 1, 1])
+        self.assertEqual([c["dp_records"] for c in cycles], [1, 0, 1, 0])
+        self.assertEqual((first["p_records"], first["dp_records"]), (7, 2))
+        self.assertEqual((first["concurrent_cycles"], first["max_concurrent_pids"]), (3, 2))
+        self.assertEqual([p["pids"] for p in first["pid_path"]], [[1, 2], [1]])
+        self.assertEqual(first["pid_changes"], 1)
+        coverage = first["coverage"]
+        for key, value in dict(cycles=5, observed_cycles=4, p_cycles=4,
+                               missing_cycles=1, missing_p_cycles=1, duplicate_cycles=1,
+                               complete_cycles=2, observed_percent=80, complete_percent=40).items():
+            self.assertEqual(coverage[key], value, key)
+        self.assertEqual(first["active"]["cycles"], 1)
+        self.assertEqual(first["active"]["percent_of_segment"], 20)
+        for field in fields:
+            with self.subTest(field=field):
+                self.assertEqual([c[field] for c in cycles], [5, None, None, 0])
+                self.assert_metric(first["metrics"][field], 2, [0, 2.5, 5, 5, 5])
+                self.assert_metric(first["active"]["metrics"][field], 1, [5] * 5)
+                self.assertEqual(coverage["metrics"][field], dict(valid_cycles=2, percent=40))
+                self.assert_metric(second["metrics"][field], 1, [9] * 5)
+        self.assertEqual(second["pid_changes"], 0)
+
+    def test_report_merged_fields_are_independently_nullable(self):
+        from perf_report import render_report
+
+        fields = ["cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb"]
+        for missing in fields:
+            with self.subTest(missing=missing):
+                rows = self.s(1) + self.p(1, 1, missing, **dict.fromkeys(fields, 2))
+                rows += self.p(1, 2, missing, **dict.fromkeys(fields, 3))
+                rows += self.s(2) + self.p(2, 1, missing, **dict.fromkeys(fields, 0))
+                sid = self.load(rows)
+                with self.store.connect() as db:
+                    db.execute("UPDATE records SET data=json_set(data,?,NULL) "
+                               "WHERE session=? AND kind='P' AND pid=2", ("$." + missing, sid))
+                data = self.assert_report(render_report(self.store, sid))
+                self.assertEqual(len(data["processes"]), 1)
+                process = data["processes"][0]
+                self.assertEqual(process["coverage"]["complete_cycles"], 1)
+                self.assertEqual(process["coverage"]["duplicate_cycles"], 0)
+                self.assertEqual(process["active"]["cycles"], int(missing != "cpu"))
+                cycle = dict(zip(data["full_cycle_schema"], process["full_cycles"][0]))
+                for field in fields:
+                    absent = field == missing
+                    self.assertEqual(cycle[field], None if absent else 5)
+                    self.assert_metric(process["metrics"][field], 1 if absent else 2,
+                                       [0] * 5 if absent else [0, 2.5, 5, 5, 5])
+                    self.assertEqual(process["coverage"]["metrics"][field],
+                                     dict(valid_cycles=1 if absent else 2, percent=50 if absent else 100))
+                    active = missing != "cpu" and not absent
+                    self.assert_metric(process["active"]["metrics"][field], int(active),
+                                       [5] * 5 if active else [None] * 5)
+
+    def test_report_excel49_missing_entries_and_source(self):
+        from perf_report import render_report
+
+        data = self.assert_report(render_report(self.store, self.load(self.s(1))))
+        required = data["required"]
+        self.assertEqual(len(required), 49)
+        self.assertEqual([item["excel_row"] for item in required],
+                         list(range(7, 38)) + list(range(39, 57)))
+        self.assertEqual(data["processes"], [])
+        self.assertEqual(data["required_source"]["file"], "8255内部-资源分布策略.xlsx")
+        self.assertEqual(data["required_source"]["sheet"], "Sheet1")
+        self.assertEqual(data["required_source"]["rows"], [[7, 37], [39, 56]])
+        self.assertEqual(data["required_source"]["sha256"],
+                         "fe8f5b0b2ef37604bcbe8f20b110365c032b8669d1a9da05ca353d1f6d3e4988")
+        for item in required:
+            with self.subTest(row=item["excel_row"]):
+                self.assertEqual(item["status"], "missing")
+                self.assertTrue(item["missing"])
+                self.assertEqual(item["matches"], [])
+                self.assertEqual(item["candidates"], [])
+                self.assertEqual(item["segments"], [dict(segment=0, status="missing", match=None,
+                                                       process_ids=[], candidate_ids=[])])
+                self.assertEqual(item["module"], "应用服务" if item["excel_row"] <= 37 else "系统服务")
+                self.assertTrue(item["business"])
+                self.assertTrue(item["name"])
+                self.assertEqual(item["truncated"], item["excel_row"] == 56)
+
+    def test_report_excel_matching_is_segment_local_and_ambiguity_safe(self):
+        from perf_report import render_report
+
+        webview = "com.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessServic"
+        names = ["/system/bin/mediaserver", "mediaserver", "audioserver",
+                 "/vendor/bin/logd", "/other/bin/logd", webview, webview + "e:0"]
+        rows = self.s(100) + "".join(self.p(100, pid, name) for pid, name in enumerate(names, 1))
+        rows += "DP,100,20,99999,1,/system/bin/surfaceflinger\n"
+        rows += self.s(1) + self.p(1, name="/system/bin/logd")
+        data = self.assert_report(render_report(self.store, self.load(rows)))
+        required = {item["excel_row"]: item for item in data["required"]}
+        processes = {(p["segment"], p["name"]): p for p in data["processes"]}
+        self.assertEqual(len(required), 49)
+        self.assertEqual(len(processes), 9)
+        def pid(segment, name):
+            return processes[(segment, name)]["id"]
+
+        expected = {
+            44: ("collected", "exact", [pid(0, names[0])], []),
+            45: ("collected", "basename", [pid(0, "audioserver")], []),
+            47: ("dp_only", "exact", [pid(0, "/system/bin/surfaceflinger")], []),
+            51: ("pending_confirmation", "ambiguous", [],
+                 [pid(0, "/vendor/bin/logd"), pid(0, "/other/bin/logd")]),
+            56: ("pending_confirmation", "candidate", [], [pid(0, webview), pid(0, webview + "e:0")]),
+        }
+        for row, item in required.items():
+            with self.subTest(row=row):
+                self.assertEqual([s["segment"] for s in item["segments"]], [0, 1])
+                first, second = item["segments"]
+                status, mode, matches, candidates = expected.get(row, ("missing", None, [], []))
+                self.assertEqual((first["status"], first["match"]), (status, mode))
+                self.assertEqual(first["process_ids"], matches)
+                self.assertCountEqual(first["candidate_ids"], candidates)
+                later = [pid(1, "/system/bin/logd")] if row == 51 else []
+                self.assertEqual(second, dict(segment=1, status="collected" if later else "missing",
+                                             match="exact" if later else None,
+                                             process_ids=later, candidate_ids=[]))
+                self.assertEqual(item["matches"], matches + later)
+                self.assertCountEqual(item["candidates"], candidates)
+                self.assertEqual(item["missing"], not bool(matches + later))
+                self.assertEqual(item["status"], "collected" if later else status)
+        assigned = {(0, names[0]): [44], (0, "audioserver"): [45],
+                    (0, "/system/bin/surfaceflinger"): [47], (1, "/system/bin/logd"): [51]}
+        for key, process in processes.items():
+            self.assertEqual(process["required_rows"], assigned.get(key, []), key)
 
     def test_member_resources_independent_exact_scope_and_nulls(self):
         rows = self.s(1000) + self.p(1000, cpu1c=50, rss_kb=10, rd_kb=2)
@@ -938,7 +1580,7 @@ class GroupStoreTests(unittest.TestCase):
         self.assertIn("单成员组", module_details(group, analyses))
         self.assertEqual(analyses["P"]["statistics"]["samples"], 1)
         self.assertIn(text(payload), baseline)
-        self.assertNotIn("<script", baseline.lower())
+        self.assertEqual(self.assert_report(baseline)["processes"][0]["name"], payload)
         self.assertEqual(render_report(self.store, sid), baseline)
         for conclusion in ("待评估", "准入", "有条件准入", "不准入"):
             saved = self.store.save_report_settings(sid, dict(conclusion=conclusion))
@@ -1201,7 +1843,7 @@ class GroupStoreTests(unittest.TestCase):
         self.assertEqual(metric["total"], float(4 * (2**64-1)))
 
 
-class ApiTests(unittest.TestCase):
+class ApiTests(ReportAssertions, unittest.TestCase):
     def setUp(self):
         from fastapi.testclient import TestClient
         from perf_api import create_app
@@ -1294,7 +1936,13 @@ class ApiTests(unittest.TestCase):
         report = self.client.get("/api/sessions/" + result.json()["id"] + "/report", headers=self.headers)
         self.assertNotIn(payload, report.text)
         self.assertIn("&lt;script&gt;", report.text)
-        self.assertNotIn("<script", report.text)
+        from perf_report_ui import REPORT_CSP
+
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.headers["content-security-policy"], REPORT_CSP + "; sandbox allow-scripts")
+        data = self.assert_report(report.text)
+        self.assertEqual(data["session"]["name"], payload)
+        self.assertIn(payload, [p["name"] for p in data["processes"]])
 
     def test_chunked_limit_closes_files_and_releases_lock(self):
         import asyncio

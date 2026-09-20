@@ -52,18 +52,18 @@ class Store(GroupStore):
                 CREATE TABLE IF NOT EXISTS process_rss_ready_v1 (
                     session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
                 );
-                CREATE TABLE IF NOT EXISTS process_rank_v2 (
+                CREATE TABLE IF NOT EXISTS process_rank_v3 (
                     session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     segment INTEGER, pid INTEGER, name TEXT, cpu_p95 REAL, cpu_p99 REAL,
                     samples INTEGER, cpu_peak REAL, cpu_avg REAL, rss_peak_kb REAL,
                     wait_peak REAL, read_kb REAL, write_kb REAL, dmabuf_peak_kb REAL,
                     PRIMARY KEY(session, segment, pid, name)
                 );
-                CREATE TABLE IF NOT EXISTS process_rank_ready_v2 (
+                CREATE TABLE IF NOT EXISTS process_rank_ready_v3 (
                     session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     total INTEGER NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS process_name_rank_v1 (
+                CREATE TABLE IF NOT EXISTS process_name_rank_v2 (
                     session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     segment INTEGER, name TEXT, cpu_p95 REAL, cpu_p99 REAL,
                     samples INTEGER, cpu_peak REAL, cpu_avg REAL, rss_peak_kb REAL,
@@ -73,7 +73,7 @@ class Store(GroupStore):
                     concurrent_pids INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(session, segment, name)
                 );
-                CREATE TABLE IF NOT EXISTS process_name_ready_v1 (
+                CREATE TABLE IF NOT EXISTS process_name_ready_v2 (
                     session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     total INTEGER NOT NULL
                 );
@@ -262,6 +262,36 @@ class Store(GroupStore):
             cursor = db.execute("SELECT id,segment,cycle,data FROM records WHERE " + where + " ORDER BY id", params)
             return self._sample(cursor, count, limit)
 
+    def process_references(self, session_id, segment, limit=1500):
+        """Aggregate full-scope P IO before sampling; never inherit process filters."""
+        self.session(session_id)
+        io_fields = ("rd_kb", "wr_kb", "rchar_kb", "wchar_kb")
+        sums = ",".join(
+            f"SUM(CASE WHEN kind='P' THEN CAST(json_extract(data,'$.{field}') AS REAL) END) AS {field}"
+            for field in io_fields)
+        with self.connect() as db:
+            # Include S-only cycles so absent IO remains NULL, not a fabricated zero.
+            # Spill the full cycle aggregation to disk rather than loading all P rows.
+            db.execute("PRAGMA temp_store=FILE")
+            db.execute("""CREATE TEMP TABLE process_reference_cycles AS
+                SELECT MIN(id) id, segment, cycle, MIN(ts) ts,
+                MAX(CASE WHEN kind='S' THEN json_extract(data,'$.cpu_total') END) cpu_total,
+                MAX(CASE WHEN kind='S' THEN json_extract(data,'$.mem_total_mb')
+                    - json_extract(data,'$.mem_avail_mb') END) mem_used_mb,
+                """ + sums + """ FROM records
+                WHERE session=? AND segment=? AND kind IN ('S','P')
+                GROUP BY segment,cycle""", (session_id, segment))
+            count = db.execute("SELECT COUNT(*) FROM process_reference_cycles").fetchone()[0]
+            cursor = db.execute("SELECT * FROM process_reference_cycles ORDER BY id")
+
+            def rows():
+                for row in cursor:
+                    point = {field: row[field] for field in ("ts", "cpu_total", "mem_used_mb", *io_fields)}
+                    yield {"id": row["id"], "segment": row["segment"], "cycle": row["cycle"],
+                           "data": json.dumps(point)}
+
+            return self._sample(rows(), count, limit)
+
     def report_series(self, session_id, kind, segment, pid=None, name=None, limit=600):
         """Mark real metric gaps before bounded report downsampling."""
         if kind not in ("S", "P"):
@@ -364,63 +394,65 @@ class Store(GroupStore):
                     exporters=[dict(r) for r in exporters])
 
     def _ensure_process_ranks(self, db, session_id):
-        if db.execute("SELECT 1 FROM process_rank_ready_v2 WHERE session=?", (session_id,)).fetchone():
+        # Versioned caches exclude old cpu-based ranks; missing cpu1c stays NULL.
+        # Public cpu_* fields represent single-core CPU for both values and sorting.
+        if db.execute("SELECT 1 FROM process_rank_ready_v3 WHERE session=?", (session_id,)).fetchone():
             return
         # Recheck under SQLite's writer lock: concurrent first requests build only once.
         db.execute("BEGIN IMMEDIATE")
         if not db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
             raise KeyError(session_id)
-        if db.execute("SELECT 1 FROM process_rank_ready_v2 WHERE session=?", (session_id,)).fetchone():
+        if db.execute("SELECT 1 FROM process_rank_ready_v3 WHERE session=?", (session_id,)).fetchone():
             db.commit()
             return
         db.execute("PRAGMA temp_store=FILE")
         db.execute("PRAGMA cache_size=-8192")
-        db.execute("""INSERT INTO process_rank_v2
+        db.execute("""INSERT INTO process_rank_v3
             WITH ranked AS (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY segment,pid,name,kind
-                    ORDER BY json_extract(data,'$.cpu') IS NULL,json_extract(data,'$.cpu')) rn,
-       COUNT(json_extract(data,'$.cpu')) OVER (PARTITION BY segment,pid,name,kind) n
+                    ORDER BY json_extract(data,'$.cpu1c') IS NULL,json_extract(data,'$.cpu1c')) rn,
+       COUNT(json_extract(data,'$.cpu1c')) OVER (PARTITION BY segment,pid,name,kind) n
                 FROM records WHERE session=? AND kind IN ('P','DP')
             ) SELECT ?,segment,pid,name,
-                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN json_extract(data,'$.cpu') END),
-                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN json_extract(data,'$.cpu') END),
+                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
+                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
                 SUM(kind='P'),
-                MAX(json_extract(data,'$.cpu')), AVG(json_extract(data,'$.cpu')),
+                MAX(json_extract(data,'$.cpu1c')), AVG(json_extract(data,'$.cpu1c')),
                 MAX(json_extract(data,'$.rss_kb')), MAX(json_extract(data,'$.wait')),
                 SUM(CAST(json_extract(data,'$.rd_kb') AS REAL)),
                 SUM(CAST(json_extract(data,'$.wr_kb') AS REAL)),
                 MAX(CASE WHEN kind='DP' THEN json_extract(data,'$.size_kb') END)
             FROM ranked GROUP BY segment,pid,name""", (session_id, session_id))
-        db.execute("""INSERT INTO process_rank_ready_v2 SELECT ?,COUNT(*)
-            FROM process_rank_v2 WHERE session=?""", (session_id, session_id))
+        db.execute("""INSERT INTO process_rank_ready_v3 SELECT ?,COUNT(*)
+            FROM process_rank_v3 WHERE session=?""", (session_id, session_id))
         db.commit()
 
     def _ensure_process_name_ranks(self, db, session_id):
-        if db.execute("SELECT 1 FROM process_name_ready_v1 WHERE session=?", (session_id,)).fetchone():
+        if db.execute("SELECT 1 FROM process_name_ready_v2 WHERE session=?", (session_id,)).fetchone():
             return
         db.execute("BEGIN IMMEDIATE")
         if not db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
             raise KeyError(session_id)
-        if db.execute("SELECT 1 FROM process_name_ready_v1 WHERE session=?", (session_id,)).fetchone():
+        if db.execute("SELECT 1 FROM process_name_ready_v2 WHERE session=?", (session_id,)).fetchone():
             db.commit()
             return
         db.execute("PRAGMA temp_store=FILE")
         db.execute("PRAGMA cache_size=-8192")
         # Recompute from raw samples, never average per-PID percentiles/averages.
-        db.execute("""INSERT INTO process_name_rank_v1
+        db.execute("""INSERT INTO process_name_rank_v2
             (session,segment,name,cpu_p95,cpu_p99,samples,cpu_peak,cpu_avg,
              rss_peak_kb,wait_peak,read_kb,write_kb,dmabuf_peak_kb)
             WITH ranked AS (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY segment,name,kind
-                    ORDER BY json_extract(data,'$.cpu') IS NULL,json_extract(data,'$.cpu')) rn,
-                    COUNT(json_extract(data,'$.cpu')) OVER (PARTITION BY segment,name,kind) n
+                    ORDER BY json_extract(data,'$.cpu1c') IS NULL,json_extract(data,'$.cpu1c')) rn,
+                    COUNT(json_extract(data,'$.cpu1c')) OVER (PARTITION BY segment,name,kind) n
                 FROM records WHERE session=? AND kind IN ('P','DP')
             ) SELECT ?,segment,name,
-                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN json_extract(data,'$.cpu') END),
-                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN json_extract(data,'$.cpu') END),
-                SUM(kind='P'), MAX(json_extract(data,'$.cpu')), AVG(json_extract(data,'$.cpu')),
+                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
+                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
+                SUM(kind='P'), MAX(json_extract(data,'$.cpu1c')), AVG(json_extract(data,'$.cpu1c')),
                 MAX(json_extract(data,'$.rss_kb')), MAX(json_extract(data,'$.wait')),
                 SUM(CAST(json_extract(data,'$.rd_kb') AS REAL)),
                 SUM(CAST(json_extract(data,'$.wr_kb') AS REAL)),
@@ -441,11 +473,11 @@ class Store(GroupStore):
                     if len(path) < 4:
                         path.append(current)
                     previous = current
-            db.execute("""UPDATE process_name_rank_v1 SET pids=?,pid_path=?,pid_changes=?,concurrent_pids=?
+            db.execute("""UPDATE process_name_rank_v2 SET pids=?,pid_path=?,pid_changes=?,concurrent_pids=?
                 WHERE session=? AND segment=? AND name=?""",
                        (json.dumps(list(pids)), json.dumps(path), changes, concurrent, session_id, segment, name))
-        db.execute("""INSERT INTO process_name_ready_v1 SELECT ?,COUNT(*)
-            FROM process_name_rank_v1 WHERE session=?""", (session_id, session_id))
+        db.execute("""INSERT INTO process_name_ready_v2 SELECT ?,COUNT(*)
+            FROM process_name_rank_v2 WHERE session=?""", (session_id, session_id))
         db.commit()
 
     def _ensure_process_rss_ranks(self, db, session_id):
@@ -486,8 +518,8 @@ class Store(GroupStore):
             raise ValueError("segment 必须是非负整数或 null")
         query = q.strip().lower()
         with self.connect() as db:
-            rank_table = "process_name_rank_v1" if merge_names else "process_rank_v2"
-            ready_table = "process_name_ready_v1" if merge_names else "process_rank_ready_v2"
+            rank_table = "process_name_rank_v2" if merge_names else "process_rank_v3"
+            ready_table = "process_name_ready_v2" if merge_names else "process_rank_ready_v3"
             ensure = self._ensure_process_name_ranks if merge_names else self._ensure_process_ranks
             ensure(db, session_id)
             self._ensure_process_rss_ranks(db, session_id)
