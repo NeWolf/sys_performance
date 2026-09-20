@@ -28,13 +28,16 @@ class ReportMarkup(HTMLParser):
         self.styles = []
         self.processes = []
         self.capture = None
+        self.tables = []
         self.feed(report)
         self.close()
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         self.tags.append((tag, attrs))
-        if tag == "details" and "process" in attrs.get("class", "").split():
+        if tag == "div":
+            self.tables.append(attrs.get("data-table"))
+        if tag == "tr" and "data-process" in attrs and "all" in self.tables:
             self.processes.append(attrs)
         if tag == "script":
             self.scripts.append([attrs, ""])
@@ -43,6 +46,8 @@ class ReportMarkup(HTMLParser):
             self.capture = "style"
 
     def handle_endtag(self, tag):
+        if tag == "div" and self.tables:
+            self.tables.pop()
         if tag == self.capture:
             self.capture = None
 
@@ -77,8 +82,8 @@ class ReportAssertions:
                          "first_record_id", "last_record_id", "timestamp_conflict"])
         self.assertEqual(data["cycle_axis_schema"], ["cycle", "ts"])
         self.assertEqual(len(markup.processes), len(data["processes"]))
-        self.assertEqual({p["id"] for p in markup.processes},
-                         {"detail-" + p["id"] for p in data["processes"]})
+        self.assertEqual({p["data-process"] for p in markup.processes},
+                         {p["id"] for p in data["processes"]})
         forbidden = {"link", "iframe", "img", "object", "embed", "base", "form",
                      "audio", "video", "source", "foreignobject", "use", "image", "animate", "set"}
         self.assertFalse(forbidden.intersection(tag for tag, _ in markup.tags))
@@ -101,14 +106,53 @@ class ReportAssertions:
         self.assertEqual(metric["count"], count)
         self.assertEqual([metric[key] for key in ("min", "avg", "p95", "p99", "max")], values)
 
-    def report_svg(self, report, title):
-        import xml.etree.ElementTree as ET
+    def report_lines(self, points, field, divisor=1, mark_runs=False):
+        """Execute the shipped ECharts series builder; transport payload via stdin."""
+        import shutil
+        import subprocess
 
-        roots = [ET.fromstring(svg) for svg in re.findall(r"<svg.*?</svg>", report)]
-        matches = [root for root in roots if root.get("aria-label") == title]
-        self.assertEqual(len(matches), 1, title)
-        self.assertEqual(matches[0].get("viewBox"), "0 0 900 240")
-        return matches[0]
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "报告 JavaScript 回归需要 Node.js，不允许跳过")
+        source = (Path(__file__).parent / "report_assets/report.js").read_text(encoding="utf-8")
+        prefix = source[:source.index("  const observer =")]
+        script = """
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+global.document = {
+  getElementById: () => ({textContent: JSON.stringify({
+    process_fields: [], full_cycle_schema: [], cycle_axis_schema: []
+  })}),
+  documentElement: {classList: {add() {}}}
+};
+""" + prefix + """
+const points = input.mark_runs ? markRuns(input.points, [input.field]) : input.points;
+console.log(JSON.stringify(lineSeries(points, input.field, input.field, '#123456', input.divisor)));
+})();
+"""
+        result = subprocess.run([node, "-e", script], input=json.dumps(dict(
+            points=points, field=field, divisor=divisor, mark_runs=mark_runs)),
+            text=True, encoding="utf-8", capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        groups = json.loads(result.stdout)
+        for group in groups:
+            self.assertEqual(group["type"], "line")
+            self.assertFalse(group["connectNulls"])
+            self.assertTrue(group["data"])
+            self.assertTrue(all(a[0] < b[0] for a, b in zip(group["data"], group["data"][1:])))
+        return [group["data"] for group in groups]
+
+    def assert_lines(self, groups, points, edges):
+        self.assertEqual(sum(len(group) for group in groups), points)
+        self.assertEqual(sum(len(group) - 1 for group in groups), edges)
+
+    def assert_report_independent(self, sid, baseline):
+        from unittest.mock import patch
+        from perf_report import render_report
+
+        with patch.object(self.store, "group_analysis", side_effect=AssertionError("报告不应读取分组")), \
+                patch.object(self.store, "report_settings", side_effect=AssertionError("报告不应读取手工设置")):
+            report = render_report(self.store, sid)
+        self.assertEqual(report, baseline)
+        return self.assert_report(report)
 
 
 class ParserTests(unittest.TestCase):
@@ -220,8 +264,7 @@ class StoreTests(ReportAssertions, unittest.TestCase):
     def test_report_overview_chart_percentiles_and_time(self):
         import shutil
         import subprocess
-        if not shutil.which("node"):
-            self.skipTest("Node.js is required for report chart checks")
+        self.assertIsNotNone(shutil.which("node"), "报告 JavaScript 回归需要 Node.js，不允许跳过")
         source = Path("report_assets/report.js").read_text(encoding="utf-8")
         prefix = source[:source.index("  const observer =")]
         harness = """
@@ -301,8 +344,7 @@ assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
                 self.assertEqual(cells[header], p["metrics"][field]["total"])
         self.assertNotIn("不是整机实测 IO", html)
         self.assertEqual(html.count("IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；"), 2)
-        if not shutil.which("node"):
-            self.skipTest("Node.js is required for report chart checks")
+        self.assertIsNotNone(shutil.which("node"), "报告 JavaScript 回归需要 Node.js，不允许跳过")
         source = Path("report_assets/report.js").read_text(encoding="utf-8")
         prefix = source[:source.index("  data.systems.forEach(setupSegment);")]
         harness = """
@@ -507,65 +549,88 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
 
     def test_statistics_helper_all_fields_and_percentiles(self):
         from perf_metrics import CATEGORIES, NUMERIC
-        from perf_report import statistics_table
+        from perf_report_ui import esc, statistics
+        from perf_report import timestamp
 
         rows = [SAMPLE.replace("42.04", str(cpu)).replace("946684800123", str(946684800123 + cpu))
                 for cpu in range(1, 101)]
         sid = self.import_sample("".join(rows))["id"]
         for kind, fields in NUMERIC.items():
             result = self.store.statistics(sid, kind)
-            report = statistics_table(result, kind + " · 原始统计")
-            self.assertIn(kind + " · ", report)
+            self.assertEqual(set(result["metrics"]), set(fields))
+            self.assertEqual(set(result["categories"]), set(CATEGORIES.get(kind, ())))
+            self.assertEqual(result["samples"], 200 if kind == "DE" else 100)
+            report = statistics(result["metrics"])
             for field in fields:
-                self.assertIn("<td>" + field + "</td>", report)
-            for field in CATEGORIES.get(kind, ()):
-                self.assertIn(" · " + field + "</h4>", report)
+                metric = result["metrics"][field]
+                self.assertEqual(metric["count"], result["samples"])
+                for key in ("min", "avg", "p95", "p99", "max"):
+                    self.assertIsNotNone(metric[key])
+                if field != "cpu":
+                    self.assertIn(esc(metric["label"]), report)
+            for category in result["categories"].values():
+                self.assertEqual(category["count"], result["samples"])
+                self.assertEqual(sum(v["count"] for v in category["values"]), category["count"])
+                self.assertAlmostEqual(sum(v["percent"] for v in category["values"]), 100)
             if kind == "S":
-                self.assertIn("<td>1 %</td><td>50.5 %</td><td>95 %</td><td>99 %</td><td>100 %</td>", report)
-                self.assertIn("9.11 GB", report)
-            self.assertIn("2000-01-01T00:00:00.124+00:00", report)
-            self.assertIn("2000-01-01T00:00:00.223+00:00", report)
+                self.assert_metric(result["metrics"]["cpu_total"], 100, [1, 50.5, 95, 99, 100])
+                self.assertEqual(result["metrics"]["mem_avail_mb"]["avg"], 9326)
+            self.assertEqual(timestamp(result["start"]), "2000-01-01T00:00:00.124+00:00")
+            self.assertEqual(timestamp(result["end"]), "2000-01-01T00:00:00.223+00:00")
 
     def test_report_formatting_and_empty_metrics(self):
-        from perf_report import measure, render_report, timestamp
+        from perf_report import render_report, timestamp
+        from perf_report_ui import number, statistics
 
-        for value, unit, total, expected in (
-                (None, "KB", False, "—"), (0, "MB", False, "0 MB"),
-                (1024, "KB", False, "1 MB"), (0.5, "MB", False, "512 KB"),
-                (-2048, "KB / 周期", False, "-2 MB / 周期"),
-                (-2048, "KB / 周期", True, "-2 MB"),
-                (12.345, "%", False, "12.35 %"), (1234, "", False, "1,234")):
-            with self.subTest(value=value, unit=unit, total=total):
-                self.assertEqual(measure(value, unit, total), expected)
+        for value, expected in ((None, "—"), (float('nan'), "—"),
+                                (float('inf'), "—"), (-float('inf'), "—"),
+                                (0, "0"), (0.5, "0.5"), (-2048, "-2,048"),
+                                (12.345, "12.35"), (1234, "1,234"), ("文本", "文本")):
+            with self.subTest(value=value):
+                self.assertEqual(number(value), expected)
         self.assertEqual(timestamp(None), "—")
         self.assertEqual(timestamp(946684800123), "2000-01-01T00:00:00.123+00:00")
         self.assertEqual(timestamp(2 ** 63 - 1), str(2 ** 63 - 1) + " ms")
         sid = self.import_sample(SAMPLE.splitlines()[0] + "\n")["id"]
         report = render_report(self.store, sid)
-        self.assertIn("无进程记录", report)
-        self.assertNotIn('<details', report)
-        from perf_report import statistics_table
-        empty = statistics_table(self.store.statistics(sid, "P"), "P")
-        self.assertIn("0 条原始记录；— → —", empty)
-        self.assertIn("<td>cpu1c</td><td>0</td><td>—</td>", empty)
+        self.assertEqual(self.assert_report(report)["processes"], [])
+        result = self.store.statistics(sid, "P")
+        self.assertEqual(result["samples"], 0)
+        self.assertIsNone(result["start"])
+        self.assertIsNone(result["end"])
+        for metric in result["metrics"].values():
+            self.assert_metric(metric, 0, [None] * 5)
+        empty = statistics(result["metrics"])
+        self.assertIn('data-sort="0">0</td>', empty)
+        self.assertIn('data-sort="">—</td>', empty)
 
     def test_report_statistics_escape_categories(self):
-        from perf_report import statistics_table, text
+        from perf_report_ui import esc, grid, statistics
 
         sid = self.import_sample()["id"]
         result = self.store.statistics(sid, "P")
-        payload = '<img src=x onerror="alert(1)">'
+        payload = '<img src=x onerror="alert(1)">&\'quoted\''
         result["categories"]["pol"]["values"][0]["value"] = payload
-        result["metrics"]["cpu"]["note"] = payload
-        report = statistics_table(result, payload)
+        result["metrics"]["cpu1c"]["label"] = payload
+        result["metrics"]["cpu1c"]["unit"] = payload
+        report = statistics(result["metrics"])
+        category = result["categories"]["pol"]["values"][0]["value"]
+        report += grid([payload], [[category]], identities=[payload], role=payload)
         self.assertNotIn(payload, report)
-        self.assertEqual(report.count(text(payload)), 3)
+        self.assertIn(esc(payload), report)
+        markup = ReportMarkup(report)
+        self.assertNotIn("img", [tag for tag, _ in markup.tags])
+        self.assertTrue(all(not any(k.startswith("on") for k in attrs)
+                            for _, attrs in markup.tags))
+        self.assertEqual([attrs["data-process"] for _, attrs in markup.tags
+                          if "data-process" in attrs], [payload])
+        self.assertEqual(esc(None), "—")
 
     def test_report_compact_contract_and_system_resources(self):
         import re
         from unittest.mock import patch
-        from perf_metrics import METHOD
-        from perf_report import render_report, text
+        from perf_report_ui import esc
+        from perf_report import render_report
 
         rows = [SAMPLE.replace("42.04", str(i)).replace("5399", str(i * 2))
                 .replace("946684800123", str(946684800123 + i)) for i in range(1, 101)]
@@ -578,13 +643,15 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
         data = self.assert_report(report)
         self.assertEqual(len(data["processes"]), 2)
         self.assertEqual(len(data["systems"]), 1)
-        self.assertIn(text(METHOD), report)
+        for value in data["method"].values():
+            self.assertIn(esc(value), report)
+        self.assertEqual(data["display_cpu_basis"], "system-100-process-single-core")
         for removed in ("1 测试环境", "6 准入结论", "附录 A", "组同周期合计统计", "请先配置准入进程组"):
             self.assertNotIn(removed, report)
-        for phrase in ("进程 CPU + 系统 CPU（整机）", "RSS 内存", "cpu / cpu_total", "纯离线文件"):
+        for phrase in ("选中进程单核 CPU %", "选中进程 RSS MB", "全进程", "离线自包含报告"):
             self.assertIn(phrase, report)
         metrics = data["systems"][0]["metrics"]
-        for field, expected in (("cpu_total", [95, 99, 100]), ("mem_used_mb", [190, 198, 200])):
+        for field, expected in (("cpu_total", [95, 99, 100]), ("mem_used_mb", [5399] * 3)):
             self.assertEqual(metrics[field]["count"], 100)
             self.assertEqual([metrics[field][key] for key in ("p95", "p99", "max")], expected)
 
@@ -1065,8 +1132,8 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertTrue(dma["dp_only"])
         for metric in dma["metrics"].values():
             self.assert_metric(metric, 0, [None] * 5)
-        self.assertIn("仅 DP 记录，无 P 样本", report)
-        self.assertIn("系统 CPU ·", report)
+        self.assertIn("DP-only", report)
+        self.assertIn("整机 CPU 总占用", report)
 
     def test_report_exact_identity_and_system_series_reuse(self):
         import re
@@ -1099,8 +1166,6 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         series.assert_not_called()
 
     def test_report_zero_null_and_actual_cpu_plot_coordinates(self):
-        import re
-        import xml.etree.ElementTree as ET
         from perf_report import render_report
 
         rows = self.s(1).replace(",7,1,", ",7,40,") + self.p(1, cpu=20, cpu1c=960, rss_kb=0)
@@ -1108,30 +1173,27 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         rows += self.s(3).replace(",7,1,", ",7,40,") + self.p(3, cpu=999, rss_kb=999)
         sid = self.load(rows)
         with self.store.connect() as db:
-            db.execute("UPDATE records SET data=json_set(data,'$.cpu',NULL,'$.rss_kb',NULL) "
+            db.execute("UPDATE records SET data=json_set(data,'$.cpu1c',NULL,'$.rss_kb',NULL) "
                        "WHERE session=? AND kind='P' AND ts=3", (sid,))
-        report = render_report(self.store, sid)
-        data = self.assert_report(report)
-        process_data = data["processes"][0]
-        self.assert_metric(process_data["metrics"]["cpu"], 2, [0, 10, 20, 20, 20])
-        self.assert_metric(process_data["metrics"]["rss_kb"], 2, [0] * 5)
-        self.assertEqual([row[2] for row in process_data["full_cycles"]], [20, 0, None])
-        self.assertEqual(process_data["active"]["cycles"], 1)
-        cpu_svg = self.report_svg(report, "进程 CPU + 系统 CPU（整机）")
-        rss_svg = self.report_svg(report, "RSS 内存")
-        process = [dot for dot in cpu_svg.findall("circle") if dot.findtext("title").startswith("进程 CPU ·")]
-        system = [dot for dot in cpu_svg.findall("circle") if dot.findtext("title").startswith("系统 CPU ·")]
-        self.assertEqual([(dot.get("cx"), dot.get("cy")) for dot in process],
-                         [("85.00", "112.50"), ("482.50", "200.00")])
-        self.assertEqual([dot.get("cy") for dot in system], ["25.00"] * 3)
-        self.assertEqual([dot.get("cy") for dot in rss_svg.findall("circle")], ["200.00"] * 2)
-        self.assertEqual(len(cpu_svg.findall("path")) - 1, 3)
-        self.assertEqual(len(rss_svg.findall("path")) - 1, 1)
+        data = self.assert_report(render_report(self.store, sid))
+        process = data["processes"][0]
+        self.assert_metric(process["metrics"]["cpu"], 3, [0, 1019 / 3, 999, 999, 999])
+        self.assert_metric(process["metrics"]["cpu1c"], 2, [800, 880, 960, 960, 960])
+        self.assert_metric(process["metrics"]["rss_kb"], 2, [0] * 5)
+        self.assertEqual([row[2:4] for row in process["full_cycles"]],
+                         [[20, 960], [0, 800], [999, None]])
+        self.assertEqual(process["active"]["cycles"], 2)
+        cpu = self.report_lines(process["series"]["points"], "cpu1c")
+        rss = self.report_lines(process["series"]["points"], "rss_kb", 1024)
+        system = self.report_lines(data["systems"][0]["series"]["points"], "cpu_total", 1 / 8)
+        self.assertEqual(cpu, [[[1, 960], [2, 800]]])
+        self.assertEqual(rss, [[[1, 0], [2, 0]]])
+        self.assertEqual(system, [[[1, 320], [2, 320], [3, 320]]])
+        self.assert_lines(cpu, 2, 1)
+        self.assert_lines(rss, 2, 1)
+        self.assert_lines(system, 3, 2)
 
     def test_report_series_metric_gaps_and_cycle_boundaries(self):
-        import xml.etree.ElementTree as ET
-        from perf_report import report_chart
-
         mutations = {
             "cpu_null": ("data=json_set(data,'$.cpu',NULL)", 3, 3, 5),
             "rss_null": ("data=json_set(data,'$.rss_kb',NULL)", 3, 5, 3),
@@ -1142,7 +1204,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         }
         for case, (assignment, ts, cpu_lines, rss_lines) in mutations.items():
             with self.subTest(case=case):
-                sid = self.load("".join(self.s(i) + self.p(i, name=case, cpu=i, rss_kb=i)
+                sid = self.load("".join(self.s(i) + self.p(i, name=case, cpu=i, cpu1c=i, rss_kb=i)
                                        for i in range(1, 7)))
                 with self.store.connect() as db:
                     db.execute("UPDATE records SET " + assignment +
@@ -1152,10 +1214,9 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                 self.assertEqual(series["total"], 6)
                 points = series["points"]
                 for field, expected in (("cpu", cpu_lines), ("rss_kb", rss_lines)):
-                    chart = ET.fromstring(report_chart([(series, field, field)], field, ""))
-                    self.assertEqual(len(chart.findall(".//line")), expected)
-                    self.assertEqual(len(chart.findall(".//circle")),
-                                     5 if case == field.replace("rss_kb", "rss") + "_null" else 6)
+                    count = 5 if case == field.replace("rss_kb", "rss") + "_null" else 6
+                    self.assert_lines(self.report_lines(points, field), count, expected)
+                    self.assert_lines(self.report_lines(points, field, mark_runs=True), count, expected)
                 if case in ("cpu_null", "rss_null"):
                     broken = "cpu" if case == "cpu_null" else "rss_kb"
                     intact = "rss_kb" if broken == "cpu" else "cpu"
@@ -1163,11 +1224,9 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                     self.assertEqual(points[1]["_run_" + intact], points[3]["_run_" + intact])
 
     def test_report_downsampling_preserves_hidden_gaps_not_artificial_gaps(self):
-        import re
-        import xml.etree.ElementTree as ET
-        from perf_report import render_report, report_chart
+        from perf_report import render_report
 
-        sid = self.load("".join(self.s(i) + self.p(i, cpu=i, rss_kb=i) for i in range(1, 1002)))
+        sid = self.load("".join(self.s(i) + self.p(i, cpu=i, cpu1c=i, rss_kb=i) for i in range(1, 1002)))
         continuous = self.store.report_series(sid, "P", 0, pid=1, name="a", limit=4)
         self.assertTrue(continuous["sampled"])
         self.assertEqual(continuous["total"], 1001)
@@ -1175,22 +1234,22 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertLessEqual(len(continuous["points"]), 4)
         self.assertTrue(any(b["cycle"] > a["cycle"] + 1
                             for a, b in zip(continuous["points"], continuous["points"][1:])))
-        chart = ET.fromstring(report_chart([(continuous, "cpu", "CPU")], "CPU", "%"))
-        self.assertEqual(len(chart.findall(".//line")), len(continuous["points"]) - 1)
+        self.assert_lines(self.report_lines(continuous["points"], "cpu"),
+                          len(continuous["points"]), len(continuous["points"]) - 1)
         full_report = render_report(self.store, sid)
         full_data = self.assert_report(full_report)
         self.assertEqual(len(full_data["processes"][0]["full_cycles"]), 1001)
-        self.assert_metric(full_data["processes"][0]["metrics"]["cpu"],
+        self.assert_metric(full_data["processes"][0]["metrics"]["cpu1c"],
                            1001, [1, 501, 951, 991, 1001])
-        full_svg = self.report_svg(full_report, "进程 CPU + 系统 CPU（整机）")
-        full_dots = [dot for dot in full_svg.findall("circle")
-                     if dot.findtext("title").startswith("进程 CPU ·")]
-        self.assertGreater(len(full_dots), 2)
-        self.assertLessEqual(len(full_dots), 600)
-        self.assertEqual(len([p for p in full_svg.findall("path")
-                             if p.get("stroke") == full_dots[0].get("fill")]), len(full_dots) - 1)
+        full_points = full_data["processes"][0]["series"]["points"]
+        self.assertGreater(len(full_points), 2)
+        self.assertLessEqual(len(full_points), 600)
+        self.assert_lines(self.report_lines(full_points, "cpu1c"), len(full_points), len(full_points) - 1)
+        raw_points = [dict(zip(full_data["full_cycle_schema"], row), segment=0)
+                      for row in full_data["processes"][0]["full_cycles"]]
+        self.assert_lines(self.report_lines(raw_points, "cpu1c", mark_runs=True), 600, 599)
         with self.store.connect() as db:
-            db.execute("UPDATE records SET data=json_set(data,'$.cpu',NULL) "
+            db.execute("UPDATE records SET data=json_set(data,'$.cpu',NULL,'$.cpu1c',NULL) "
                        "WHERE session=? AND kind='P' AND ts=501", (sid,))
             db.execute("UPDATE records SET data=json_set(data,'$.cpu_total',NULL) "
                        "WHERE session=? AND kind='S' AND ts=501", (sid,))
@@ -1202,21 +1261,18 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertNotEqual(points[0]["_run_cpu"], points[-1]["_run_cpu"])
         self.assertEqual(points[0]["_run_rss_kb"], points[-1]["_run_rss_kb"])
         for field, count in (("cpu", len(points) - 2), ("rss_kb", len(points) - 1)):
-            chart = ET.fromstring(report_chart([(gapped, field, field)], field, ""))
-            self.assertEqual(len(chart.findall(".//line")), count)
+            self.assert_lines(self.report_lines(points, field), len(points), count)
         system = self.store.report_series(sid, "S", 0, limit=4)
         self.assertNotEqual(system["points"][0]["_run_cpu_total"],
                             system["points"][-1]["_run_cpu_total"])
         report = render_report(self.store, sid)
-        self.assertIn("已降采样", report)
         data = self.assert_report(report)
         process = data["processes"][0]
         self.assertEqual(len(process["full_cycles"]), 1001)
-        self.assert_metric(process["metrics"]["cpu"], 1000, [1, 501, 951, 991, 1001])
+        self.assert_metric(process["metrics"]["cpu1c"], 1000, [1, 501, 951, 991, 1001])
         self.assert_metric(process["metrics"]["rss_kb"], 1001, [1, 501, 951, 991, 1001])
-        self.assertEqual(process["full_cycles"][500][2], None)
-        cpu_svg = self.report_svg(report, "进程 CPU + 系统 CPU（整机）")
-        for series, field, label in ((process["series"], "cpu", "进程 CPU"),
+        self.assertEqual(process["full_cycles"][500][3], None)
+        for series, field, label in ((process["series"], "cpu1c", "进程 CPU"),
                                       (data["systems"][0]["series"], "cpu_total", "系统 CPU")):
             self.assertTrue(series["sampled"])
             self.assertEqual(series["total"], 1001)
@@ -1231,39 +1287,30 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
             left = max((p for p in valid if p["ts"] < 501), key=lambda p: p["ts"])
             right = min((p for p in valid if p["ts"] > 501), key=lambda p: p["ts"])
             self.assertNotEqual(left["_run_" + field], right["_run_" + field])
-            dots = [dot for dot in cpu_svg.findall("circle")
-                    if dot.findtext("title").startswith(label + " ·")]
-            self.assertEqual(len(dots), len(valid))
-            color = dots[0].get("fill")
-            paths = [p for p in cpu_svg.findall("path") if p.get("stroke") == color]
-            self.assertGreater(len(paths), 0)
-            self.assertEqual(len(paths), len(dots) - 2)
-            for path in paths:
-                coords = re.fullmatch(r"M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)", path.get("d"))
-                self.assertIsNotNone(coords)
-                self.assertFalse(float(coords[1]) < 482.50 < float(coords[3]))
-        rss_svg = self.report_svg(report, "RSS 内存")
-        self.assertGreater(len(rss_svg.findall("circle")), 2)
-        self.assertLessEqual(len(rss_svg.findall("circle")), 600)
-        self.assertEqual(len(rss_svg.findall("path")) - 1, len(rss_svg.findall("circle")) - 1)
+            groups = self.report_lines(series["points"], field)
+            self.assert_lines(groups, len(valid), len(valid) - 2)
+            self.assertTrue(all(not (g[0][0] < 501 < g[-1][0]) for g in groups))
+        rss_points = process["series"]["points"]
+        self.assert_lines(self.report_lines(rss_points, "rss_kb"), len(rss_points), len(rss_points) - 1)
+        raw_points = [dict(zip(data["full_cycle_schema"], row), segment=0)
+                      for row in process["full_cycles"]]
+        self.assert_lines(self.report_lines(raw_points, "cpu1c", mark_runs=True), 600, 598)
 
     def test_report_chart_requires_same_segment_known_run_and_increasing_time(self):
-        import xml.etree.ElementTree as ET
-        from perf_report import report_chart
-
-        first = dict(ts=1, cpu=10, segment=0, _run_cpu=1)
-        cases = [(dict(ts=1000000, segment=0, _run_cpu=1), 1),
-                 (dict(ts=2, segment=1, _run_cpu=1), 0),
-                 (dict(ts=2, segment=0, _run_cpu=2), 0),
-                 (dict(ts=2, segment=0, _run_cpu=None), 0),
-                 (dict(ts=1, segment=0, _run_cpu=1), 0),
-                 (dict(ts=0, segment=0, _run_cpu=1), 0)]
+        first = dict(ts=1, cpu1c=10, segment=0, _run_cpu1c=1)
+        cases = [(dict(ts=1000000, segment=0, _run_cpu1c=1), 1),
+                 (dict(ts=2, segment=1, _run_cpu1c=1), 0),
+                 (dict(ts=2, segment=0, _run_cpu1c=2), 0),
+                 (dict(ts=2, segment=0, _run_cpu1c=None), 0),
+                 (dict(ts=1, segment=0, _run_cpu1c=1), 0),
+                 (dict(ts=0, segment=0, _run_cpu1c=1), 0)]
         for changes, expected in cases:
             with self.subTest(changes=changes):
-                series = dict(points=[first, dict(first, **changes)], total=2, sampled=False)
-                chart = ET.fromstring(report_chart([(series, "cpu", "CPU")], "CPU", "%"))
-                self.assertEqual(len(chart.findall(".//circle")), 2)
-                self.assertEqual(len(chart.findall(".//line")), expected)
+                self.assert_lines(self.report_lines([first, dict(first, **changes)], "cpu1c"), 2, expected)
+        for invalid in (None, "1"):
+            with self.subTest(invalid=invalid):
+                self.assert_lines(self.report_lines([first, dict(first, ts=invalid)], "cpu1c"), 1, 0)
+                self.assert_lines(self.report_lines([first, dict(first, ts=2, cpu1c=invalid)], "cpu1c"), 1, 0)
 
     def test_report_offline_markup_and_untrusted_text(self):
         from html import escape
@@ -1281,7 +1328,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(data["session"]["name"], payload)
         self.assertEqual(data["processes"][0]["name"], payload)
         self.assertEqual(len(ReportMarkup(report).processes), 1)
-        self.assertIn("<svg", report)
+        self.assertIn('data-chart="system-cpu"', report)
 
     def test_report_only_dp_without_system_does_not_fabricate_samples(self):
         from perf_report import render_report
@@ -1296,8 +1343,10 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(process["full_cycles"][0][2:9], [None] * 7)
         self.assertEqual(data["systems"][0]["samples"], 0)
         self.assertEqual(data["systems"][0]["series"]["points"], [])
-        self.assertIn("仅 DP 记录，无 P 样本", report)
-        self.assertNotIn("<svg", report)
+        self.assertIn("DP-only", report)
+        for field in data["process_fields"]:
+            self.assertEqual(self.report_lines(process["series"]["points"], field), [])
+        self.assertEqual(self.report_lines(data["systems"][0]["series"]["points"], "cpu_total"), [])
         for metrics in (process["metrics"], data["systems"][0]["metrics"]):
             for metric in metrics.values():
                 self.assert_metric(metric, 0, [None] * 5)
@@ -1363,7 +1412,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                 process = data["processes"][0]
                 self.assertEqual(process["coverage"]["complete_cycles"], 1)
                 self.assertEqual(process["coverage"]["duplicate_cycles"], 0)
-                self.assertEqual(process["active"]["cycles"], int(missing != "cpu"))
+                self.assertEqual(process["active"]["cycles"], int(missing != "cpu1c"))
                 cycle = dict(zip(data["full_cycle_schema"], process["full_cycles"][0]))
                 for field in fields:
                     absent = field == missing
@@ -1372,7 +1421,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                                        [0] * 5 if absent else [0, 2.5, 5, 5, 5])
                     self.assertEqual(process["coverage"]["metrics"][field],
                                      dict(valid_cycles=1 if absent else 2, percent=50 if absent else 100))
-                    active = missing != "cpu" and not absent
+                    active = missing != "cpu1c" and not absent
                     self.assert_metric(process["active"]["metrics"][field], int(active),
                                        [5] * 5 if active else [None] * 5)
 
@@ -1488,27 +1537,42 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(self.store.group_resources(sid, group["id"])["rows"][0]["statistics"]["cpu1c"]["count"], 0)
 
     def test_member_resources_nearest_rank_and_report_scenes(self):
-        from perf_report import member_resources_table, table
+        from perf_report import render_report
+        from perf_report_ui import grid, number, statistics
+
         sid = self.load("".join(self.p(i, cpu1c=i, rss_kb=i) for i in range(1, 101)))
-        group = self.store.save_group(sid, self.config(scene="后台", members=[dict(
-            pid=1, name="a", service_category="应用服务", related_service="<unsafe>&", foreground="Y")]))
+        baseline = render_report(self.store, sid)
+        member = dict(pid=1, name="a", service_category="应用服务",
+                      related_service="<unsafe>&", foreground="Y")
+        group = self.store.save_group(sid, self.config(scene="后台", members=[member]))
         self.store.save_report_settings(sid, dict(cpu_platform="<platform>", kdmips_per_core=28.75))
         resources = self.store.group_resources(sid, group["id"])
-        self.assertEqual(resources["rows"][0]["statistics"]["cpu1c"],
+        row = resources["rows"][0]
+        self.assertEqual(row["statistics"]["cpu1c"],
                          dict(count=100, min=1, avg=50.5, max=100, p95=95, p99=99))
-        report = member_resources_table(resources)
+        for key, expected in dict(min=0.2875, avg=14.51875, p95=27.3125,
+                                  p99=28.4625, max=28.75).items():
+            self.assertAlmostEqual(row["kdmips"][key], expected)
+        self.assertEqual(number(row["kdmips"]["p99"]), "28.46")
         self.assertEqual(resources["settings"]["cpu_platform"], "<platform>")
-        self.assertIn("&lt;platform&gt;", table(["平台"], [[resources["settings"]["cpu_platform"]]]))
+        report = grid(["平台", "关联服务", "分类"], [[resources["settings"]["cpu_platform"],
+                      row["member"]["related_service"], row["member"]["service_category"]]])
+        self.assertIn("&lt;platform&gt;", report)
         self.assertIn("&lt;unsafe&gt;&amp;", report)
         self.assertNotIn("<unsafe>", report)
         self.assertIn("应用服务", report)
-        self.assertIn("28.462 K", report)
-        for scene, index in (("前台", 0), ("后台", 1), ("未标注", 2)):
-            resources["group"]["scene"] = scene
-            cells = ["—"] * 3
-            cells[index] = "1 % / 50.5 % / 95 % / 99 % / 100 %"
-            self.assertIn("<td>100</td>" + "".join("<td>" + c + "</td>" for c in cells),
-                          member_resources_table(resources))
+        self.assertIn('>27.31</td>', statistics(row["statistics"]))
+        self.assertIn('>28.75</td>', statistics(row["statistics"]))
+        for scene in ("前台", "后台", "未标注"):
+            with self.subTest(scene=scene):
+                saved = self.store.save_group(sid, self.config(scene=scene, members=[member]), group["id"])
+                updated = self.store.group_resources(sid, group["id"])
+                self.assertEqual(updated["group"]["scene"], scene)
+                self.assertEqual(updated["group"], saved)
+                self.assertEqual(updated["rows"], resources["rows"])
+                for key, value in member.items():
+                    self.assertEqual(updated["rows"][0]["member"][key], value)
+                self.assert_report_independent(sid, baseline)
 
     def test_resource_settings_validation_and_legacy_members(self):
         import json
@@ -1549,7 +1613,8 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
             self.assertEqual(db.execute("SELECT config FROM process_groups WHERE id=?", (group["id"],)).fetchone()[0], encoded)
 
     def test_report_manual_fields_escaped_and_single_member(self):
-        from perf_report import manual_section, module_details, render_report, table, text
+        from perf_report import render_report
+        from perf_report_ui import esc, grid
 
         fields = ("hardware", "software", "tester", "test_notes", "worst_scenarios",
                   "analysis", "criteria", "conclusion", "conclusion_notes")
@@ -1564,34 +1629,37 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                               foreground="Y", background="N")]))
         self.assertEqual(self.store.report_settings(sid), settings)
         self.assertEqual(self.store.group(sid, group["id"]), group)
-        manual = "".join(manual_section(settings, field, field) for field in fields)
+        manual = grid(fields, [[settings[field] for field in fields]])
         for value in settings.values():
-            self.assertIn(text(value), manual)
+            self.assertIn(esc(value), manual)
             self.assertNotIn(value, manual)
         member = group["members"][0]
-        metadata = table(["组", "说明", "类型", "用途", "前台", "后台"], [[
+        metadata = grid(["组", "说明", "类型", "用途", "前台", "后台"], [[
             group["name"], group["description"], member["process_type"], member["purpose"],
             member["foreground"], member["background"]]])
         for prefix in ("group", "desc", "type", "purpose"):
-            self.assertIn(text(prefix + payload), metadata)
+            self.assertIn(esc(prefix + payload), metadata)
             self.assertNotIn(prefix + payload, metadata)
-        self.assertIn("<td>Y</td><td>N</td>", metadata)
+        self.assertIn('data-sort="Y">Y</td><td data-sort="N">N</td>', metadata)
         analyses = {kind: self.store.group_analysis(sid, group["id"], kind) for kind in ("P", "DP")}
-        self.assertIn("单成员组", module_details(group, analyses))
+        self.assertEqual(len(group["members"]), 1)
+        self.assertEqual(analyses["DP"]["coverage"]["missing"], 1)
+        for metric in analyses["DP"]["statistics"]["metrics"].values():
+            self.assert_metric(metric, 0, [None] * 5)
         self.assertEqual(analyses["P"]["statistics"]["samples"], 1)
-        self.assertIn(text(payload), baseline)
+        self.assertIn(esc(payload), baseline)
         self.assertEqual(self.assert_report(baseline)["processes"][0]["name"], payload)
-        self.assertEqual(render_report(self.store, sid), baseline)
+        self.assert_report_independent(sid, baseline)
         for conclusion in ("待评估", "准入", "有条件准入", "不准入"):
             saved = self.store.save_report_settings(sid, dict(conclusion=conclusion))
             self.assertEqual(self.store.report_settings(sid), saved)
-            self.assertIn("<p class='manual'>" + conclusion + "</p>",
-                          manual_section(saved, "conclusion", "结论"))
-            self.assertEqual(render_report(self.store, sid), baseline)
+            self.assertEqual(saved["conclusion"], conclusion)
+            self.assert_report_independent(sid, baseline)
 
     def test_report_group_offset_peaks_k_and_analysis_reuse(self):
         from unittest.mock import patch
-        from perf_report import module_details, metric_value
+        from perf_report import render_report
+        from perf_report_ui import number, scaled, statistics
 
         rows = "".join(self.s(i) + self.p(i, cpu=i, cpu1c=8*i, rss_kb=i*1024) +
                        self.p(i, 2, "b", cpu=101-i, cpu1c=8*(101-i), rss_kb=(101-i)*1024) +
@@ -1603,28 +1671,35 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         analyses = {kind: self.store.group_analysis(sid, group["id"], kind) for kind in ("P", "DP")}
         factor = self.store.report_settings(sid)["kdmips_per_core"]
         with patch.object(self.store, "group_analysis", wraps=self.store.group_analysis) as analysis:
-            module = module_details(group, analyses, factor)
+            module = statistics(analyses["P"]["statistics"]["metrics"])
         analysis.assert_not_called()
-        report = module
-        self.assertIn("<td>808 %</td><td>808 %</td><td>232.3 K</td><td>232.3 K</td>"
-                      "<td>808 %</td><td>232.3 K</td><td>101 MB</td>", module)
-        self.assertNotIn("808 K", report)
-        self.assertNotIn("200 %", module)
-        self.assertIn("100 个范围周期", module)
-        self.assertNotIn("条原始记录", module)
-        for phrase in ("CPU cpu1c", "读取 rd 周期增量", "写入 wr 周期增量", "DP dmabuf", "DP 对象数",
-                       "I/O MB/s 无法可靠换算"):
-            self.assertIn(phrase, report)
+        metrics = analyses["P"]["statistics"]["metrics"]
+        self.assert_metric(metrics["cpu1c"], 100, [808] * 5)
+        self.assert_metric(metrics["rss_kb"], 100, [101 * 1024] * 5)
+        self.assert_metric(analyses["DP"]["statistics"]["metrics"]["size_kb"], 100, [101 * 1024] * 5)
+        self.assert_metric(analyses["DP"]["statistics"]["metrics"]["objs"], 100, [3] * 5)
+        self.assertEqual(analyses["P"]["coverage"],
+                         dict(cycles=100, complete=100, partial=0, missing=0, duplicates=0))
+        for key in ("p95", "p99", "max"):
+            self.assertEqual(number(scaled(metrics["cpu1c"][key], 100 / factor)), "232.3")
+            self.assertEqual(scaled(metrics["rss_kb"][key], 1024), 101)
+        self.assertIn('>232.3</td>', module)
+        self.assertIn('>101</td>', module)
+        for field in ("rd_kb", "wr_kb", "rchar_kb", "wchar_kb"):
+            m = metrics[field]
+            self.assertEqual(m["count"], 100)
+            self.assertEqual(m["total"], m["avg"] * 100)
+        baseline = render_report(self.store, sid)
+        self.assert_report_independent(sid, baseline)
         overlap = self.store.save_group(sid, self.config(name="重叠组"))
         self.assertEqual(self.store.group_analysis(sid, overlap["id"])["statistics"]["metrics"],
                          analyses["P"]["statistics"]["metrics"])
-        self.assertEqual(metric_value(analyses["P"], "cpu1c", "max", "%"), "808 %")
-        self.assertEqual(metric_value(analyses["P"], "cpu1c", "max", "K", factor), "232.3 K")
-        self.assertEqual(metric_value(analyses["P"], "rss_kb", "max"), "101 MB")
-        self.assertEqual(metric_value(analyses["DP"], "size_kb", "max"), "101 MB")
+        self.assertEqual(scaled(analyses["DP"]["statistics"]["metrics"]["size_kb"]["max"], 1024), 101)
+        self.assert_report_independent(sid, baseline)
 
     def test_report_low_coverage_null_duplicate_and_empty_scope(self):
-        from perf_report import module_details
+        from perf_report import render_report
+        from perf_report_ui import statistics
 
         rows = self.s(1) + self.p(1) + self.p(1, 2, "b") + "DP,1,1,100,2,a\nDP,1,2,200,3,b\n"
         rows += self.s(2) + self.p(2) + self.s(3)
@@ -1636,21 +1711,33 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                        "WHERE session=? AND ts=5 AND pid=2", (sid,))
         group = self.store.save_group(sid, self.config())
         analyses = {kind: self.store.group_analysis(sid, group["id"], kind) for kind in ("P", "DP")}
-        module = module_details(group, analyses)
-        self.assertIn("<td>P</td><td>5</td><td>2</td><td>2</td><td>1</td><td>1</td><td>40 %</td>", module)
-        self.assertIn("<td>DP</td><td>5</td><td>1</td><td>1</td><td>3</td><td>0</td><td>20 %</td>", module)
-        self.assertIn("<td>cpu</td><td>1</td><td>5</td><td>20 %</td>", module)
-        self.assertIn("<td>rss_kb</td><td>2</td><td>5</td><td>40 %</td>", module)
-        self.assertIn("低覆盖率风险", module)
-        self.assertIn("完整周期仅代表成员记录齐全", module)
-        self.assertIn("5 个范围周期", module)
-        self.assertNotIn("条原始记录", module)
+        self.assertEqual(analyses["P"]["coverage"],
+                         dict(cycles=5, complete=2, partial=2, missing=1, duplicates=1))
+        self.assertEqual(analyses["DP"]["coverage"],
+                         dict(cycles=5, complete=1, partial=1, missing=3, duplicates=0))
+        metrics = analyses["P"]["statistics"]["metrics"]
+        self.assertEqual(metrics["cpu"]["count"], 1)
+        self.assertEqual(metrics["rss_kb"]["count"], 2)
+        for field, percent in (("cpu", 20), ("rss_kb", 40)):
+            self.assertEqual(metrics[field]["count"] / analyses["P"]["statistics"]["samples"] * 100, percent)
+        # 完整周期只说明成员记录齐全，字段缺失不应补零。
+        self.assertGreater(analyses["P"]["coverage"]["complete"], metrics["cpu"]["count"])
+        baseline = render_report(self.store, sid)
+        self.assert_report_independent(sid, baseline)
         group = self.store.save_group(sid, self.config(start=10, end=20), group["id"])
         analyses = {kind: self.store.group_analysis(sid, group["id"], kind) for kind in ("P", "DP")}
-        empty = module_details(group, analyses)
-        self.assertIn("范围内无周期，待评估", empty)
-        self.assertIn("0 个范围周期；— → —", empty)
-        self.assertIn("无对应样本，不补零", empty)
+        for analysis in analyses.values():
+            self.assertEqual(analysis["series"], dict(points=[], total=0, sampled=False))
+            self.assertEqual(analysis["coverage"],
+                             dict(cycles=0, complete=0, partial=0, missing=0, duplicates=0))
+            result = analysis["statistics"]
+            self.assertEqual(result["samples"], 0)
+            self.assertIsNone(result["start"])
+            self.assertIsNone(result["end"])
+            for metric in result["metrics"].values():
+                self.assert_metric(metric, 0, [None] * 5)
+            self.assertIn('data-sort="">—</td>', statistics(result["metrics"]))
+        self.assert_report_independent(sid, baseline)
 
     def test_cycle_sum_before_peak_percentiles_and_increments(self):
         text = "".join(self.s(i) + self.p(i, cpu=i, cpu1c=8*i, rss_delta_kb=-10) +
@@ -1883,7 +1970,7 @@ class ApiTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(self.client.get(base + "/processes", params={"q": "x" * 257}, headers=self.headers).status_code, 422)
         report = self.client.get(base + "/report", headers=self.headers)
         self.assertEqual(report.status_code, 200)
-        self.assertIn("<svg", report.text)
+        self.assertIn('data-chart="system-cpu"', report.text)
         self.assertIn("attachment", report.headers["content-disposition"])
         self.assertEqual(self.client.delete(base, headers=self.headers).json(), {"deleted": True})
         self.assertEqual(self.client.get(base, headers=self.headers).status_code, 404)
@@ -2060,7 +2147,7 @@ class ApiTests(ReportAssertions, unittest.TestCase):
                 self.assertTrue(client.get(base + "/processes").json())
                 report = client.get(base + "/report")
                 self.assertEqual(report.status_code, 200)
-                self.assertIn("<svg", report.text)
+                self.assertIn('data-chart="system-cpu"', report.text)
                 self.assertEqual(client.delete(base).status_code, 200)
                 self.assertEqual(client.get("/api/sessions").json(), [])
         finally:
