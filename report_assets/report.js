@@ -256,7 +256,7 @@
     const input = wrap.querySelector('.table-search'), count = wrap.querySelector('.table-count');
     const filter = () => {
       const query = (input?.value || '').toLocaleLowerCase().trim();
-      for (const row of rows) row.hidden = !row.textContent.toLocaleLowerCase().includes(query);
+      for (const row of rows) row.hidden = !(row.textContent + ' ' + (row.dataset.search || '')).toLocaleLowerCase().includes(query);
       if (count) count.textContent = rows.filter(row => !row.hidden).length + ' / ' + rows.length + ' 行';
     };
     if (input) input.addEventListener('input',filter);

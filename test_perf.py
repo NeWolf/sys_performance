@@ -398,6 +398,21 @@ for (const mode of ['overlay','merge']) {
   assert.equal(option(mode+'-io').series.length,4);
 }
 const root=document.getElementById(system.id);
+const searchWrap = new Node(), searchInput = searchWrap.querySelector('.table-search');
+const searchTable = searchWrap.querySelector('table');
+const searchRow = new Node();
+searchRow.textContent='pid-worker pid4次变更，last：100';
+searchRow.dataset.search='100, 600, 700, 800, 900';
+searchTable.tBodies=[{rows:[searchRow]}];
+searchTable.tHead={rows:[{cells:[]}]};
+setupTable(searchWrap,()=>{});
+for (const [query, hidden] of [['900',false],['100',false],['PID-WORKER',false],['999',true],['',false]]) {
+  searchInput.value=query; searchInput.events.input();
+  assert.equal(searchRow.hidden,hidden);
+}
+delete searchRow.dataset.search;
+searchInput.value='pid-worker'; searchInput.events.input();
+assert.equal(searchRow.hidden,false);
 const candidates=root.querySelector('.candidate-list');
 const chosen=candidates.children.find(label=>label.children[0].value===data.processes.find(p=>!p.dp_only).id).children[0];
 chosen.checked=true; chosen.events.change();
@@ -437,6 +452,37 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
 })();
 """
         self.run_report_script(harness + prefix + checks)
+
+    def test_report_process_pid_summary(self):
+        from perf_report import render_report
+        from perf_report_ui import process_row
+
+        cases = [
+            ([[900]], "900"),
+            ([[900], [800], [700], [600]], "600, 700, 800, 900"),
+            ([[900], [800], [700], [600], [100]], "pid4次变更，last：100"),
+            ([[900], [800], [900], [800], [900]], "pid4次变更，last：900"),
+            ([[900], [800], [700], [600], [100, 200]], "pid4次变更，last：100, 200"),
+        ]
+        for sequence, expected in cases:
+            with self.subTest(sequence=sequence):
+                lines = []
+                for cycle, pids in enumerate(sequence):
+                    ts = 946684800123 + cycle * 1000
+                    lines.append(SAMPLE.splitlines()[0].replace("946684800123", str(ts)))
+                    lines.extend(f"DP,{ts},{pid},1024,1,pid-worker" for pid in pids)
+                sid = self.import_sample("\n".join(lines) + "\n")["id"]
+                html = render_report(self.store, sid)
+                markup = ReportMarkup(html)
+                payload = json.loads(markup.scripts[0][1])
+                p, = payload["processes"]
+                self.assertEqual(p["pid_changes"], len(sequence) - 1)
+                self.assertEqual([entry["pids"] for entry in p["pid_path"]], sequence)
+                self.assertEqual(process_row(p, 1)[2], expected)
+                self.assertEqual(process_row(p, 1)[-1], len(sequence) - 1)
+                all_table = html.split('data-table="all"', 1)[1].split('</table>', 1)[0]
+                self.assertIn('>' + expected + '</td>', all_table)
+                self.assertEqual(markup.processes[0]["data-search"], ', '.join(map(str, p["pids"])))
 
     def test_report_overview_missing_inputs_and_process_basis(self):
         from perf_report import render_report

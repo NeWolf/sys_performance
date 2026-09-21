@@ -82,7 +82,7 @@ def scaled(value, divisor):
     return value / divisor if value is not None else None
 
 
-def grid(headers, rows, identities=None, searchable=False, role=""):
+def grid(headers, rows, identities=None, searchable=False, role="", search_terms=None):
     out = ['<div class="data-table" data-table="' + esc(role) + '">']
     if searchable:
         out.append('<div class="controls js-only"><label>搜索 <input type="search" class="table-search" placeholder="名称、PID、状态；点击表头排序" aria-label="搜索表格"></label><span class="table-count" aria-live="polite"></span></div>')
@@ -92,6 +92,8 @@ def grid(headers, rows, identities=None, searchable=False, role=""):
     for index, row in enumerate(rows):
         identity = identities[index] if identities else None
         attrs = ' data-process="' + esc(identity) + '" tabindex="0" aria-selected="false"' if identity else ''
+        if search_terms is not None:
+            attrs += ' data-search="' + esc(search_terms[index]) + '"'
         out.append('<tr' + attrs + '>')
         for value in row:
             cls = ' class="name"' if isinstance(value, str) and len(value) > 22 else ''
@@ -149,7 +151,12 @@ PROCESS_HEADERS += ["PID变化"]
 def process_row(p, ordinal):
     p = p or {}
     cpu = lambda k, active=False: metric(p, "cpu1c", k, active)
-    rows = [ordinal, p.get("name"), ', '.join(str(v) for v in p.get("pids", [])) or None,
+    pid_label = ', '.join(str(v) for v in p.get("pids", [])) or None
+    if p.get("pid_changes", 0) > 3:
+        path = p.get("pid_path", [])
+        last = ', '.join(str(v) for v in path[-1]["pids"]) if path else ""
+        pid_label = f'pid{p["pid_changes"]}次变更，last：{last or "—"}'
+    rows = [ordinal, p.get("name"), pid_label,
             p.get("active", {}).get("cycles"),
             *[cpu(k, True) for k in ("avg", "p95", "p99", "max")],
             scaled(cpu("p95"), 100 / 28.75), scaled(cpu("max"), 100 / 28.75),
@@ -294,7 +301,7 @@ def segment_html(data, system):
     out.append('</div>' + grid(io_headers, io_rows, [p["id"] for p in processes], True, "io") + '</details>')
     out.append('<section class="panel"><h3>Excel 49 项 · 当前时段逐项实测</h3><p class="note">独立核对全部49项；实测为当前完整时段，日志没有前后台场景标记，不推断场景。候选与截断名称不计入实测，DP-only不等于P采集成功。实测K固定按28.75 KDMIPS/核换算；源预算K照录，不修正源表不一致。RSS峰值不等同于源表所有内存口径。日志仅有IO周期增量，无法给出源表MB/S速率，因此留空。</p>' + required_table(data, segment) + '</section>')
     reference_note = '<p class="note">默认参照：系统 CPU＝整机总占用×8（满载800%）；已使用内存＝总内存−MemAvailable。IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；未采集进程不计入，各字段仅汇总有效值（可能不完整），无有效值时断线。</p>'
-    out.append('<section class="panel"><h3>全进程 · 搜索排序与叠加趋势</h3><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。零活跃及 DP-only 身份完整保留。</p>' + reference_note + grid(PROCESS_HEADERS, [process_row(p, n) for n, p in enumerate(processes, 1)], [p["id"] for p in processes], True, "all"))
+    out.append('<section class="panel"><h3>全进程 · 搜索排序与叠加趋势</h3><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。零活跃及 DP-only 身份完整保留。</p>' + reference_note + grid(PROCESS_HEADERS, [process_row(p, n) for n, p in enumerate(processes, 1)], [p["id"] for p in processes], True, "all", search_terms=[', '.join(map(str, p["pids"])) for p in processes]))
     out.append('<div class="selection-tags js-only" aria-live="polite"></div>')
     for role, title in (("overlay-cpu", "选中进程单核 CPU %"), ("overlay-rss", "选中进程 RSS MB"), ("overlay-io", "选中进程 IO 增量 KB/周期")):
         out.append('<h4>' + title + '</h4>' + chart(system, role, title))
