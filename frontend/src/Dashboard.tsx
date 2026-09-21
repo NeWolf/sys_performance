@@ -81,13 +81,13 @@ function InteractiveReport({ id, name, disabled }: { id: string; name: string; d
   }
   return <section className={`analysis-report${expanded ? ' analysis-report-expanded' : ''}`} aria-label="交互性能分析">
     <div className="analysis-report-toolbar">
-      <div><strong>交互性能分析</strong><p>与导出报告一致 · 按采集段查看 · 搜索、排序、趋势叠加与精确合并</p></div>
+      <div><strong>交互性能分析</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
       <div className="actions">
         <button disabled={disabled || result.loading} onClick={reload}>重新加载</button>
         <button aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? '退出大屏' : '大屏查看'}</button>
       </div>
     </div>
-    {result.loading && <div className="panel loading-state" role="status">正在生成完整分析，大日志可能需要较长时间…</div>}
+    {result.loading && <div className="panel loading-state" role="status">正在读取分析结果；首次分析或版本更新时需生成缓存，大日志可能需要较长时间…</div>}
     {result.error && <div className="banner error" role="alert">{result.error}<button disabled={disabled} onClick={() => { setResult({ html: '', error: '', loading: true }); setRevision((value) => value + 1) }}>重试</button></div>}
     {/* 保留报告自身 CSP；不授予同源、弹窗、下载或顶层导航权限。 */}
     {result.html && <iframe className="analysis-report-frame" title={`${name} · 性能分析`} sandbox="allow-scripts" referrerPolicy="no-referrer" srcDoc={result.html} />}

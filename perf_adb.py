@@ -150,21 +150,48 @@ class AdbController:
     def stop(self, serial):
         with self.device(serial):
             root = self.root_mode(serial)
-            self.setprop(serial, "test", "0", root)
-            # Recheck the executable immediately before signalling each PID.
-            for pid in self.pids(serial, root):
-                self.shell(serial, f'[ "$(readlink /proc/{pid}/exe)" != "{REMOTE_BIN}" ] || kill -TERM {pid}', root)
-            for _ in range(10):
-                if not self.pids(serial, root):
-                    return self.snapshot(serial, root)
-                time.sleep(0.2)
-            raise AdbError("采集开关已关闭，但测试进程尚未退出；未强制杀进程，请刷新状态", 409)
+            self._stop(serial, root)
+            return self.snapshot(serial, root)
+
+    def _stop(self, serial, root):
+        """Caller holds the device lock throughout stop, pull or deletion."""
+        self.setprop(serial, "test", "0", root)
+        # Recheck the executable immediately before signalling each PID.
+        for pid in self.pids(serial, root):
+            self.shell(serial, f'[ "$(readlink /proc/{pid}/exe)" != "{REMOTE_BIN}" ] || kill -TERM {pid}', root)
+        for _ in range(10):
+            if not self.pids(serial, root):
+                return
+            time.sleep(0.2)
+        raise AdbError("采集开关已关闭，但测试进程尚未退出；未强制杀进程，请刷新状态", 409)
+
+    def delete_logs(self, serial):
+        with self.device(serial):
+            root = self.root_mode(serial)
+            # Do not trust a potentially stale browser status or release the lock.
+            self._stop(serial, root)
+            if self.properties(serial)["test"] != "0" or self.pids(serial, root):
+                raise AdbError("采集未确认停止，未删除设备日志，请刷新状态后重试", 409)
+            paths = " ".join(shlex.quote(PERF_DIR + "/" + name) for name in LOG_NAMES)
+            # Fixed allowlist only: no caller paths, globs or recursive deletion.
+            try:
+                self.shell(serial, "rm -f -- " + paths, root)
+                remaining = self.shell(
+                    serial, f'for f in {paths}; do if [ -e "$f" ] || [ -L "$f" ]; '
+                    'then echo "$f"; fi; done', root)
+                if remaining:
+                    raise AdbError("设备仍有未删除的性能日志，请检查权限后重试", 502)
+            except AdbError as exc:
+                raise AdbError("采集已停止；日志删除未完成，可能已部分删除：" + str(exc), exc.status) from exc
+            return self.snapshot(serial, root)
 
     def pull(self, serial, store, title=""):
         with self.device(serial):
             root = self.root_mode(serial)
             if self.properties(serial)["test"] != "0" or self.pids(serial, root):
-                raise AdbError("请先停止采集再拉取，避免轮转或未刷新缓冲造成不完整日志", 409)
+                self._stop(serial, root)
+            if self.properties(serial)["test"] != "0" or self.pids(serial, root):
+                raise AdbError("采集未确认停止，未拉取日志，请刷新状态后重试", 409)
             folder = self.archive / uuid.uuid4().hex
             folder.mkdir(parents=True)
             paths = []

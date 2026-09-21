@@ -39,6 +39,10 @@ class Store(GroupStore):
                     session TEXT PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     config TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS report_cache (
+                    session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                    version TEXT NOT NULL, document BLOB NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS analysis_cache (
                     session TEXT REFERENCES sessions(id) ON DELETE CASCADE,
                     scope TEXT, result TEXT NOT NULL, PRIMARY KEY(session, scope)
@@ -379,6 +383,10 @@ class Store(GroupStore):
     def overview(self, session_id):
         session = self.session(session_id)
         with self.connect() as db:
+            cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope='overview-v1'",
+                                (session_id,)).fetchone()
+            if cached:
+                return dict(session, **json.loads(cached[0]))
             stats = db.execute("""SELECT COUNT(*) samples,
                 AVG(json_extract(data,'$.cpu_total')) cpu_avg,
                 MAX(json_extract(data,'$.cpu_total')) cpu_peak,
@@ -390,8 +398,11 @@ class Store(GroupStore):
             exporters = db.execute("""SELECT name,MAX(json_extract(data,'$.size_mb')) peak_mb,
                 COUNT(*) samples FROM records WHERE session=? AND kind='DE'
                 GROUP BY name ORDER BY peak_mb DESC LIMIT 100""", (session_id,)).fetchall()
-        return dict(session, stats=dict(stats), segments=[dict(r) for r in segments],
-                    exporters=[dict(r) for r in exporters])
+            result = dict(stats=dict(stats), segments=[dict(r) for r in segments],
+                          exporters=[dict(r) for r in exporters])
+            db.execute("INSERT OR IGNORE INTO analysis_cache SELECT id,'overview-v1',? FROM sessions WHERE id=?",
+                       (json.dumps(result, ensure_ascii=False), session_id))
+        return dict(session, **result)
 
     def _ensure_process_ranks(self, db, session_id):
         # Versioned caches exclude old cpu-based ranks; missing cpu1c stays NULL.

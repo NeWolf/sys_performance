@@ -185,6 +185,10 @@ def create_app(database, port=8765, development=False, frontend=None):
     def adb_stop(body: AdbRequest):
         return adb.stop(body.serial)
 
+    @app.post("/api/adb/delete-logs")
+    def adb_delete_logs(body: AdbRequest):
+        return adb.delete_logs(body.serial)
+
     @app.post("/api/adb/pull")
     def adb_pull(body: AdbPullRequest):
         if not import_lock.acquire(blocking=False):

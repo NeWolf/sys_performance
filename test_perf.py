@@ -499,6 +499,8 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
                 with self.store.connect() as db:
                     db.execute("UPDATE records SET data=json_set(data,?,NULL) "
                                "WHERE session=? AND kind='S'", ("$." + field, missing_sid))
+                    # Fixture mutation bypasses immutable imports: invalidate its prior report.
+                    db.execute("DELETE FROM report_cache WHERE session=?", (missing_sid,))
                 html = render_report(self.store, missing_sid)
                 system = json.loads(ReportMarkup(html).scripts[0][1])["systems"][0]
                 self.assertEqual(system["metrics"][field]["count"], 0)
@@ -1152,6 +1154,89 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         return dict(dict(name="组合", segment=0, members=[dict(pid=1, name="a"),
                         dict(pid=2, name="b")]), **changes)
 
+    def test_report_cache_persists_and_is_session_scoped(self):
+        from unittest.mock import patch
+        from perf_report import render_report
+
+        sid = self.load(self.s(1) + self.p(1))
+        report = render_report(self.store, sid)
+        reopened = Store(self.store.path)
+        with patch("perf_report.build_report_data", side_effect=AssertionError("不得重复分析")), \
+                patch("perf_report.render_document", side_effect=AssertionError("不得重复渲染")):
+            self.assertEqual(render_report(reopened, sid), report)
+            self.store.save_group(sid, self.config(members=[dict(pid=1, name="a")]))
+            self.assertEqual(render_report(reopened, sid), report)
+        other = self.load(self.s(2) + self.p(2, name="other"))
+        self.assertNotEqual(render_report(reopened, other), report)
+        self.assertTrue(reopened.delete(sid))
+        with self.assertRaises(KeyError):
+            render_report(reopened, sid)
+        with reopened.connect() as db:
+            self.assertEqual([r[0] for r in db.execute("SELECT session FROM report_cache")], [other])
+
+    def test_report_cache_version_and_corruption_rebuild(self):
+        from unittest.mock import patch
+        from perf_report import build_report_data, render_report
+
+        sid = self.load(self.s(1) + self.p(1))
+        report = render_report(self.store, sid)
+        with patch("perf_report.REPORT_CACHE_VERSION", "next-version"), \
+                patch("perf_report.build_report_data", wraps=build_report_data) as build:
+            self.assertEqual(render_report(self.store, sid), report)
+            self.assertEqual(render_report(self.store, sid), report)
+            self.assertEqual(build.call_count, 1)
+            with self.store.connect() as db:
+                self.assertEqual(db.execute("SELECT version FROM report_cache").fetchone()[0], "next-version")
+                db.execute("UPDATE report_cache SET document=?", (b"broken",))
+            self.assertEqual(render_report(self.store, sid), report)
+            self.assertEqual(build.call_count, 2)
+
+    def test_report_cache_failure_retries_and_deletion_during_build(self):
+        from unittest.mock import patch
+        from perf_report import build_report_data, render_report
+
+        sid = self.load(self.s(1) + self.p(1))
+        for target in ("build_report_data", "render_document"):
+            with patch("perf_report." + target, side_effect=RuntimeError("generation failed")):
+                with self.assertRaises(RuntimeError):
+                    render_report(self.store, sid)
+            with self.store.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM report_cache").fetchone()[0], 0)
+        self.assert_report(render_report(self.store, sid))
+        other = self.load(self.s(2) + self.p(2))
+
+        def build_then_delete(store, session_id):
+            data = build_report_data(store, session_id)
+            store.delete(session_id)
+            return data
+
+        with patch("perf_report.build_report_data", side_effect=build_then_delete):
+            with self.assertRaises(KeyError):
+                render_report(self.store, other)
+        with self.store.connect() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM report_cache WHERE session=?", (other,)).fetchone())
+
+    def test_report_cache_coalesces_concurrent_requests(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from unittest.mock import patch
+        from perf_report import build_report_data, render_report
+
+        sid = self.load(self.s(1) + self.p(1))
+        reopened = Store(self.store.path)
+        barrier = threading.Barrier(2)
+
+        def request(store):
+            barrier.wait(timeout=10)
+            return render_report(store, sid)
+
+        with patch("perf_report.build_report_data", wraps=build_report_data) as build:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(request, self.store)
+                second = executor.submit(request, reopened)
+                self.assertEqual(first.result(timeout=30), second.result(timeout=30))
+            self.assertEqual(build.call_count, 1)
+
     def test_report_all_identities_including_dp_beyond_top_100(self):
         import re
         from unittest.mock import patch
@@ -1296,6 +1381,8 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                        "WHERE session=? AND kind='P' AND ts=501", (sid,))
             db.execute("UPDATE records SET data=json_set(data,'$.cpu_total',NULL) "
                        "WHERE session=? AND kind='S' AND ts=501", (sid,))
+            # This test deliberately edits an already analyzed source snapshot.
+            db.execute("DELETE FROM report_cache WHERE session=?", (sid,))
         gapped = self.store.report_series(sid, "P", 0, pid=1, name="a", limit=4)
         points = gapped["points"]
         self.assertTrue(all(point["cpu"] is not None for point in points))
@@ -2017,6 +2104,43 @@ class ApiTests(ReportAssertions, unittest.TestCase):
         self.assertIn("attachment", report.headers["content-disposition"])
         self.assertEqual(self.client.delete(base, headers=self.headers).json(), {"deleted": True})
         self.assertEqual(self.client.get(base, headers=self.headers).status_code, 404)
+
+    def test_reopened_analysis_uses_persistent_report_and_overview(self):
+        from contextlib import contextmanager
+        from fastapi.testclient import TestClient
+        from unittest.mock import patch
+        import sqlite3
+        from perf_api import create_app
+
+        sid = self.upload().json()["id"]
+        base = "/api/sessions/" + sid
+        overview = self.client.get(base, headers=self.headers)
+        report = self.client.get(base + "/report", headers=self.headers)
+        self.assertEqual(overview.status_code, 200)
+        self.assertEqual(report.status_code, 200)
+        app = create_app(self.app.state.store.path)
+        connect = app.state.store.connect
+
+        @contextmanager
+        def cached_only():
+            with connect() as db:
+                db.set_authorizer(lambda action, table, *_:
+                                  sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == "records"
+                                  else sqlite3.SQLITE_OK)
+                yield db
+
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            headers = {"X-Session-Token": client.get("/api/token").json()["token"]}
+            with patch.object(app.state.store, "connect", cached_only), \
+                    patch("perf_report.build_report_data", side_effect=AssertionError("不应重新分析")), \
+                    patch("perf_report.render_document", side_effect=AssertionError("不应重新生成")):
+                self.assertEqual(client.get(base, headers=headers).json(), overview.json())
+                cached = client.get(base + "/report", headers=headers)
+                self.assertEqual(cached.status_code, 200)
+                self.assertEqual(cached.text, report.text)
+                self.assertEqual(cached.headers["content-security-policy"], report.headers["content-security-policy"])
+            self.assertEqual(client.delete(base, headers=headers).status_code, 200)
+            self.assertEqual(client.get(base + "/report", headers=headers).status_code, 404)
 
     def test_security_boundary(self):
         self.assertEqual(self.client.get("/api/sessions").status_code, 403)

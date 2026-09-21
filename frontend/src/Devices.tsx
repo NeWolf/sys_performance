@@ -79,11 +79,12 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     return () => { controller.abort(); window.clearInterval(timer) }
   }, [serial, revision])
 
-  async function perform(action: 'status' | 'start' | 'stop' | 'pull') {
+  async function perform(action: 'status' | 'start' | 'stop' | 'pull' | 'delete-logs') {
     if (!serial || !connected || disabled || running.current) return
-    if (action === 'pull' && !guard.confirm('拉取成功后将切换会话并放弃未保存配置，是否继续？')) return
+    if (action === 'pull' && !guard.confirm('拉取前会先停止尚未结束的采集；成功后将切换会话并放弃未保存配置，是否继续？')) return
     if (action === 'start' && !window.confirm(`将在 ${serial} 开始采集；若未部署，将先自动部署采集程序，已部署则直接使用。使用现有 root / su 权限，持久化属性会影响系统 sysmonitor，关闭页面不会停止采集。确认继续？`)) return
     if (action === 'stop' && !window.confirm('将关闭设备共享采集开关，并终止该路径的测试进程。确认停止？')) return
+    if (action === 'delete-logs' && !window.confirm(`将永久删除车机 ${serial} 上 /log/sys/perf/ 中的 perf.log 和 perf.1.log 至 perf.4.log，无法恢复。若正在采集，会先关闭共享采集开关并停止测试进程，停止失败则不删除。尚未拉取的日志将丢失，请先备份；本地已导入的数据和备份不受影响。确认删除？`)) return
     await mutation.run(async (signal) => {
       running.current = true
       setBusy(action)
@@ -109,7 +110,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
             const next = await api<Status>(`/api/adb/${action}`, init)
             if (signal.aborted) return
             setStatus(next)
-            setNotice(action === 'start' ? '采集已开始，状态每 5 秒自动刷新；不会自动清空旧日志。' : '采集开关已关闭，测试进程已退出。')
+            setNotice(action === 'start' ? '采集已开始，状态每 5 秒自动刷新；不会自动清空旧日志。' : action === 'delete-logs' ? '采集已停止，车机性能日志已清空；本地已导入的数据和备份未改动。' : '采集开关已关闭，测试进程已退出。')
           }
         }
       } finally {
@@ -148,8 +149,9 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       <button className="primary" disabled={locked || !connected || !Number.isInteger(interval) || interval < 1 || interval > 3600} onClick={() => void perform('start')}>开始采集</button>
       <button disabled={locked || !connected} onClick={() => void perform('stop')}>停止采集</button>
       <button disabled={locked || !connected} onClick={() => void perform('pull')}>拉取日志并分析</button>
+      <button className="danger" disabled={locked || !connected} onClick={() => void perform('delete-logs')}>删除车机性能日志</button>
     </div>
-    <p className="muted">未部署时自动部署，已部署直接开始采集；连接后每 5 秒自动刷新状态。始终写入文件；不自动提权重启、不删除设备日志。采集属性为设备全局属性；异步模式仅对新启动实例保证生效。历史日志会一并拉取，关闭页面或断连不会停止采集。</p>
+    <p className="muted">未部署时自动部署，已部署直接开始采集；连接后每 5 秒自动刷新状态。始终写入文件；不自动提权重启、不自动删除设备日志；手动删除需确认，并先停止采集。采集属性为设备全局属性；异步模式仅对新启动实例保证生效。拉取日志会自动先停止尚未结束的采集，停止失败则不拉取。历史日志会一并拉取，关闭页面或断连不会停止采集。</p>
     {busy && <p role="status">正在执行设备操作，请勿关闭页面…</p>}
     {error && <p className="error" role="alert">{error}</p>}
     {notice && <p className="device-notice" role="status">{notice}</p>}
