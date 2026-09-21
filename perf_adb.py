@@ -14,7 +14,7 @@ REMOTE_BIN = "/data/local/tmp/sysmonitor_test"
 PERF_DIR = "/log/sys/perf"
 LOG_NAMES = ["perf.log"] + [f"perf.{i}.log" for i in range(1, 5)]
 PROPERTIES = ("test", "interval", "tofile", "tologcat", "async")
-MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_FILE_BYTES = 1024 * 1024 * 1024
 
 
 class AdbError(Exception):
@@ -177,7 +177,7 @@ class AdbController:
                 with path.open("wb") as output:
                     self.shell(serial, f"head -c {MAX_FILE_BYTES + 1} {remote}", root, output)
                 if path.stat().st_size > MAX_FILE_BYTES:
-                    raise AdbError("设备日志超过单文件 50 MiB 限制；本次未导入", 413)
+                    raise AdbError("设备日志超过单文件 1 GB 限制；本次未导入", 413)
                 paths.append(path)
             if not paths:
                 raise AdbError("设备没有可拉取的性能日志")

@@ -135,11 +135,16 @@ class AdbTests(unittest.TestCase):
         self.assertFalse(any("push" in call for call in self.adb.calls))
 
     def test_pull_size_limit_no_import(self):
-        with patch("perf_adb.MAX_FILE_BYTES", 2):
+        with patch("perf_adb.MAX_FILE_BYTES", len(SAMPLE) - 1):
             with self.assertRaises(AdbError) as error:
                 self.adb.pull("unit", self.store)
         self.assertEqual(error.exception.status, 413)
+        self.assertIn("1 GB", str(error.exception))
         self.assertEqual(self.store.sessions(), [])
+        with patch("perf_adb.MAX_FILE_BYTES", len(SAMPLE)):
+            result = self.adb.pull("unit", self.store)
+        self.assertEqual(result["files"], ["perf.log"])
+        self.assertEqual(self.store.overview(result["id"])["summary"]["cycles"], 1)
 
     def test_subprocess_timeout_missing_and_arguments(self):
         adb = AdbController(self.temp.name, executable="adb")

@@ -2048,7 +2048,7 @@ class ApiTests(ReportAssertions, unittest.TestCase):
 
         self.assertEqual(MAX_FILE_BYTES, 1024 ** 3)
         self.assertEqual(MAX_BODY_BYTES, 5 * MAX_FILE_BYTES + 1024 ** 2)
-        self.assertEqual(ADB_FILE_BYTES, 50 * 1024 ** 2)
+        self.assertEqual(ADB_FILE_BYTES, 1024 ** 3)
         # 缩小阈值验证真实 multipart 边界，不分配 GB 级测试数据。
         size = len(SAMPLE.encode())
         with patch("perf_api.MAX_FILE_BYTES", size - 1):
