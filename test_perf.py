@@ -106,17 +106,24 @@ class ReportAssertions:
         self.assertEqual(metric["count"], count)
         self.assertEqual([metric[key] for key in ("min", "avg", "p95", "p99", "max")], values)
 
-    def report_lines(self, points, field, divisor=1, mark_runs=False):
-        """Execute the shipped ECharts series builder; transport payload via stdin."""
+    def run_report_script(self, script):
+        """Send UTF-8 JavaScript via stdin to avoid Windows command-line limits."""
         import shutil
         import subprocess
 
         node = shutil.which("node")
         self.assertIsNotNone(node, "报告 JavaScript 回归需要 Node.js，不允许跳过")
+        result = subprocess.run([node, "--input-type=commonjs", "-"], input=script,
+                                text=True, encoding="utf-8", capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def report_lines(self, points, field, divisor=1, mark_runs=False):
+        """Execute the shipped ECharts series builder; transport script via stdin."""
         source = (Path(__file__).parent / "report_assets/report.js").read_text(encoding="utf-8")
         prefix = source[:source.index("  const observer =")]
-        script = """
-const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+        script = "const input = " + json.dumps(dict(
+            points=points, field=field, divisor=divisor, mark_runs=mark_runs)) + ";\n" + """
 global.document = {
   getElementById: () => ({textContent: JSON.stringify({
     process_fields: [], full_cycle_schema: [], cycle_axis_schema: []
@@ -128,11 +135,7 @@ const points = input.mark_runs ? markRuns(input.points, [input.field]) : input.p
 console.log(JSON.stringify(lineSeries(points, input.field, input.field, '#123456', input.divisor)));
 })();
 """
-        result = subprocess.run([node, "-e", script], input=json.dumps(dict(
-            points=points, field=field, divisor=divisor, mark_runs=mark_runs)),
-            text=True, encoding="utf-8", capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        groups = json.loads(result.stdout)
+        groups = json.loads(self.run_report_script(script))
         for group in groups:
             self.assertEqual(group["type"], "line")
             self.assertFalse(group["connectNulls"])
@@ -262,9 +265,6 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         self.assertIn('.overview-primary .stat-header strong{font-size:32px;color:var(--cpu-color)}', CSS)
 
     def test_report_overview_chart_percentiles_and_time(self):
-        import shutil
-        import subprocess
-        self.assertIsNotNone(shutil.which("node"), "报告 JavaScript 回归需要 Node.js，不允许跳过")
         source = Path("report_assets/report.js").read_text(encoding="utf-8")
         prefix = source[:source.index("  const observer =")]
         harness = """
@@ -312,11 +312,9 @@ for (const s of overview.memory.series) assert.deepEqual(s.markLine.data.map(x=>
 assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
 })();
 """
-        subprocess.run(["node", "-e", harness + prefix + checks], check=True, capture_output=True, text=True)
+        self.run_report_script(harness + prefix + checks)
 
     def test_report_process_table_and_reference_curves(self):
-        import shutil
-        import subprocess
         from perf_report import render_report
         from perf_report_ui import PROCESS_HEADERS, process_row
 
@@ -344,7 +342,6 @@ assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
                 self.assertEqual(cells[header], p["metrics"][field]["total"])
         self.assertNotIn("不是整机实测 IO", html)
         self.assertEqual(html.count("IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；"), 2)
-        self.assertIsNotNone(shutil.which("node"), "报告 JavaScript 回归需要 Node.js，不允许跳过")
         source = Path("report_assets/report.js").read_text(encoding="utf-8")
         prefix = source[:source.index("  data.systems.forEach(setupSegment);")]
         harness = """
@@ -439,7 +436,7 @@ assert.equal(sampled.length,600);
 assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
 })();
 """
-        subprocess.run(["node", "-e", harness + prefix + checks], check=True, capture_output=True, text=True)
+        self.run_report_script(harness + prefix + checks)
 
     def test_report_overview_missing_inputs_and_process_basis(self):
         from perf_report import render_report
