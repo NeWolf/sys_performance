@@ -58,6 +58,10 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Set macOS deployment baseline
+        if: runner.os == 'macOS'
+        run: python -c 'import sys; sys.path.insert(0, "packaging"); from macos_compat import MACOS_MIN_VERSION; print("MACOSX_DEPLOYMENT_TARGET=" + MACOS_MIN_VERSION)' >> "$GITHUB_ENV"
+
       - name: Install Python dependencies
         run: python -m pip install -r requirements.txt 'pyinstaller>=6.11,<7' 'Pillow>=10.4,<12'
 
@@ -68,7 +72,7 @@ jobs:
           npm --prefix frontend run lint
 
       - name: Run backend regression tests
-        run: python -m unittest test_perf test_adb
+        run: python -m unittest test_perf test_adb test_packaging
 
       - name: Locate Windows installer compiler
         if: runner.os == 'Windows'
@@ -93,6 +97,7 @@ jobs:
         run: |
           command -v hdiutil
           command -v lipo
+          command -v otool
           python -c 'import os, platform; expected = {"arm64": "arm64", "x64": "x86_64"}[os.environ["EXPECTED_ARCH"]]; assert platform.machine() == expected, platform.machine()'
 
       - name: Build native packages

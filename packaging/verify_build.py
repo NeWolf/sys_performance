@@ -16,6 +16,8 @@ import zipfile
 
 import httpx
 
+from macos_compat import verify_macos_binaries, verify_macos_metadata
+
 
 def smoke(command, folder):
     with socket.socket() as sock:
@@ -73,7 +75,7 @@ def verify_payload(payload, folder, system):
     if not executable.is_file():
         raise RuntimeError("Packaged server is missing")
     if system == "Darwin":
-        subprocess.run(["lipo", str(executable), "-verify_arch", platform.machine()], check=True)
+        verify_macos_binaries(payload)
     smoke([str(executable)], folder)
 
 
@@ -86,6 +88,7 @@ def verify_dmg(archive, folder):
         contents = mount / "SysMonitor.app/Contents"
         with (contents / "Info.plist").open("rb") as handle:
             info = plistlib.load(handle)
+        verify_macos_metadata(info)
         if info.get("CFBundleExecutable") != "SysMonitor" or info.get("CFBundlePackageType") != "APPL":
             raise RuntimeError("Invalid macOS application metadata")
         for launcher in (contents / "MacOS/SysMonitor", contents / "Resources/Start.command"):

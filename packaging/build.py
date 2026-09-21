@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 
+from macos_compat import MACOS_MIN_VERSION, verify_macos_binaries
+
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "1.0.0"
 
@@ -55,6 +57,8 @@ def main():
     system = platform.system()
     if system not in ("Darwin", "Windows", "Linux"):
         parser.error("Unsupported operating system")
+    if system == "Darwin":
+        os.environ["MACOSX_DEPLOYMENT_TARGET"] = MACOS_MIN_VERSION
     if not args.skip_frontend:
         npm = shutil.which("npm")
         if not npm:
@@ -85,6 +89,7 @@ def main():
     payload = output / "portable" / "SysMonitor"
     artifacts = []
     if system == "Darwin":
+        verify_macos_binaries(payload)
         stage = output / "image"
         app = stage / "SysMonitor.app"
         contents = app / "Contents"
@@ -105,7 +110,7 @@ exec "$HERE/server/SysMonitor" --open-browser
                           "CFBundleIdentifier": "local.sysmonitor.desktop", "CFBundlePackageType": "APPL",
                           "CFBundleIconFile": icon.name,
                           "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION,
-                          "LSMinimumSystemVersion": platform.mac_ver()[0]}, handle)
+                          "LSMinimumSystemVersion": MACOS_MIN_VERSION}, handle)
         (stage / "Applications").symlink_to("/Applications", target_is_directory=True)
         dmg = output / (stem + ".dmg")
         run("hdiutil", "create", "-volname", "SysMonitor", "-srcfolder", stage,
