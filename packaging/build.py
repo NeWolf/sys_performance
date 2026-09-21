@@ -1,4 +1,4 @@
-"""Build on the target OS: python packaging/build.py (requires PyInstaller)."""
+"""Build on the target OS: python packaging/build.py (requires PyInstaller and Pillow)."""
 import argparse
 from datetime import datetime
 import hashlib
@@ -25,6 +25,27 @@ def write(path, text, executable=False):
         path.chmod(0o755)
 
 
+def build_icon(output, system):
+    """Convert the shared PNG to the native icon format without distorting it."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("Icon conversion requires Pillow: python -m pip install 'Pillow>=10.4,<12'") from exc
+
+    size = 1024 if system == "Darwin" else 256
+    suffix = {"Darwin": ".icns", "Windows": ".ico", "Linux": ".png"}[system]
+    icon = output / ("SysMonitor" + suffix)
+    with Image.open(ROOT / "tj.png") as source:
+        fitted = ImageOps.contain(source.convert("RGBA"), (size, size), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        canvas.paste(fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2))
+        if system == "Windows":
+            canvas.save(icon, sizes=[(n, n) for n in (16, 24, 32, 48, 64, 128, 256)])
+        else:
+            canvas.save(icon)
+    return icon
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-frontend", action="store_true")
@@ -44,7 +65,7 @@ def main():
     for resource in ("frontend/dist/index.html", "frontend/src/sysmonitor_test/sysmonitor",
                      "report_assets/report.css", "report_assets/report.js",
                      "report_assets/vendor/echarts.min.js", "report_assets/vendor/ECHARTS-LICENSE",
-                     "report_assets/vendor/ECHARTS-NOTICE"):
+                     "report_assets/vendor/ECHARTS-NOTICE", "tj.png"):
         if not (ROOT / resource).is_file():
             parser.error("Missing resource: " + resource)
     arch = platform.machine().lower()
@@ -52,7 +73,9 @@ def main():
     stem = f"SysMonitor-{VERSION}-{label}-{arch}"
     output = args.output_dir.resolve() / (stem + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
     output.mkdir(parents=True, exist_ok=False)
-    run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir",
+    icon = build_icon(output, system)
+    icon_args = ["--icon", icon] if system == "Windows" else []
+    run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", *icon_args,
         "--name", "SysMonitor", "--distpath", output / "portable",
         "--workpath", output / "work", "--specpath", output,
         "--add-data", str(ROOT / "frontend/dist") + ":frontend/dist",
@@ -67,6 +90,7 @@ def main():
         contents = app / "Contents"
         resources = contents / "Resources"
         shutil.copytree(payload, resources / "server")
+        shutil.copy2(icon, resources / icon.name)
         write(contents / "MacOS" / "SysMonitor",
               (ROOT / "packaging/macos-launcher.sh").read_text(), True)
         write(resources / "Start.command", '''#!/bin/sh
@@ -79,6 +103,7 @@ exec "$HERE/server/SysMonitor" --open-browser
         with (contents / "Info.plist").open("wb") as handle:
             plistlib.dump({"CFBundleExecutable": "SysMonitor", "CFBundleName": "SysMonitor",
                           "CFBundleIdentifier": "local.sysmonitor.desktop", "CFBundlePackageType": "APPL",
+                          "CFBundleIconFile": icon.name,
                           "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION,
                           "LSMinimumSystemVersion": platform.mac_ver()[0]}, handle)
         (stage / "Applications").symlink_to("/Applications", target_is_directory=True)
@@ -98,6 +123,7 @@ OutputDir={output}
 OutputBaseFilename={stem}-setup
 Compression=lzma2
 SolidCompression=yes
+SetupIconFile={icon}
 UninstallDisplayIcon={{app}}\\SysMonitor.exe
 [Files]
 Source: "{payload}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -113,6 +139,7 @@ Name: "{{userdesktop}}\\SysMonitor"; Filename: "{{app}}\\SysMonitor.exe"; Parame
             print("Inno Setup not found: portable ZIP only; compile installer.iss with ISCC for installer.")
         artifacts.append(Path(shutil.make_archive(str(output / stem), "zip", payload.parent, payload.name)))
     else:
+        shutil.copy2(icon, payload / "sysmonitor.png")
         write(payload / "start.sh", '#!/bin/sh\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/SysMonitor" --open-browser\n', True)
         artifacts.append(Path(shutil.make_archive(str(output / stem), "gztar", payload.parent, payload.name)))
         if shutil.which("dpkg-deb"):
@@ -120,7 +147,10 @@ Name: "{{userdesktop}}\\SysMonitor"; Filename: "{{app}}\\SysMonitor.exe"; Parame
             shutil.copytree(payload, package / "opt/sysmonitor")
             deb_arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
             write(package / "DEBIAN/control", f"Package: sysmonitor\nVersion: {VERSION}\nArchitecture: {deb_arch}\nMaintainer: SysMonitor\nDepends: libc6\nDescription: Local Android performance log analysis\n")
-            write(package / "usr/share/applications/sysmonitor.desktop", "[Desktop Entry]\nType=Application\nName=SysMonitor\nExec=/opt/sysmonitor/SysMonitor --open-browser\nTerminal=true\nCategories=Development;\n")
+            icon_dir = package / "usr/share/icons/hicolor/256x256/apps"
+            icon_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(icon, icon_dir / "sysmonitor.png")
+            write(package / "usr/share/applications/sysmonitor.desktop", "[Desktop Entry]\nType=Application\nName=SysMonitor\nExec=/opt/sysmonitor/SysMonitor --open-browser\nIcon=sysmonitor\nTerminal=true\nCategories=Development;\n")
             deb = output / (stem + ".deb")
             run("dpkg-deb", "--build", "--root-owner-group", package, deb)
             artifacts.append(deb)
