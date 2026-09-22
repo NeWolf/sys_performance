@@ -39,6 +39,7 @@ INCREMENTS = {"rss_delta_kb", "majflt", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb"
 LABELS = {
     "cpu_total": "系统 CPU 总占用", "cpu_user": "用户态 CPU", "cpu_sys": "内核态 CPU",
     "cpu_iow": "I/O 等待 CPU", "cpu_irq": "中断 CPU", "mem_avail_mb": "可用内存",
+    "mem_free_mb": "空闲内存",
     "mem_total_mb": "总内存", "mem_used_mb": "已用内存", "cpu": "进程 CPU（整机口径）",
     "cpu1c": "进程 CPU（单核口径）", "dmips": "DMIPS 加权占用", "wait": "调度等待",
     "nthr": "线程数", "rss_kb": "驻留内存 RSS", "rss_delta_kb": "周期 RSS 变化",

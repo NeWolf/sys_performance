@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
@@ -20,6 +20,7 @@ from perf_metrics import resource_settings
 from perf_adb import AdbController, AdbError
 from perf_report import REPORT_CSP, render_report
 from perf_store import Store
+from perf_top_capture import TopCapture
 
 MAX_FILE_BYTES = 1024 * 1024 * 1024
 # 最多 5 个文件，额外预留 1 MiB multipart 表单开销。
@@ -112,6 +113,35 @@ class AdbPullRequest(AdbRequest):
     title: str = Field(default="", max_length=120)
 
 
+class TopConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm: Literal[True]
+
+    @model_validator(mode="before")
+    @classmethod
+    def explicit_confirmation(cls, values):
+        if isinstance(values, dict) and values.get("confirm") is not True:
+            raise ValueError("请显式确认此操作")
+        return values
+
+
+class TopImportRequest(TopConfirmRequest):
+    capture_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
+class TopStartRequest(TopConfirmRequest):
+    serial: str = Field(min_length=1, max_length=200)
+    count: int = Field(default=-1, ge=-1, le=100000, strict=True)
+    interval: float = Field(default=1, ge=1, le=3600, allow_inf_nan=False, strict=True)
+    title: str = Field(default="", max_length=120)
+
+    @model_validator(mode="after")
+    def valid_count(self):
+        if self.count == 0:
+            raise ValueError("采样次数必须为 -1 或 1 至 100000")
+        return self
+
+
 class GroupMember(BaseModel):
     model_config = ConfigDict(extra="forbid")
     pid: int = Field(ge=0, le=2**63 - 1, strict=True)
@@ -160,10 +190,54 @@ def create_app(database, port=8765, development=False, frontend=None):
     store = Store(database)
     token = secrets.token_urlsafe(32)
     import_lock = threading.Lock()
-    app = FastAPI(title="sysmonitor 本地分析", docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.store = store
     adb = AdbController(Path(database).resolve().parent / "adb_logs")
+    top = TopCapture(adb, Path(database).resolve().parent / "top_logs", store, import_lock)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            await run_in_threadpool(top.close)
+
+    app = FastAPI(title="sysmonitor 本地分析", docs_url=None, redoc_url=None,
+                  openapi_url=None, lifespan=lifespan)
+    app.state.store = store
     app.state.adb = adb
+    app.state.top = top
+
+    @app.get("/api/top/status")
+    def top_status():
+        return top.status()
+
+    @app.post("/api/top/start")
+    def top_start(body: TopStartRequest):
+        try:
+            return top.start(body.serial, body.count, body.interval, body.title)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/top/stop")
+    def top_stop(body: TopConfirmRequest):
+        try:
+            return top.stop()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/top/import")
+    def top_import(body: TopImportRequest):
+        try:
+            return top.import_capture(body.capture_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/top/archive")
+    def top_archive(capture_id: Optional[str] = Query(None, pattern=r"^[0-9a-f]{32}$")):
+        try:
+            path = top.archive_path(capture_id)
+            return FileResponse(path, media_type="text/plain", filename="top_raw.txt")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.exception_handler(AdbError)
     async def adb_error(_request, exc):

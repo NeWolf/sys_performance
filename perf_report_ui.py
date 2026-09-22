@@ -33,7 +33,7 @@ def number(value):
 
 def stamp(value):
     from perf_report import timestamp
-    return timestamp(value)
+    return timestamp(value, local=True)
 
 
 def prepare_display(data):
@@ -41,22 +41,24 @@ def prepare_display(data):
     from copy import deepcopy
     data = deepcopy(data)
     data["display_cpu_basis"] = "system-100-process-single-core"
+    memory_field = ("mem_free_mb" if data["session"].get("summary", {}).get("source_format") == "top"
+                    else "mem_avail_mb")
     labels = {"cpu_total": "整机 CPU 总占用", "cpu_user": "用户态占用", "cpu_sys": "内核态占用",
               "cpu_iow": "iowait 占用", "cpu_irq": "irq+softirq 占用", "cpu_idle": "空闲",
-              "mem_total_mb": "总内存", "mem_avail_mb": "空闲内存", "mem_used_mb": "已使用内存"}
+              "mem_total_mb": "总内存", memory_field: "空闲内存", "mem_used_mb": "已使用内存"}
     for system in data["systems"]:
         system["metrics"] = {field: dict(system["metrics"][field], label=label)
                              for field, label in labels.items()}
     data["system_fields"] = list(labels)
     data["method"]["cpu"] = "整机 CPU 满载为100%，不按核数换算。进程仍使用单核cpu1c，可超过100%，缺失不回退；固定28.75 KDMIPS/核。"
     data["method"]["system"] = "每条原始S有效字段独立统计，重复S不去重；空闲=100−整机CPU总占用。各字段含空闲均用全量有效样本计算P95/P99。超标严格大于90/95/99%，分母为有效S样本，非时间占比。缺失字段留空。"
-    data["method"]["memory"] = "MemTotal、MemAvailable与mem_used_mb单位为MB；每条S按MemTotal−MemAvailable计算已用内存，含不可回收部分，不把可回收cache算作已用；任一字段缺失则已用缺失。"
-    data["method"]["chart_time"] = "趋势横轴显示小时:分钟（UTC，与日志时间表一致），提示保留完整日期时间；虚线为整段全量P95/P99，缩放不重算。"
+    data["method"]["memory"] = "内存单位为MB。sysmonitor：已用＝MemTotal−MemAvailable，含不可回收部分，不把可回收cache算作已用；任一字段缺失则已用缺失。Top：已用直接取Mem行的used，空闲直接取free，沿用设备top口径，不等同于sysmonitor；free不等于MemAvailable，不用free冒充可用内存。Swap不计入物理内存。"
+    data["method"]["chart_time"] = "趋势横轴显示小时:分钟:秒（本机时间，与日志时间表一致），提示保留完整日期时间；虚线为整段全量P95/P99，缩放不重算。"
     return data
 
 
 def time_label(system):
-    from datetime import datetime, timezone
+    from datetime import datetime
     times = [row[1] for row in system["cycle_axis"]
              if isinstance(row[1], (int, float)) and math.isfinite(row[1])]
     if not times:
@@ -64,7 +66,7 @@ def time_label(system):
     start, end = min(times), max(times)
     def formatted(value):
         try:
-            return datetime.fromtimestamp(value / 1000, timezone.utc).strftime("%Y年%m月%d日 %H:%M:%S")
+            return datetime.fromtimestamp(value / 1000).strftime("%Y年%m月%d日 %H:%M:%S")
         except (OverflowError, OSError, ValueError):
             return "—"
     hours, remainder = divmod(int((end - start) / 1000), 3600)
@@ -140,7 +142,7 @@ def stat_cards(metrics):
     return ''.join(out) + '</div>'
 
 
-PROCESS_HEADERS = ["序号", "原始进程名", "PID", "活跃周期", "活跃均值 %", "活跃P95 %", "活跃P99 %", "活跃峰值 %", "P95K KDMIPS", "峰值K KDMIPS", "RSS均值 MB", "RSS P95 MB", "RSS峰值 MB", "累计读 KB", "累计写 KB"]
+PROCESS_HEADERS = ["序号", "原始进程名", "PID", "活跃周期", "活跃均值 %", "活跃P95 %", "活跃P99 %", "活跃峰值 %", "P95K KDMIPS", "峰值K KDMIPS", "内存均值 MB", "内存 P95 MB", "内存峰值 MB", "累计读 KB", "累计写 KB"]
 for _field, _label in IO_FIELDS:
     PROCESS_HEADERS += [_label + "均值 KB/周期", _label + "P95 KB/周期", _label + "峰值 KB/周期"]
     if _field not in ("rd_kb", "wr_kb"):
@@ -230,16 +232,15 @@ def required_table(data, segment):
         status = next((s for s in item["segments"] if s["segment"] == segment), {})
         matches = status.get("process_ids", [])
         p = lookup.get(matches[0]) if matches else None
-        candidates = ', '.join(str(lookup[i]["name"]) for i in status.get("candidate_ids", [])) or None
         source = EXCEL_BUDGETS[item["excel_row"]]
         rows.append([item["module"], item["business"], item["name"], source.get("D"), source.get("E"),
-                     states.get(status.get("status"), "缺失"), candidates,
+                     states.get(status.get("status"), "缺失"),
                      metric(p, "cpu1c", "p95"), scaled(metric(p, "cpu1c", "p95"), 100 / 28.75),
                      metric(p, "cpu1c", "max"), scaled(metric(p, "cpu1c", "max"), 100 / 28.75),
                      scaled(metric(p, "rss_kb", "max"), 1024), None, None])
         ids.append(p["id"] if p else None)
-    headers = ["模块", "作用", "进程(cmdline)", "前台需求", "后台需求", "匹配状态", "候选（不计实测）",
-               "P95% · 单核", "P95 K · KDMIPS", "峰值% · 单核", "峰值K · KDMIPS", "内存峰MB · RSS", "IO读MB/S", "IO写MB/S"]
+    headers = ["模块", "作用", "进程(cmdline)", "前台需求", "后台需求", "匹配状态",
+               "P95%", "P95 K · KDMIPS", "峰值%", "峰值K · KDMIPS", "内存峰MB", "IO读MB/S", "IO写MB/S"]
     budgets = []
     for item in data["required"]:
         source = EXCEL_BUDGETS[item["excel_row"]]
@@ -266,7 +267,7 @@ def segment_html(data, system):
     if isinstance(average, (int, float)) and math.isfinite(average):
         cpu_level = "low" if average < 70 else "medium" if average < 80 else "high"
     out.append('<section class="panel overview"><h3>整体概览</h3><div class="overview-primary cpu-' + cpu_level + '">' + stat_cards({"cpu_total": metrics["cpu_total"]}) + '</div><div class="charts"><div><h4>整机 CPU 总占用 · 满载 100%</h4>' + chart(system, "system-cpu", "整机CPU总占用、用户态、内核态、iowait、irq+softirq与空闲") + '</div><div><h4>内存占用</h4>' + chart(system, "memory", "已使用内存、空闲内存及P95/P99") + '</div></div>')
-    out.append('<p class="note">整机 CPU 满载为 100%，不按核数换算；空闲 = 100% − 整机 CPU 总占用%。均值卡：低于70%绿色，70%至不足80%黄色，80%及以上红色。总占用曲线红色加粗。默认仅显示整机 CPU 总占用与已使用内存，点击图例可显示其他曲线。内存单位为 MB；已使用内存 = MemTotal − MemAvailable，空闲内存指可用的 MemAvailable；已使用含不可回收部分，不把可回收 cache 算作已用。总内存不绘图、不展示分位数。虚线为完整时段全量有效样本的 P95 / P99，缩放不重算；横轴为小时:分钟（UTC），缺失不补零。</p>')
+    out.append('<details class="overview-notes"><summary>查看统计口径与图表说明</summary><p class="note">整机 CPU 满载为 100%，不按核数换算；空闲 = 100% − 整机 CPU 总占用%。均值卡：低于70%绿色，70%至不足80%黄色，80%及以上红色。总占用曲线红色加粗。默认仅显示整机 CPU 总占用与已使用内存，点击图例可显示其他曲线。内存单位为 MB；sysmonitor 已使用内存 = MemTotal − MemAvailable，空闲内存指可用的 MemAvailable，已使用含不可回收部分、不把可回收 cache 算作已用。Top 已使用内存直接取 Mem 行的 used，空闲内存直接取 free，沿用设备 top 口径；free 不等于 MemAvailable，不用 free 冒充可用内存，Swap 不计入物理内存。总内存不绘图、不展示分位数。虚线为完整时段全量有效样本的 P95 / P99，缩放不重算；横轴为小时:分钟:秒（本机时间），缺失不补零。</p></details>')
     out.append(grid(["CPU指标 · %", "最小", "最大", "均值", "P95", "P99", "有效样本"], [[m["label"], m.get("min"), m.get("max"), m.get("avg"), m.get("p95"), m.get("p99"), m.get("count")] for m in cpu_metrics.values()]))
     out.append(grid(["内存指标", "最小", "最大", "均值", "P95", "P99", "有效样本"],
                     [[m["label"], m.get("min"), m.get("max"), m.get("avg"),
@@ -274,43 +275,44 @@ def segment_html(data, system):
                       m.get("p99") if field != "mem_total_mb" else None, m.get("count")]
                      for field, m in mem_metrics.items()]))
     out.append('</section>')
+    out.append('<details class="panel" open><summary>Excel 49 项 · 当前时段逐项实测</summary><details class="report-notes"><summary>查看说明</summary><p class="note">独立核对全部49项；实测为当前完整时段，日志没有前后台场景标记，不推断场景。候选与截断名称不计入实测，DP-only不等于P采集成功。实测K固定按28.75 KDMIPS/核换算；源预算K照录，不修正源表不一致。RSS峰值不等同于源表所有内存口径。日志仅有IO周期增量，无法给出源表MB/S速率，因此留空。</p></details>' + required_table(data, segment) + '</details>')
+    reference_note = '<p class="note">默认参照：系统 CPU＝整机总占用×8（满载800%）；已使用内存：sysmonitor＝总内存−MemAvailable，Top＝Mem 行的 used。IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；未采集进程不计入，各字段仅汇总有效值（可能不完整），无有效值时断线。</p>'
+    out.append('<details class="panel" open><summary>全进程 · 搜索排序与叠加趋势</summary><details class="report-notes"><summary>查看说明</summary><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。零活跃及 DP-only 身份完整保留。</p>' + reference_note + '</details>' + grid(PROCESS_HEADERS, [process_row(p, n) for n, p in enumerate(processes, 1)], [p["id"] for p in processes], True, "all", search_terms=[', '.join(map(str, p["pids"])) for p in processes]))
+    out.append('<div class="selection-tags js-only" aria-live="polite"></div>')
+    for role, title in (("overlay-cpu", "选中进程 CPU %"), ("overlay-rss", "选中进程 内存 MB"), ("overlay-io", "选中进程 IO 增量 KB/周期")):
+        out.append('<h4>' + title + '</h4>' + chart(system, role, title))
+    out.append('</details>')
+    out.append('<details class="panel" open><summary>关联进程 · 搜索、勾选与精确合并</summary><details class="report-notes"><summary>查看说明</summary><p class="note">仅同段合并，按本段全部周期对齐。任一成员行或字段缺失，则对应合计缺失；全量重算最近秩分位数。不会相加分位数。</p>' + reference_note + '</details>' + '<div class="js-only"><div class="merge-grid"><div class="merge-column"><h4>可选进程</h4><label>搜索 <input class="merge-search" type="search" placeholder="名称 / PID" aria-label="搜索可合并进程"></label><div class="candidate-list"></div></div><div class="merge-column"><h4>已选进程 <span class="merge-count">0</span></h4><button class="merge-clear" type="button">清空选择</button><div class="selected-list"></div></div></div><button class="merge-apply" type="button">计算全量合并统计</button><p class="merge-status status" aria-live="polite"></p><div class="merge-result"></div></div>')
+    for role, title in (("merge-cpu", "合并 CPU"), ("merge-rss", "合并 内存 MB"), ("merge-io", "合并 IO 增量")):
+        out.append(chart(system, role, title))
+
+    out.append('</details>')
     exceed = system["cpu_exceedances"]
     out.append('<details class="panel"><summary>CPU 超标分布明细 · 整机 100% 口径</summary>' + chart(system, "exceed", "CPU 超标彩色柱", "small"))
     out.append(grid(["严格阈值 · 整机 %", "样本数", "有效 S 样本占比 %"], [[t["threshold"], t["count"], t["percent"]] for t in exceed["thresholds"]]))
     limit = exceed["thresholds"][0]["threshold"]
-    out.append('<p class="note">分母为有效系统CPU样本 ' + esc(exceed["valid_samples"]) + '；不是时间占比。超过 ' + esc(number(limit)) + '% 共 ' + esc(number(exceed["total"])) + ' 条，显示前 ' + esc(len(exceed["details"])) + ' 条；' + ('明细已截断。' if exceed["truncated"] else '明细未截断。') + '</p>')
-    out.append(grid(["记录ID", "周期", "UTC时间", "整机 CPU 总占用 · %", "来源", "行号"], [[r["record_id"], r["cycle"], stamp(r["ts"]), r["cpu_total"], r["source"], r["line"]] for r in exceed["details"]], searchable=True))
+    out.append('<details class="report-notes"><summary>查看说明</summary><p class="note">分母为有效系统CPU样本 ' + esc(exceed["valid_samples"]) + '；不是时间占比。超过 ' + esc(number(limit)) + '% 共 ' + esc(number(exceed["total"])) + ' 条，显示前 ' + esc(len(exceed["details"])) + ' 条；' + ('明细已截断。' if exceed["truncated"] else '明细未截断。') + '</p></details>')
+    out.append(grid(["记录ID", "周期", "本机时间", "整机 CPU 总占用 · %", "来源", "行号"], [[r["record_id"], r["cycle"], stamp(r["ts"]), r["cpu_total"], r["source"], r["line"]] for r in exceed["details"]], searchable=True))
     out.append('</details>')
-    for role, title, field, key, active in (("active-top", "活跃 CPU Top30 · 单核活跃均值", "cpu1c", "avg", True), ("peak-top", "CPU 峰值 Top30 · 趋势", "cpu1c", "max", False), ("rss-top", "RSS 均值 Top30", "rss_kb", "avg", False)):
+    for role, title, field, key, active in (("active-top", "活跃 CPU Top30 · 活跃均值", "cpu1c", "avg", True), ("peak-top", "CPU 峰值 Top30 · 趋势", "cpu1c", "max", False), ("rss-top", "内存均值 Top30", "rss_kb", "avg", False)):
         ranked = sorted((p for p in processes if metric(p, field, key, active) is not None), key=lambda p: (-metric(p, field, key, active), p["name"]))[:30]
         tag = "details"
         heading = '<summary>' + title + '</summary>'
         out.append('<' + tag + ' class="panel">' + heading + chart(system, role, title, "tall" if role != "peak-top" else ""))
-        unit = "MB" if field == "rss_kb" else "%" if role == "peak-top" else "单核 %"
+        unit = "MB" if field == "rss_kb" else "%"
         headers = ["进程", "PID", "有效周期", *[label + " · " + unit for _, label in STATS]]
         rows = []
         for p in ranked:
             m = (p["active"] if active else p)["metrics"][field]
             rows.append([p["name"], ', '.join(map(str, p["pids"])), m["count"], *[scaled(m[k], 1024 if field == "rss_kb" else 1) for k, _ in STATS]])
         out.append(grid(headers, rows, [p["id"] for p in ranked], True, role) + '</' + tag + '>')
-    out.append('<details class="panel"><summary>物理 / 逻辑 IO · 有效增量及累计</summary><p class="note">KB/周期是计数增量，不是 KB/s 或 MB/s；累计只累加有效增量，缺失不补零。选择进程查看其独立曲线，默认展示物理 IO 有效累计靠前的进程。</p><div class="charts">')
+    out.append('<details class="panel"><summary>物理 / 逻辑 IO · 有效增量及累计</summary><details class="report-notes"><summary>查看说明</summary><p class="note">KB/周期是计数增量，不是 KB/s 或 MB/s；累计只累加有效增量，缺失不补零。选择进程查看其独立曲线，默认展示物理 IO 有效累计靠前的进程。</p></details><div class="charts">')
     for role, title in (("io-physical", "物理 IO 增量"), ("io-logical", "逻辑 IO 增量"), ("io-physical-total", "物理 IO 累计"), ("io-logical-total", "逻辑 IO 累计")):
         out.append('<div><h4>' + title + '</h4>' + chart(system, role, title) + '</div>')
     io_headers = ["进程", "PID"] + [label + suffix for _, label in IO_FIELDS for suffix in ("均值 KB/周期", "P95 KB/周期", "峰值 KB/周期", "累计 KB")]
     io_rows = [[p["name"], ', '.join(map(str, p["pids"])), *[metric(p, f, k) for f, _ in IO_FIELDS for k in ("avg", "p95", "max", "total")]] for p in processes]
     out.append('</div>' + grid(io_headers, io_rows, [p["id"] for p in processes], True, "io") + '</details>')
-    out.append('<section class="panel"><h3>Excel 49 项 · 当前时段逐项实测</h3><p class="note">独立核对全部49项；实测为当前完整时段，日志没有前后台场景标记，不推断场景。候选与截断名称不计入实测，DP-only不等于P采集成功。实测K固定按28.75 KDMIPS/核换算；源预算K照录，不修正源表不一致。RSS峰值不等同于源表所有内存口径。日志仅有IO周期增量，无法给出源表MB/S速率，因此留空。</p>' + required_table(data, segment) + '</section>')
-    reference_note = '<p class="note">默认参照：系统 CPU＝整机总占用×8（满载800%）；已使用内存＝总内存−MemAvailable。IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；未采集进程不计入，各字段仅汇总有效值（可能不完整），无有效值时断线。</p>'
-    out.append('<section class="panel"><h3>全进程 · 搜索排序与叠加趋势</h3><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。零活跃及 DP-only 身份完整保留。</p>' + reference_note + grid(PROCESS_HEADERS, [process_row(p, n) for n, p in enumerate(processes, 1)], [p["id"] for p in processes], True, "all", search_terms=[', '.join(map(str, p["pids"])) for p in processes]))
-    out.append('<div class="selection-tags js-only" aria-live="polite"></div>')
-    for role, title in (("overlay-cpu", "选中进程单核 CPU %"), ("overlay-rss", "选中进程 RSS MB"), ("overlay-io", "选中进程 IO 增量 KB/周期")):
-        out.append('<h4>' + title + '</h4>' + chart(system, role, title))
-    out.append('</section>')
-    out.append('<section class="panel"><h3>关联进程 · 搜索、勾选与精确合并</h3><p class="note">仅同段合并，按本段全部周期对齐。任一成员行或字段缺失，则对应合计缺失；全量重算最近秩分位数。不会相加分位数。</p>' + reference_note + '<div class="js-only"><div class="merge-grid"><div class="merge-column"><h4>可选进程</h4><label>搜索 <input class="merge-search" type="search" placeholder="名称 / PID" aria-label="搜索可合并进程"></label><div class="candidate-list"></div></div><div class="merge-column"><h4>已选进程 <span class="merge-count">0</span></h4><button class="merge-clear" type="button">清空选择</button><div class="selected-list"></div></div></div><button class="merge-apply" type="button">计算全量合并统计</button><p class="merge-status status" aria-live="polite"></p><div class="merge-result"></div></div>')
-    for role, title in (("merge-cpu", "合并单核 CPU"), ("merge-rss", "合并 RSS MB"), ("merge-io", "合并 IO 增量")):
-        out.append(chart(system, role, title))
-
-    return ''.join(out) + '</section></section>'
+    return ''.join(out) + '</section>'
 
 
 def render_document(data):
@@ -318,7 +320,7 @@ def render_document(data):
     payload = json.dumps(data, ensure_ascii=True, allow_nan=False, separators=(',', ':'))
     payload = payload.replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
     title = str(data["session"].get("name") or "性能采集报告")
-    out = ['<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="' + esc(REPORT_CSP) + '"><title>' + esc(title) + ' · 性能分析报告</title><style>' + CSS + '</style></head><body><main><header><div class="eyebrow">SYSMONITOR · OFFLINE PERFORMANCE</div><h1>性能分析报告</h1><p class="subtitle">' + esc(title) + '</p><p class="note">进程主口径：单核 CPU · 固定 28.75 KDMIPS/核 · RSS MB · IO KB/周期</p></header><nav>']
+    out = ['<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="' + esc(REPORT_CSP) + '"><title>' + esc(title) + ' · 性能分析报告</title><style>' + CSS + '</style></head><body><main><header><div class="eyebrow">SYSMONITOR · OFFLINE PERFORMANCE</div><h1>性能分析报告</h1><p class="subtitle">' + esc(title) + '</p><details class="report-notes"><summary>查看进程统计口径</summary><p class="note">进程主口径：单核 CPU · 固定 28.75 KDMIPS/核 · RSS MB · IO KB/周期</p></details></header><nav>']
     out.extend('<a href="#' + esc(s["id"]) + '">' + esc(time_label(s)) + '</a>' for s in data["systems"])
     out.append('<a href="#method">统计口径</a></nav><noscript><p class="note">JavaScript 已禁用：静态统计、排行榜、Excel逐项表和全部进程仍可阅读；图表与交互不可用。</p></noscript>')
     out.extend(segment_html(data, system) for system in data["systems"])

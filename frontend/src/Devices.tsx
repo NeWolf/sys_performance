@@ -1,10 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, errorMessage } from './api'
+import { api, apiResponse, errorMessage } from './api'
 import { useEditGuard, useMutation } from './Editing'
 
 type Device = { serial: string; state: string; model: string }
 type Status = { serial: string; pids: string[]; properties: Record<string, string>; files: string; privilege: string; deployed: boolean }
 type PullResult = { id: string; duplicate: boolean; archive: string; files: string[] }
+type TopStatus = {
+  id: string | null; status: string; running: boolean; stopping: boolean; importing: boolean
+  count: number; target_count: number; interval: number; serial: string | null
+  error: string | null; archive: string | null; session_id: string | null
+}
+const topLabels: Record<string, string> = {
+  idle: '未开始', starting: '启动中', running: '采集中', stopping: '停止中',
+  stopped: '已停止', completed: '采集完成', importing: '导入中', imported: '已导入', error: '异常',
+}
 
 export function Devices({ onImported, disabled, view, onAdvanced }: { onImported: (id: string) => void; disabled: boolean; view: string; onAdvanced: () => void }) {
   const [revision, setRevision] = useState(0)
@@ -23,7 +32,36 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   const running = useRef(false)
   const polling = useRef<Promise<void> | null>(null)
   const [pollError, setPollError] = useState('')
+  const [topStatus, setTopStatus] = useState<TopStatus | null>(null)
+  const [topPollError, setTopPollError] = useState('')
+  const [topInterval, setTopInterval] = useState(1)
+  const [topCount, setTopCount] = useState(-1)
+  const [topTitle, setTopTitle] = useState('')
+  const topPolling = useRef<Promise<void> | null>(null)
+  const topActive = Boolean(topStatus?.running || topStatus?.importing)
+  const validTopSettings = Number.isFinite(topInterval) && topInterval >= 1 && topInterval <= 3600
+    && Number.isInteger(topCount) && (topCount === -1 || (topCount >= 1 && topCount <= 100000))
   const locked = Boolean(busy) || disabled
+
+  useEffect(() => {
+    const controller = new AbortController()
+    async function refresh() {
+      if (running.current || topPolling.current) return
+      const request = (async () => {
+        try {
+          const next = await api<TopStatus>('/api/top/status', { signal: controller.signal })
+          if (!controller.signal.aborted) { setTopStatus(next); setTopPollError('') }
+        } catch (failure) {
+          if (!controller.signal.aborted) setTopPollError(errorMessage(failure))
+        }
+      })()
+      topPolling.current = request
+      try { await request } finally { if (topPolling.current === request) topPolling.current = null }
+    }
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 2000)
+    return () => { controller.abort(); window.clearInterval(timer) }
+  }, [revision])
   const current = connected && status?.serial === serial ? status : null
   const selectedDevice = devices.data.find((device) => device.serial === serial)
   const disconnected = serial && !devices.loading && !devices.error && (!selectedDevice || selectedDevice.state !== 'device')
@@ -120,6 +158,59 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     })
   }
 
+  async function performTop(action: 'start' | 'stop' | 'import' | 'archive') {
+    if (locked || running.current) return
+    if (action === 'start' && (!connected || !validTopSettings || topActive)) return
+    if (action === 'start' && !window.confirm(`将在 ${serial} 开始独立 Top 采集（${topInterval} 秒，${topCount === -1 ? '持续采集直到手动停止' : `${topCount} 次`}）。无需部署 sysmonitor 或 root，不修改其采集开关。关闭页面不会停止采集，退出本地服务将停止。确认开始？`)) return
+    if (action === 'stop' && !window.confirm(`确认停止 ${topStatus?.serial || ''} 的 Top 采集？已完成样本将保留，不影响 sysmonitor 采集。`)) return
+    if (action === 'import' && !guard.confirm('导入 Top 日志后将切换分析会话并放弃未保存配置，是否继续？')) return
+    const captureId = topStatus?.id
+    if ((action === 'import' || action === 'archive') && (!captureId || !topStatus?.archive || topActive)) return
+    await mutation.run(async (signal) => {
+      running.current = true
+      setBusy(`top-${action}`)
+      setNotice('')
+      try {
+        await Promise.all([polling.current, topPolling.current])
+        if (signal.aborted) return
+        if (action === 'archive') {
+          const response = await apiResponse(`/api/top/archive?${new URLSearchParams({ capture_id: captureId! })}`, { signal })
+          const blob = await response.blob()
+          if (signal.aborted) return
+          const url = URL.createObjectURL(blob)
+          const link = document.createElement('a')
+          link.href = url
+          link.download = 'top_raw.txt'
+          document.body.append(link)
+          link.click()
+          link.remove()
+          window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+          setNotice('Top 原始日志已触发浏览器下载。')
+        } else {
+          const body = action === 'start'
+            ? { confirm: true, serial, interval: topInterval, count: topCount, title: topTitle }
+            : action === 'import' ? { confirm: true, capture_id: captureId } : { confirm: true }
+          const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal }
+          if (action === 'import') {
+            const result = await api<{ id: string; duplicate: boolean }>('/api/top/import', init)
+            if (signal.aborted) return
+            setNotice(result.duplicate ? '已打开已有 Top 分析会话。' : 'Top 日志导入完成。')
+            onImported(result.id)
+          } else {
+            const next = await api<TopStatus>(`/api/top/${action}`, init)
+            if (signal.aborted) return
+            setTopStatus(next)
+            setTopPollError('')
+            setNotice(action === 'start' ? 'Top 任务已启动，结束后可单独导入分析或下载原始日志。' : '已请求停止 Top 采集，请等待归档完成。')
+          }
+        }
+      } finally {
+        running.current = false
+        if (!signal.aborted) { setBusy(''); setRevision((value) => value + 1) }
+      }
+    })
+  }
+
   return <>
     <section hidden={view !== 'advanced'} className="panel config-panel" aria-label="高级采集设置">
       <div className="section-heading"><div><h2>采集参数</h2><p>参数用于下一次开始采集，修改后不会立即写入设备。</p></div></div>
@@ -158,7 +249,31 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     {current && <div className="device-status"><p>采集程序：{current.deployed ? '已部署' : '未部署（开始采集时自动部署）'} · 测试进程：{current.pids.length ? current.pids.join(', ') : '未运行'} · 权限：{current.privilege}</p>
       <p>采集开关：{current.properties.test || '默认关闭'} · 间隔：{current.properties.interval || '1'} 秒 · 文件：{current.properties.tofile || '1'} · logcat：{current.properties.tologcat || '1'} · 异步属性：{current.properties.async || '0'}</p>
       <details><summary>设备日志文件</summary><pre>{current.files || '暂无日志文件'}</pre></details></div>}
+    <section aria-label="独立 Top 采集">
+      <div className="section-heading"><div><h2>Top 采集</h2><p className="muted">独立于 sysmonitor，无需部署或 root；使用上方所选 ADB 设备。</p></div></div>
+      <div className="device-controls">
+        <label>Top 间隔（秒）<input type="number" min={1} max={3600} step="any" value={topInterval} disabled={locked || topActive} onChange={(event) => setTopInterval(Number(event.target.value))} /></label>
+        <label>Top 次数（-1 持续）<input type="number" min={-1} max={100000} step={1} value={topCount} disabled={locked || topActive} onChange={(event) => setTopCount(Number(event.target.value))} /></label>
+        <label>Top 会话名称<input value={topTitle} maxLength={120} placeholder="选填" disabled={locked || topActive} onChange={(event) => setTopTitle(event.target.value)} /></label>
+      </div>
+      {!validTopSettings && <p className="error" role="alert">Top 间隔须为 1–3600 秒；次数须为 -1 或 1–100000 的整数。</p>}
+      <div className="actions device-actions">
+        <button className="primary" disabled={locked || !connected || !validTopSettings || !topStatus || Boolean(topPollError) || topActive} onClick={() => void performTop('start')}>开始 Top 采集</button>
+        <button disabled={locked || !topStatus?.running || topStatus.stopping} onClick={() => void performTop('stop')}>停止 Top 采集</button>
+        <button disabled={locked || topActive || !topStatus?.archive || Boolean(topPollError)} onClick={() => void performTop('import')}>导入 Top 日志并分析</button>
+        <button disabled={locked || topActive || !topStatus?.archive || Boolean(topPollError)} onClick={() => void performTop('archive')}>下载 Top 原始日志</button>
+      </div>
+      <p className="muted">Top 参数与原采集参数互不影响；每 2 秒刷新状态。结束或停止后手动导入，不自动切换分析会话。关闭页面不会停止任务，退出本地服务将停止；断连等异常时保留已完成样本。</p>
+      {topPollError && <p className="error" role="alert">Top 状态刷新失败：{topPollError}，正在重试。</p>}
+      {!topStatus && !topPollError && <p role="status">正在查询 Top 状态…</p>}
+      {topStatus && <div className="device-status" role="status">
+        <p>Top 状态：{topLabels[topStatus.status] || topStatus.status} · 设备：{topStatus.serial || '—'} · 已采样：{topStatus.count} / {topStatus.target_count === -1 ? '持续' : topStatus.target_count} · 间隔：{topStatus.interval} 秒</p>
+        {topActive && topStatus.serial !== serial && <p className="muted">当前 Top 任务属于 {topStatus.serial}，切换所选设备不会改变正在运行的任务。</p>}
+        {topStatus.error && <p className="error">{topStatus.error}{topStatus.archive ? '；已完成样本可下载或导入。' : ''}</p>}
+      </div>}
+    </section>
   </section>
+  {view !== 'capture' && (topActive || topPollError || topStatus?.error) && <div className="banner warning" role="status">Top 采集：{topPollError || topStatus?.error || `${topLabels[topStatus!.status] || topStatus!.status} · ${topStatus!.count} 次`}。请到数据集查看或停止任务。</div>}
   {view !== 'capture' && (disconnected || devices.error || pollError || error) && <div className="banner warning" role="status">设备采集提示：{disconnected ? '设备已断开连接或不可用，正在自动检测重连。' : devices.error || pollError || error} 请到数据采集查看详情。</div>}
   {view !== 'capture' && notice && <div className="banner success device-notice" role="status">{notice}</div>}
   {view !== 'capture' && busy && <div className="banner info" role="status">正在执行设备操作，请勿关闭页面…</div>}

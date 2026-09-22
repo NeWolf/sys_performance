@@ -232,8 +232,11 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         self.assertNotIn("核数证据", html)
         from perf_report_ui import segment_html, time_label
         section = segment_html(display, system).split('</section>', 1)[0]
-        self.assertIn("开始测试：2000年01月01日 00:00:30", section)
-        self.assertIn("结束时间：2000年01月01日 00:50:00", section)
+        from datetime import datetime
+        start = datetime.fromtimestamp(946684830).strftime("%Y年%m月%d日 %H:%M:%S")
+        end = datetime.fromtimestamp(946687800).strftime("%Y年%m月%d日 %H:%M:%S")
+        self.assertIn("开始测试：" + start, section)
+        self.assertIn("结束时间：" + end, section)
         self.assertIn("采集0小时49分钟30秒", section)
         for removed in ("独立时段 · 时间回拨隔离", "全部周期", "系统样本", "进程名称（含 DP-only）", "存在活跃周期"):
             self.assertNotIn(removed, section)
@@ -259,10 +262,111 @@ class StoreTests(ReportAssertions, unittest.TestCase):
                 system["metrics"]["cpu_total"]["avg"] = value
                 html = segment_html(data, system)
                 self.assertIn('class="overview-primary cpu-' + level + '"', html)
+                self.assertIn('<details class="overview-notes"><summary>查看统计口径与图表说明</summary>', html)
+                self.assertIn('缺失不补零。</p></details>', html)
                 self.assertEqual(system["metrics"]["cpu_total"]["avg"], value)
         for level, color in (("low", "#6bcb77"), ("medium", "#ffd93d"), ("high", "#ff6b6b")):
             self.assertIn('.overview-primary.cpu-' + level + '{--cpu-color:' + color, CSS)
         self.assertIn('.overview-primary .stat-header strong{font-size:32px;color:var(--cpu-color)}', CSS)
+
+    def test_report_primary_modules_open_before_collapsed_modules(self):
+        from perf_report import render_report
+
+        report = render_report(self.store, self.import_sample()["id"])
+        self.assert_report(report)
+        expanded_titles = ("Excel 49 项 · 当前时段逐项实测", "全进程 · 搜索排序与叠加趋势",
+                           "关联进程 · 搜索、勾选与精确合并")
+
+        class FoldMarkup(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack = []
+                self.modules = []
+                self.notes = 0
+
+            def handle_starttag(parser, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "details" and attrs.get("class") != "panel":
+                    self.assertNotIn("open", attrs)
+                if tag == "section" and "overview" in attrs.get("class", "").split():
+                    parser.overview = True
+                if tag == "summary":
+                    self.assertEqual(parser.stack[-1][0], "details")
+                if tag == "p" and attrs.get("class") == "note":
+                    # The no-JavaScript warning must remain immediately visible.
+                    if not any(t == "noscript" for t, _ in parser.stack):
+                        self.assertTrue(any(t == "details" and a.get("class") in
+                                            ("overview-notes", "report-notes")
+                                            for t, a in parser.stack))
+                        parser.notes += 1
+                if tag not in ("meta", "input", "br", "hr", "link", "img"):
+                    parser.stack.append((tag, attrs))
+
+            def handle_endtag(parser, tag):
+                self.assertTrue(parser.stack, tag)
+                self.assertEqual(parser.stack.pop()[0], tag)
+
+            def handle_data(parser, text):
+                if parser.stack and parser.stack[-1][0] in ("h4", "th", "summary"):
+                    self.assertNotIn("单核", text)
+                    self.assertNotIn("RSS", text)
+                if parser.stack and parser.stack[-1][0] == "summary":
+                    if parser.stack[-2][1].get("class") == "panel":
+                        parser.modules.append(text)
+                        self.assertEqual("open" in parser.stack[-2][1], text in expanded_titles)
+
+        markup = FoldMarkup()
+        markup.feed(report)
+        markup.close()
+        self.assertEqual(markup.stack, [])
+        self.assertTrue(markup.overview)
+        self.assertGreaterEqual(markup.notes, 9)
+        self.assertEqual(markup.modules, [
+            *expanded_titles,
+            "CPU 超标分布明细 · 整机 100% 口径",
+            "活跃 CPU Top30 · 活跃均值", "CPU 峰值 Top30 · 趋势", "内存均值 Top30",
+            "物理 / 逻辑 IO · 有效增量及累计", "统计口径与数据来源",
+        ])
+
+    def test_report_fold_toggle_initializes_and_resizes_charts(self):
+        source = Path("report_assets/report.js").read_text(encoding="utf-8")
+        lifecycle = source[source.index("  function resizeVisible("):].rsplit("})();", 1)[0]
+        harness = """
+const assert = require('node:assert/strict');
+const events = {}, callbacks = {};
+const fold = {open:false, addEventListener:(event, fn)=>events[event]=fn,
+  contains:node=>node===chartNode};
+const chartNode = {getClientRects:()=>fold.open?[{}]:[],
+  get clientWidth(){return fold.open?600:0;}};
+const hiddenNode = {getClientRects:()=>[], clientWidth:0};
+const instances = new Map([[chartNode,{chart:null}],[hiddenNode,{chart:null}]]);
+let initialized=0, resized=0;
+function activate(node,state) {
+  initialized++; state.chart={resize:()=>resized++};
+}
+const document = {contains:()=>true, querySelectorAll:selector=>
+  selector==='details'?[fold]:fold.open?[]:[fold]};
+const window = {addEventListener:(event,fn)=>callbacks[event]=fn};
+const requestAnimationFrame = fn=>fn(), cancelAnimationFrame = ()=>{};
+"""
+        checks = """
+events.toggle();
+assert.equal(initialized,0);
+fold.open=true; events.toggle();
+assert.equal(initialized,1);
+assert.equal(resized,0);
+fold.open=false; events.toggle();
+fold.open=true; events.toggle();
+assert.equal(initialized,1);
+assert.equal(resized,1);
+fold.open=false;
+callbacks.beforeprint();
+assert.equal(fold.open,true);
+callbacks.afterprint();
+assert.equal(fold.open,false);
+assert.equal(instances.get(hiddenNode).chart,null);
+"""
+        self.run_report_script(harness + lifecycle + checks)
 
     def test_report_overview_chart_percentiles_and_time(self):
         source = Path("report_assets/report.js").read_text(encoding="utf-8")
@@ -275,10 +379,16 @@ global.document = {
 };
 """
         checks = """
-assert.equal(timeLabel(Date.UTC(2026,8,20,13,7,59)), '13:07:59');
-assert.equal(timeLabel(Date.UTC(2026,8,20,13,8,0)), '13:08:00');
-assert.equal(timeLabel(Date.UTC(2026,8,21,0,0,1,999)), '00:00:01');
-assert.equal(timeLabel(0), '00:00:00');
+process.env.TZ = 'Asia/Shanghai';
+assert.equal(timeLabel(Date.UTC(2026,8,20,13,7,59)), '21:07:59');
+assert.equal(timeLabel(Date.UTC(2026,8,20,13,8,0)), '21:08:00');
+assert.equal(timeLabel(Date.UTC(2026,8,20,16,0,1,999)), '00:00:01');
+assert.equal(fullTimeLabel(Date.UTC(2026,8,20,16,0,1)), '2026-09-21 00:00:01');
+assert.equal(timeLabel(0), '08:00:00');
+process.env.TZ = 'America/New_York';
+assert.equal(timeLabel(Date.UTC(2026,0,1,12)), '07:00:00');
+assert.equal(timeLabel(Date.UTC(2026,6,1,12)), '08:00:00');
+process.env.TZ = 'Asia/Shanghai';
 assert.equal(timeLabel(null), '—');
 assert.equal(timeLabel(NaN), '—');
 assert.equal(timeLabel(1e20), '—');
@@ -291,7 +401,9 @@ const points = [
 const series = overviewSeries(points,'cpu_total',{p95:95,p99:99},'#ff6b6b','%',true);
 assert.equal(series.length,2);
 assert.deepEqual(series[0].data, [[1000,10],[3000,20]]);
-assert.equal(series[0].lineStyle.width,3);
+assert.equal(series[0].lineStyle.width,1.5);
+assert.equal(lineSeries(points,'cpu_total','CPU','red')[0].lineStyle.width,1);
+assert.equal(series[0].markLine.lineStyle.width,1);
 assert.equal(series[0].markLine.lineStyle.type,'dashed');
 assert.deepEqual(series[0].markLine.data.map(x=>x.yAxis),[95,99]);
 assert.equal(series[1].markLine,undefined);
@@ -310,6 +422,14 @@ assert.deepEqual(overview.memory.series.map(s=>s.name),['已使用内存','空�
 assert.equal(overview.memory.yAxis.name,undefined);
 for (const s of overview.memory.series) assert.deepEqual(s.markLine.data.map(x=>x.yAxis),[80,90]);
 assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
+data.system_fields = data.system_fields.map(f => f === 'mem_avail_mb' ? 'mem_free_mb' : f);
+const topMemory = overviewOptions({series:{points:[{segment:0,cycle:1,ts:1000,
+ mem_used_mb:7516,mem_free_mb:7209,mem_avail_mb:null}]},
+ metrics:{mem_used_mb:{p95:7516,p99:7516},mem_free_mb:{p95:7209,p99:7209}}}).memory;
+assert.deepEqual(topMemory.legend.selected,{'已使用内存':true,'空闲内存':false});
+assert.deepEqual(topMemory.series.map(s=>s.name),['已使用内存','空闲内存']);
+assert.deepEqual(topMemory.series[1].data,[[1000,7209]]);
+assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
 })();
 """
         self.run_report_script(harness + prefix + checks)
@@ -331,7 +451,7 @@ assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
             self.assertEqual(row[-1], p["pid_changes"])
         for removed in ("状态", "单核均值 %", "单核P95 %", "单核P99 %", "单核峰值 %", "物理读累计 KB", "物理写累计 KB"):
             self.assertNotIn(removed, PROCESS_HEADERS)
-        rss_column = PROCESS_HEADERS.index("RSS峰值 MB")
+        rss_column = PROCESS_HEADERS.index("内存峰值 MB")
         self.assertEqual(PROCESS_HEADERS[rss_column + 1:rss_column + 3], ["累计读 KB", "累计写 KB"])
         for p in payload["processes"]:
             cells = dict(zip(PROCESS_HEADERS, process_row(p, 1)))
@@ -346,6 +466,7 @@ assert.equal(overview.cpu.series.filter(s=>s.markLine).length,1);
         prefix = source[:source.index("  data.systems.forEach(setupSegment);")]
         harness = """
 const assert = require('node:assert/strict');
+process.env.TZ = 'Asia/Shanghai';
 class Node {
   constructor() { this.children=[]; this.events={}; this.dataset={}; this.value='';
     this.classList={add(){},toggle(){}}; this.nodes=new Map(); }
@@ -388,9 +509,9 @@ const option = role => instances.get(document.getElementById(system.id+'-'+role)
 for (const {option: chart} of instances.values()) {
   if (chart.xAxis.type !== 'time') continue;
   const ts = Date.UTC(2026,8,20,13,7,59);
-  assert.equal(chart.xAxis.axisLabel.formatter(ts), '13:07:59');
-  assert.equal(chart.dataZoom.find(z => z.type === 'slider').labelFormatter(ts), '13:07:59');
-  assert.ok(chart.xAxis.axisPointer.label.formatter({value:ts}).includes('13:07:59'));
+  assert.equal(chart.xAxis.axisLabel.formatter(ts), '21:07:59');
+  assert.equal(chart.dataZoom.find(z => z.type === 'slider').labelFormatter(ts), '21:07:59');
+  assert.equal(chart.xAxis.axisPointer.label.formatter({value:ts}), '2026-09-20 21:07:59');
 }
 for (const mode of ['overlay','merge']) {
   assert.equal(option(mode+'-cpu').series[0].data[0][1],42.04*8);
@@ -693,7 +814,7 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
         self.assertEqual(data["display_cpu_basis"], "system-100-process-single-core")
         for removed in ("1 测试环境", "6 准入结论", "附录 A", "组同周期合计统计", "请先配置准入进程组"):
             self.assertNotIn(removed, report)
-        for phrase in ("选中进程单核 CPU %", "选中进程 RSS MB", "全进程", "离线自包含报告"):
+        for phrase in ("选中进程 CPU %", "选中进程 内存 MB", "全进程", "离线自包含报告"):
             self.assertIn(phrase, report)
         metrics = data["systems"][0]["metrics"]
         for field, expected in (("cpu_total", [95, 99, 100]), ("mem_used_mb", [5399] * 3)):
@@ -1564,6 +1685,15 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual([item["excel_row"] for item in required],
                          list(range(7, 38)) + list(range(39, 57)))
         self.assertEqual(data["processes"], [])
+        from unittest.mock import patch
+        from perf_report_ui import required_table
+        with patch("perf_report_ui.grid", return_value="") as table:
+            required_table(data, 0)
+        headers, rows = table.call_args_list[0].args[:2]
+        self.assertNotIn("候选（不计实测）", headers)
+        self.assertEqual(len(headers), 13)
+        self.assertEqual(len(rows), 49)
+        self.assertTrue(all(len(row) == len(headers) for row in rows))
         self.assertEqual(data["required_source"]["file"], "8255内部-资源分布策略.xlsx")
         self.assertEqual(data["required_source"]["sheet"], "Sheet1")
         self.assertEqual(data["required_source"]["rows"], [[7, 37], [39, 56]])

@@ -80,7 +80,7 @@ REQUIRED_PROCESSES = tuple(
 )
 PROCESS_FIELDS = ("cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb")
 SYSTEM_FIELDS = ("cpu_total", "cpu_user", "cpu_sys", "cpu_iow", "cpu_irq", "cpu_idle",
-                 "mem_total_mb", "mem_avail_mb", "mem_used_mb", "mem_percent")
+                 "mem_total_mb", "mem_avail_mb", "mem_free_mb", "mem_used_mb", "mem_percent")
 INCREMENTS = frozenset(PROCESS_FIELDS[3:])
 FULL_CYCLE_SCHEMA = (
     "cycle", "ts", *PROCESS_FIELDS, "pids", "duplicate_pids", "p_records",
@@ -115,9 +115,9 @@ def _metric_metadata(field):
     if field == "cpu_idle":
         return {"label": "空闲", "unit": "%", "note": "每条 S 样本按 100 - cpu_total 计算"}
     if field == "mem_used_mb":
-        return {"label": "mem_used_mb", "unit": "MB", "note": "MemTotal - MemAvailable，含不可回收部分，不把可回收 cache 算作已用"}
+        return {"label": "mem_used_mb", "unit": "MB", "note": "sysmonitor：MemTotal - MemAvailable，含不可回收部分，不把可回收 cache 算作已用；Top：直接使用 Mem 行的 used，不等同于 sysmonitor 口径"}
     if field == "mem_percent":
-        return {"label": "系统内存使用率", "unit": "%", "note": "(MemTotal - MemAvailable) / MemTotal × 100，仅 total > 0"}
+        return {"label": "系统内存使用率", "unit": "%", "note": "已用内存 / 总内存 × 100，仅 total > 0；sysmonitor 已用为 MemTotal - MemAvailable，Top 已用为 Mem 行的 used"}
     return metadata(field)
 
 
@@ -358,7 +358,10 @@ def _build_system(db, store, segment, cycles):
         data = json.loads(row["data"])
         values = {field: _number(data.get(field)) for field in SYSTEM_FIELDS[:-1]}
         total, available = values["mem_total_mb"], values["mem_avail_mb"]
-        used = total - available if total is not None and available is not None else None
+        if data.get("source_format") == "top":
+            used = values["mem_used_mb"]
+        else:
+            used = total - available if total is not None and available is not None else None
         values["mem_used_mb"] = used
         cpu = values["cpu_total"]
         values["cpu_idle"] = 100 - cpu if cpu is not None else None

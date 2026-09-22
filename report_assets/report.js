@@ -9,10 +9,16 @@
   const index = Object.fromEntries(data.full_cycle_schema.map((f, i) => [f, i]));
   const axisIndex = Object.fromEntries(data.cycle_axis_schema.map((f, i) => [f, i]));
   const io = ['rd_kb', 'wr_kb', 'rchar_kb', 'wchar_kb'];
-  const labels = {cpu1c:'单核 CPU', cpu_total:'整机 CPU 总占用', cpu_idle:'空闲', cpu_user:'用户态占用', cpu_sys:'内核态占用', cpu_irq:'irq+softirq 占用', cpu_iow:'iowait 占用', rss_kb:'RSS', rd_kb:'物理读', wr_kb:'物理写', rchar_kb:'逻辑读', wchar_kb:'逻辑写', mem_used_mb:'已使用内存', mem_avail_mb:'空闲内存', mem_total_mb:'总内存', mem_percent:'内存使用率'};
-  const timeLabel = value => {
+  const labels = {cpu1c:'CPU', cpu_total:'整机 CPU 总占用', cpu_idle:'空闲', cpu_user:'用户态占用', cpu_sys:'内核态占用', cpu_irq:'irq+softirq 占用', cpu_iow:'iowait 占用', rss_kb:'内存', rd_kb:'物理读', wr_kb:'物理写', rchar_kb:'逻辑读', wchar_kb:'逻辑写', mem_used_mb:'已使用内存', mem_free_mb:'空闲内存', mem_avail_mb:'空闲内存', mem_total_mb:'总内存', mem_percent:'内存使用率'};
+  const fullTimeLabel = value => {
     const date = new Date(value);
-    return valid(value) && Number.isFinite(date.getTime()) ? date.toISOString().slice(11,19) : '—';
+    if (!valid(value) || !Number.isFinite(date.getTime())) return '—';
+    const pad = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  };
+  const timeLabel = value => {
+    const label = fullTimeLabel(value);
+    return label === '—' ? label : label.slice(11);
   };
   const palette = ['#a78bfa','#38bdf8','#34d399','#fbbf24','#fb7185','#c084fc','#22d3ee','#fb923c'];
   const instances = new Map();
@@ -63,7 +69,7 @@
       if (!valid(p[field]) || !valid(p.ts)) { previous = null; group = null; continue; }
       if (!group || !connected) {
         group = {name, type:'line', data:[], showSymbol:true, symbolSize:3, connectNulls:false,
-          yAxisIndex, lineStyle:{width:1.5, color}, itemStyle:{color}, emphasis:{focus:'series'}, animation:false};
+          yAxisIndex, lineStyle:{width:1, color}, itemStyle:{color}, emphasis:{focus:'series'}, animation:false};
         groups.push(group);
       }
       group.data.push([p.ts, p[field] / divisor]);
@@ -74,11 +80,11 @@
   function overviewSeries(points, field, metric, color, unit, references=false) {
     const series = lineSeries(points, field, labels[field] || field, color);
     if (field === 'cpu_total' || field === 'mem_used_mb') {
-      series.forEach(item => { item.lineStyle.width = 3; item.z = 5; });
+      series.forEach(item => { item.lineStyle.width = 1.5; item.z = 5; });
     }
     if (references && series.length) {
       series[0].markLine = {silent:true, symbol:'none', animation:false,
-        lineStyle:{type:'dashed',width:1.5},
+        lineStyle:{type:'dashed',width:1},
         data:['p95','p99'].filter(key => valid(metric?.[key])).map((key, i) => ({
           name:labels[field] + ' ' + key.toUpperCase(), yAxis:metric[key],
           lineStyle:{color:field === 'cpu_total' ? ['#ffd93d','#f472b6'][i] : color},
@@ -98,7 +104,7 @@
       selected:Object.fromEntries(fs.map(f => [labels[f], f === primary]))});
     const cpuSeries = cpuFields.flatMap((f,i) => overviewSeries(points,f,system.metrics[f],
       f === 'cpu_total' ? '#ff6b6b' : palette[i%palette.length], '%', f === 'cpu_total'));
-    const memFields = ['mem_used_mb','mem_avail_mb'];
+    const memFields = ['mem_used_mb', data.system_fields.includes('mem_free_mb') ? 'mem_free_mb' : 'mem_avail_mb'];
     const memSeries = memFields.flatMap((f,i) => overviewSeries(points,f,system.metrics[f],palette[i%palette.length],'MB',true));
     return {
       cpu:{series:cpuSeries,legend:legend(cpuFields,'cpu_total'),
@@ -128,11 +134,8 @@
       tooltip:{trigger:'axis', renderMode:'richText', confine:true},
       legend:{type:'scroll', top:0, textStyle:{color:'#cbd5e1'}, pageTextStyle:{color:'#cbd5e1'}},
       grid:{left:65,right:45,top:65,bottom:65,containLabel:true},
-      xAxis:{type:'time', name:'时间 (UTC)', axisLabel:{formatter:timeLabel,hideOverlap:true},
-        axisPointer:{label:{formatter:params => {
-          const date = new Date(params.value);
-          return Number.isFinite(date.getTime()) ? date.toISOString().replace('T',' ') : '—';
-        }}}, splitLine:{show:false}},
+      xAxis:{type:'time', name:'时间 (本机)', axisLabel:{formatter:timeLabel,hideOverlap:true},
+        axisPointer:{label:{formatter:params => fullTimeLabel(params.value)}}, splitLine:{show:false}},
       yAxis:{type:'value', splitLine:{lineStyle:{color:'rgba(148,163,184,.12)'}}},
       dataZoom:[{type:'inside',filterMode:'none'}, {type:'slider',bottom:8,height:18,borderColor:'#475569',textStyle:{color:'#94a3b8'},labelFormatter:timeLabel}],
       ...option};
@@ -175,7 +178,7 @@
       else if (io.includes(f)) series.push(...lineSeries(ioPoints, f,
         '已采集进程 IO 合计 · ' + labels[f], ['#ff6b6b','#fbbf24','#34d399','#38bdf8'][io.indexOf(f)]));
     }
-    series.forEach(s => { s.lineStyle.width = 3; s.lineStyle.type = 'dashed'; s.z = 5; });
+    series.forEach(s => { s.lineStyle.width = 1.5; s.lineStyle.type = 'dashed'; s.z = 5; });
     return series;
   }
   function plot(node, members, fs, {total=false, points=null, unit='', fieldLabels=labels, references=[]}={}) {
@@ -195,7 +198,7 @@
   function bars(node, ps, field, key, active=false) {
     const ranked = rank(ps,field,key,active);
     draw(node, {tooltip:{trigger:'axis',renderMode:'richText',confine:true}, legend:{show:false},
-      xAxis:{type:'value',name:field === 'rss_kb' ? 'MB' : '单核 %'},
+      xAxis:{type:'value',name:field === 'rss_kb' ? 'MB' : '%'},
       yAxis:{type:'category',inverse:true,data:ranked.map(p => p.name),axisLabel:{width:250,overflow:'truncate'}},
       series:[{type:'bar',barMaxWidth:18,data:ranked.map((p,i) => ({value:(active ? p.active.metrics : p.metrics)[field][key] / (field === 'rss_kb' ? 1024 : 1),itemStyle:{color:palette[i%palette.length]}}))}],
       dataZoom:[],grid:{left:20,right:65,top:30,bottom:35,containLabel:true}});
@@ -244,7 +247,7 @@
           ...['min','avg','p95','p99','max'].map(k => valid(m[k]) ? m[k]/divisor : null)];
         if (isCPU) values.push(...['p95','max'].map(k => valid(m[k]) ? m[k]/100*28.75 : null));
         if (isIO) values.push(m.total);
-        row.append(el('td',labels[f] + ' / ' + (f === 'rss_kb' ? 'MB' : isIO ? 'KB/周期' : '单核 %')));
+        row.append(el('td',labels[f] + ' / ' + (f === 'rss_kb' ? 'MB' : isIO ? 'KB/周期' : '%')));
         values.forEach(v => row.append(el('td',fmt(v)))); body.append(row);
       }
       table.append(head,body); wrap.append(table); container.append(wrap);
@@ -305,7 +308,7 @@
         button.setAttribute('aria-label','移除叠加 ' + p.name);
         button.addEventListener('click',() => toggle(p.id)); tags.append(button);
       }
-      plotCompared('overlay-cpu',members,['cpu1c'],'单核 %');
+      plotCompared('overlay-cpu',members,['cpu1c'],'%');
       plotCompared('overlay-rss',members,['rss_kb'],'MB');
       plotCompared('overlay-io',members,io,'KB/周期');
       const ioMembers = members.length ? members : [...ps].filter(p => io.some(f => valid(p.metrics[f]?.total))).sort((a,b) =>
@@ -337,7 +340,7 @@
     const apply = root.querySelector('.merge-apply');
     function clearResult() {
       resultNode.replaceChildren();
-      for (const [role,fs,unit] of [['cpu',['cpu1c'],'单核 %'],['rss',['rss_kb'],'MB'],['io',io,'KB/周期']]) {
+      for (const [role,fs,unit] of [['cpu',['cpu1c'],'%'],['rss',['rss_kb'],'MB'],['io',io,'KB/周期']]) {
         plotCompared('merge-'+role,[],fs,unit);
       }
     }
@@ -381,10 +384,10 @@
           const result = mergeFull(system,members), sampled = sample(result.points);
           const aggregate = {name:'合并（'+members.length+'个名称）', series:{points:sampled}};
           resultNode.replaceChildren(el('h4','全量合并统计'),mergeTable(result,system.cycles),
-            el('h4','合并后有效单核 CPU > 0 的活跃统计'),mergeTable(result,system.cycles,true));
+            el('h4','合并后有效CPU > 0 的活跃统计'),mergeTable(result,system.cycles,true));
           const complete = result.points.filter(p => fields.every(f => valid(p[f]))).length;
           status.textContent = '已对齐 '+system.cycles+' 个周期；七字段完整 '+complete+'；活跃 '+result.active.length+'。图表最多600点，统计未采样。';
-          plotCompared('merge-cpu',[aggregate],['cpu1c'],'单核 %');
+          plotCompared('merge-cpu',[aggregate],['cpu1c'],'%');
           plotCompared('merge-rss',[aggregate],['rss_kb'],'MB');
           plotCompared('merge-io',[aggregate],io,'KB/周期');
         } catch (error) { status.textContent = '合并失败：'+error.message; }

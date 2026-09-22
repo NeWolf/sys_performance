@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from perf_parser import iter_records, rotation_key
+from perf_top_parser import detect_source_format, iter_top_records
 from perf_groups import GroupStore
 from perf_metrics import CATEGORIES, INCREMENTS, LABELS, METHOD, NOTES, NUMERIC, metadata
 
@@ -129,6 +130,18 @@ class Store(GroupStore):
             fingerprint.update(value)
             stream.seek(0)
             unique_sources.append((Path(name.replace("\\", "/")).name, stream))
+        formats = set()
+        for name, stream in unique_sources:
+            try:
+                detected = detect_source_format(stream)
+            except ValueError as exc:
+                raise ValueError(name + ": " + str(exc)) from exc
+            if detected:
+                formats.add(detected)
+        if len(formats) > 1:
+            raise ValueError("同一导入不能混合 Top/sysmonitor")
+        source_format = next(iter(formats), "sysmonitor")
+        parser = iter_top_records if source_format == "top" else iter_records
         signature = fingerprint.hexdigest()
         with self.connect() as db:
             # Serialize imports before checking duplicates.
@@ -140,7 +153,12 @@ class Store(GroupStore):
             summary = {"counts": {k: 0 for k in ("S", "P", "D", "DE", "DP")},
                        "errors": 0, "unknown": 0, "issues": [], "events": [], "event_count": 0,
                        "files": [name for name, _ in unique_sources], "segments": 0,
-                       "orphan_cycles": 0, "duplicate_files": len(sources) - len(unique_sources)}
+                       "orphan_cycles": 0, "duplicate_files": len(sources) - len(unique_sources),
+                       "source_format": source_format}
+            if source_format == "top":
+                summary["timestamp_timezones"] = {"UTC": 0, "local": 0}
+                summary["timestamp_policy"] = "UTC 标记按 UTC；旧日志无时区按导入机器本地时区（含当日夏令时）解析"
+                summary["statistics_policy"] = "沿用 nearest-rank；缺周期/缺指标为 NULL，不采用原脚本插值及补零"
             db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (
                 session_id, title[:120] or "离线采集 " + datetime.now().strftime("%m-%d %H:%M"),
                 datetime.now(timezone.utc).isoformat(), signature, "{}"))
@@ -152,7 +170,8 @@ class Store(GroupStore):
             batch = []
             first_ts = None
             for source, stream in unique_sources:
-                for record in iter_records(stream):
+                last_sample = None
+                for record in parser(stream):
                     if record.error:
                         summary["errors"] += 1
                         if len(summary["issues"]) < 100:
@@ -161,9 +180,13 @@ class Store(GroupStore):
                     if record.kind is None:
                         summary["unknown"] += 1
                         continue
-                    kind, data = record.kind, record.data
+                    kind, data = record.kind, dict(record.data)
+                    sample = data.pop("_sample", None)
+                    new_sample = source_format == "top" and sample != last_sample
+                    last_sample = sample
                     ts = data["ts"]
-                    changed_boot = kind == "S" and boot is not None and data["boot"] != boot
+                    changed_boot = (kind == "S" and "boot" in data and
+                                    boot is not None and data["boot"] != boot)
                     backwards = last_ts is not None and ts < last_ts
                     if changed_boot or backwards:
                         segment += 1
@@ -171,14 +194,16 @@ class Store(GroupStore):
                         if len(summary["events"]) < 100:
                             summary["events"].append({"source": source, "line": record.number, "ts": ts,
                                                       "message": "设备重启" if changed_boot else "时钟回拨或数据乱序"})
-                    if ts != last_ts or changed_boot or backwards:
+                    if ts != last_ts or changed_boot or backwards or new_sample:
                         if last_ts is not None and not cycle_has_s:
                             summary["orphan_cycles"] += 1
                         cycle += 1
                         cycle_has_s = False
                     if kind == "S":
-                        boot = data["boot"]
+                        boot = data.get("boot")
                         cycle_has_s = True
+                        if source_format == "top":
+                            summary["timestamp_timezones"][data["timestamp_timezone"]] += 1
                     if first_ts is None:
                         first_ts = ts
                     last_ts = ts
@@ -191,7 +216,7 @@ class Store(GroupStore):
                         batch.clear()
             self._insert(db, batch)
             if not any(summary["counts"].values()):
-                raise ValueError("没有有效的 sysmonitor 记录，请检查日志格式及末尾换行")
+                raise ValueError("没有有效的 sysmonitor/Top 记录，请检查日志格式及末尾换行")
             if last_ts is not None and not cycle_has_s:
                 summary["orphan_cycles"] += 1
             summary.update(segments=segment + 1, cycles=cycle, first_ts=first_ts, last_ts=last_ts)
@@ -280,8 +305,15 @@ class Store(GroupStore):
             db.execute("""CREATE TEMP TABLE process_reference_cycles AS
                 SELECT MIN(id) id, segment, cycle, MIN(ts) ts,
                 MAX(CASE WHEN kind='S' THEN json_extract(data,'$.cpu_total') END) cpu_total,
-                MAX(CASE WHEN kind='S' THEN json_extract(data,'$.mem_total_mb')
-                    - json_extract(data,'$.mem_avail_mb') END) mem_used_mb,
+                MAX(CASE WHEN kind='S' THEN CASE
+                    WHEN json_extract(data,'$.source_format')='top'
+                    THEN json_extract(data,'$.cpu_single_core')
+                    ELSE json_extract(data,'$.cpu_total') * 8 END END) cpu_single_core,
+                MAX(CASE WHEN kind='S' THEN CASE
+                    WHEN json_extract(data,'$.source_format')='top'
+                    THEN json_extract(data,'$.mem_used_mb')
+                    ELSE json_extract(data,'$.mem_total_mb')
+                        - json_extract(data,'$.mem_avail_mb') END END) mem_used_mb,
                 """ + sums + """ FROM records
                 WHERE session=? AND segment=? AND kind IN ('S','P')
                 GROUP BY segment,cycle""", (session_id, segment))
@@ -290,11 +322,12 @@ class Store(GroupStore):
 
             def rows():
                 for row in cursor:
-                    point = {field: row[field] for field in ("ts", "cpu_total", "mem_used_mb", *io_fields)}
+                    point = {field: row[field] for field in
+                             ("ts", "cpu_total", "cpu_single_core", "mem_used_mb", *io_fields)}
                     yield {"id": row["id"], "segment": row["segment"], "cycle": row["cycle"],
                            "data": json.dumps(point)}
 
-            return self._sample(rows(), count, limit)
+            return self._sample(rows(), count, limit, extra_metrics=("cpu_single_core",))
 
     def report_series(self, session_id, kind, segment, pid=None, name=None, limit=600):
         """Mark real metric gaps before bounded report downsampling."""
@@ -330,14 +363,15 @@ class Store(GroupStore):
             return self._sample(marked_rows(cursor), count, limit)
 
     @staticmethod
-    def _sample(cursor, count, limit):
+    def _sample(cursor, count, limit, extra_metrics=()):
         import math
         if type(limit) is not int or limit < 1:
             raise ValueError("limit 必须是正整数")
         if count <= limit:
             return {"points": [dict(json.loads(row["data"]), segment=row["segment"], cycle=row["cycle"])
                                for row in cursor], "total": count, "sampled": False}
-        metrics = tuple(dict.fromkeys(field for fields in NUMERIC.values() for field in fields))
+        metrics = tuple(dict.fromkeys(
+            (*extra_metrics, *(field for fields in NUMERIC.values() for field in fields))))
         width = max(1, math.ceil(count / max(1, limit // (2 * len(metrics) + 2))))
         result, selected, extrema = [], {}, {}
         for index, row in enumerate(cursor):

@@ -8,17 +8,20 @@ from perf_report_data import build_report_data
 from perf_report_ui import CSS, JS, REPORT_CSP, render_document
 
 # Bump when Python report/statistics semantics change; assets/CSP invalidate automatically.
-REPORT_CACHE_VERSION = "1:" + hashlib.sha256(
+REPORT_CACHE_VERSION = "8:" + hashlib.sha256(
     (CSS + "\0" + JS + "\0" + REPORT_CSP).encode("utf-8")).hexdigest()
 # Bounded process-wide locks also coalesce requests through separate Store instances.
 _REPORT_LOCKS = tuple(threading.Lock() for _ in range(64))
 
 
-def timestamp(value):
+def timestamp(value, *, local=False):
     if value is None:
         return "—"
     try:
-        return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(timespec="milliseconds")
+        date = datetime.fromtimestamp(value / 1000, timezone.utc)
+        if local:
+            date = date.astimezone()
+        return date.isoformat(timespec="milliseconds")
     except (ValueError, OverflowError, OSError):
         return str(value) + " ms"
 
