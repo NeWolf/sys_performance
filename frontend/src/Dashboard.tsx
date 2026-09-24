@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { apiResponse, errorMessage, formatNumber, formatTime, sessionPath, useResource } from './api'
+import { formatNumber, formatTime, sessionPath, useResource, useAnalysisStream } from './api'
+import { AnalysisProgress } from './Progress'
 import type { Overview } from './api'
 import { Groups } from './Groups'
 import { ReportConfig } from './ReportConfig'
@@ -22,7 +23,7 @@ function Analysis({ data, disabled, view }: { data: Overview; disabled: boolean;
   const [segment, setSegment] = useState(data.segments[0]?.segment ?? 0)
   return <>
     <ViewPanel active={view === 'analysis'}>
-      <InteractiveReport id={data.id} name={data.name} disabled={disabled} />
+      <InteractiveReport key={data.id} id={data.id} name={data.name} disabled={disabled} />
       <details className="panel diagnostics">
         <summary>日志质量与来源</summary>
         <p className="muted">{formatNumber(data.summary.cycles, 0)} 个周期 · {data.summary.segments} 个时间段 · {formatTime(data.summary.first_ts)} → {formatTime(data.summary.last_ts)}</p>
@@ -49,25 +50,14 @@ function Analysis({ data, disabled, view }: { data: Overview; disabled: boolean;
   </>
 }
 
+function validateReport(html: string) {
+  if (typeof html !== 'string' || !html.trim()) throw new Error('本地服务返回了空报告或无效报告，请重试。')
+}
+
 function InteractiveReport({ id, name, disabled }: { id: string; name: string; disabled: boolean }) {
   const [revision, setRevision] = useState(0)
   const [expanded, setExpanded] = useState(false)
-  const [result, setResult] = useState<{ html: string; error: string; loading: boolean }>({ html: '', error: '', loading: true })
-  useEffect(() => {
-    const controller = new AbortController()
-    async function load() {
-      try {
-        const response = await apiResponse(`${sessionPath(id)}/report`, { signal: controller.signal })
-        const html = await response.text()
-        if (!html.trim()) throw new Error('本地服务返回了空报告，请重试。')
-        if (!controller.signal.aborted) setResult({ html, error: '', loading: false })
-      } catch (failure) {
-        if (!controller.signal.aborted) setResult({ html: '', error: errorMessage(failure), loading: false })
-      }
-    }
-    void load()
-    return () => controller.abort()
-  }, [id, revision])
+  const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream`, revision, validateReport)
   useEffect(() => {
     if (!expanded) return
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setExpanded(false) }
@@ -76,7 +66,6 @@ function InteractiveReport({ id, name, disabled }: { id: string; name: string; d
   }, [expanded])
   function reload() {
     if (!window.confirm('重新加载将清空报告内的搜索、曲线选择与合并结果，是否继续？')) return
-    setResult({ html: '', error: '', loading: true })
     setRevision((value) => value + 1)
   }
   return <section className={`analysis-report${expanded ? ' analysis-report-expanded' : ''}`} aria-label="交互性能分析">
@@ -84,14 +73,16 @@ function InteractiveReport({ id, name, disabled }: { id: string; name: string; d
       <div><strong>交互性能分析</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
       <div className="actions">
         <button disabled={disabled || result.loading} onClick={reload}>重新加载</button>
+        {result.loading && <button onClick={result.cancel}>取消分析</button>}
         <button aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? '退出大屏' : '大屏查看'}</button>
       </div>
     </div>
-    {result.loading && <div className="panel loading-state" role="status">正在读取分析结果；首次分析或版本更新时需生成缓存，大日志可能需要较长时间…</div>}
-    {result.error && <div className="banner error" role="alert">{result.error}<button disabled={disabled} onClick={() => { setResult({ html: '', error: '', loading: true }); setRevision((value) => value + 1) }}>重试</button></div>}
+    {result.loading && <AnalysisProgress progress={result.progress} elapsed={result.elapsed} report />}
+    {result.cancelled && <div className="banner info" role="status">分析已取消 · 已用时 {result.elapsed} 秒<button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>}
+    {result.error && <div className="banner error" role="alert">{result.error} · 已用时 {result.elapsed} 秒<button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>}
     {/* 保留报告自身 CSP；不授予同源、弹窗、下载或顶层导航权限。 */}
-    {result.html && <iframe className="analysis-report-frame" title={`${name} · 性能分析`} sandbox="allow-scripts" referrerPolicy="no-referrer" srcDoc={result.html} />}
-    <p className="analysis-report-note">图表缩放不改变全量统计；未采集保持缺失。大屏模式可用顶部按钮退出。</p>
+    {result.data && <iframe key={result.key} className="analysis-report-frame" title={`${name} · 性能分析`} sandbox="allow-scripts" referrerPolicy="no-referrer" srcDoc={result.data} />}
+    <p className="analysis-report-note">{result.data && `分析报告已就绪 · 已用时 ${result.elapsed} 秒。`}图表缩放不改变全量统计；未采集保持缺失。大屏模式可用顶部按钮或 Esc 退出。</p>
   </section>
 }
 

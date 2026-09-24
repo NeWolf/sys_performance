@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 export type Kind = 'S' | 'P' | 'D' | 'DE' | 'DP'
 export type MetricValue = number | null
@@ -71,6 +71,7 @@ export interface SeriesData {
   points: Point[]
   total: number
   sampled: boolean
+  cpu_reference_note?: string
 }
 
 export interface NumericStatistic {
@@ -161,9 +162,11 @@ async function check(response: Response): Promise<Response> {
   throw new Error(message)
 }
 
-export async function apiResponse(path: string, init: RequestInit = {}): Promise<Response> {
+export async function apiResponse(path: string, init: RequestInit = {}, timeoutMs: number | null = 300_000): Promise<Response> {
+  // 流式计算由调用方取消，不套用普通请求的五分钟总时限。
   // 每次读取当前本地服务令牌，服务重启后无需刷新页面；令牌不持久化。
-  const signal = init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000)
+  const timeout = timeoutMs == null ? null : AbortSignal.timeout(timeoutMs)
+  const signal = timeout ? (init.signal ? AbortSignal.any([init.signal, timeout]) : timeout) : init.signal
   try {
     const tokenResponse = await check(await fetch('/api/token', { signal, cache: 'no-store', credentials: 'same-origin' }))
     const { token } = await tokenResponse.json() as { token: string }
@@ -259,4 +262,104 @@ export function useResource<T>(path: string | null, revision = 0) {
     error: path ? current?.error : undefined,
     loading: Boolean(path && !current),
   }
+}
+export type Progress = { side?: 'baseline' | 'target' | null; stage: string; completed: number | null; total: number | null }
+type StreamState<T> = { key: string; data?: T; error?: string; progress?: Progress; elapsed: number; cancelled?: boolean }
+
+export function useAnalysisStream<T>(path: string | null, run: number, validate?: (data: T) => void) {
+  const key = JSON.stringify([path, run])
+  const controllerRef = useRef<AbortController | null>(null)
+  const [state, setState] = useState<StreamState<T>>({ key: '', elapsed: 0 })
+  const current: StreamState<T> = state.key === key ? state : { key, elapsed: 0 }
+  const loading = !!path && current.data === undefined && !current.error && !current.cancelled
+  useEffect(() => {
+    if (!path) return
+    const controller = new AbortController()
+    controllerRef.current = controller
+    let active = true
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
+    const started = performance.now()
+    const elapsed = () => Math.floor((performance.now() - started) / 1000)
+    const touch = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => controller.abort(new Error('连接长时间未响应，请重试。')), 60_000)
+    }
+    const update = (patch: Partial<StreamState<T>>) => {
+      if (active && !controller.signal.aborted) setState((previous) => {
+        const base = previous.key === key ? previous : { key, elapsed: 0 }
+        return { ...base, ...patch, elapsed: Math.max(base.elapsed, patch.elapsed ?? elapsed()) }
+      })
+    }
+    const clock = setInterval(() => update({ elapsed: elapsed() }), 1000)
+    async function read() {
+      touch()
+      try {
+        const response = await apiResponse(path!, { signal: controller.signal }, null)
+        if (!response.body) throw new Error('浏览器无法读取处理进度，请重试。')
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        const consume = (line: string) => {
+          if (!line.trim()) return false
+          const event = JSON.parse(line) as { type: string; data: T; message: string; elapsed: number } & Progress
+          if (event.type === 'progress') update({ progress: event })
+          if (event.type === 'heartbeat' && Number.isFinite(event.elapsed)) update({ elapsed: event.elapsed })
+          if (event.type === 'error') throw new Error(event.message || '分析失败，请重试。')
+          if (event.type === 'result') {
+            if (event.data == null) throw new Error('本地服务未返回分析结果，请重试。')
+            validate?.(event.data)
+            update({ data: event.data })
+            return true
+          }
+          return false
+        }
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (controller.signal.aborted) throw controller.signal.reason
+            touch()
+            buffer += decoder.decode(value, { stream: !done })
+            let newline: number
+            while ((newline = buffer.indexOf('\n')) !== -1) {
+              const line = buffer.slice(0, newline)
+              buffer = buffer.slice(newline + 1)
+              if (consume(line)) return
+            }
+            if (done) {
+              if (consume(buffer)) return
+              throw new Error('进度连接已中断，未收到完整结果，请重试。')
+            }
+          }
+        } finally {
+          clearTimeout(idleTimer)
+          clearInterval(clock)
+          await reader.cancel().catch(() => {})
+          reader.releaseLock()
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) update({ error: errorMessage(error) })
+        else if (active && controller.signal.reason instanceof Error && controller.signal.reason.name !== 'AbortError') {
+          setState((previous) => ({ ...(previous.key === key ? previous : { key, elapsed: 0 }), error: errorMessage(controller.signal.reason) }))
+        }
+      } finally {
+        clearTimeout(idleTimer)
+        clearInterval(clock)
+        if (controllerRef.current === controller) controllerRef.current = null
+      }
+    }
+    void read()
+    return () => {
+      active = false
+      clearTimeout(idleTimer)
+      clearInterval(clock)
+      controller.abort()
+      if (controllerRef.current === controller) controllerRef.current = null
+    }
+  }, [path, key, validate])
+  function cancel() {
+    if (!loading) return
+    controllerRef.current?.abort()
+    setState((previous) => ({ ...(previous.key === key ? previous : { key, elapsed: 0 }), cancelled: true }))
+  }
+  return { ...current, loading, cancel }
 }

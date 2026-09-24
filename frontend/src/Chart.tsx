@@ -144,6 +144,95 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
   )
 }
 
+export interface ComparisonBarItem {
+  name: string
+  baseline: number | null
+  target: number | null
+  delta: number | null
+  percent: number | null
+  comparable: boolean
+}
+
+export function ComparisonBars({ title, unit, items, ranking = false, note, baselineLabel, targetLabel }: {
+  title: string
+  unit: string
+  items: ComparisonBarItem[]
+  ranking?: boolean
+  note?: string
+  baselineLabel: string
+  targetLabel: string
+}) {
+  const host = useRef<HTMLDivElement>(null)
+  const valid = (value: number | null) => value != null && Number.isFinite(value)
+  const rows = ranking ? items.filter((item) => item.comparable && valid(item.delta)) : items
+  const hasData = rows.some((item) => ranking ? valid(item.delta) : valid(item.baseline) || valid(item.target))
+  const deltaUnit = unit === '%' ? '百分点' : unit
+  const displayUnit = ranking ? deltaUnit : unit
+  useEffect(() => {
+    if (!host.current || !hasData) return
+    const element = host.current
+    let chart: ReturnType<typeof init> | undefined
+    const text = (value: number | null, suffix: string, signed = false) => value == null || !Number.isFinite(value)
+      ? '—（缺失）' : `${signed && value > 0 ? '+' : ''}${formatNumber(value, 2)} ${suffix}`
+    const option: EChartsOption = {
+      animation: false,
+      color: ['#4f6cf6', '#11a897'],
+      textStyle: { fontFamily: 'system-ui, sans-serif', color: '#62718a' },
+      aria: { enabled: true, description: `${title}，单位 ${displayUnit}。缺失不补零，详细数值见下方表格。` },
+      tooltip: {
+        trigger: 'axis', renderMode: 'richText', confine: true,
+        axisPointer: { type: 'shadow' },
+        formatter: (params) => {
+          const first = (Array.isArray(params) ? params : [params])[0]
+          const item = first && rows[first.dataIndex]
+          if (!item) return ''
+          return [item.name, `${baselineLabel}：${text(item.baseline, unit)}`, `${targetLabel}：${text(item.target, unit)}`,
+            item.comparable ? `差值：${text(item.delta, deltaUnit, true)}` : '口径不同，不计算差值',
+            `相对变化：${item.percent == null ? `—（${baselineLabel}为零、缺失或不可比）` : text(item.percent, '%', true)}`].join('\n')
+        },
+      },
+      legend: { show: !ranking, top: 0, data: ['baseline', 'target'], formatter: (name: string) => name === 'baseline' ? baselineLabel : targetLabel },
+      grid: { top: 40, left: 180, right: 30, bottom: 48 },
+      xAxis: {
+        type: 'value', name: displayUnit, nameLocation: 'middle', nameGap: 30,
+        axisLabel: { hideOverlap: true, formatter: (value: number) => formatNumber(value) },
+        splitLine: { lineStyle: { color: '#edf1f6', type: 'dashed' } },
+      },
+      yAxis: {
+        type: 'category', inverse: true, data: rows.map((item) => item.name),
+        axisLabel: { interval: 0, width: 160, overflow: 'truncate' },
+        axisTick: { show: false }, axisLine: { lineStyle: { color: '#d9e1ec' } },
+      },
+      series: ranking ? [{
+        name: `差值（${targetLabel} − ${baselineLabel}）`, type: 'bar', barMaxWidth: 22,
+        data: rows.map((item) => ({ value: item.delta, itemStyle: { color: item.delta! > 0 ? '#b42318' : item.delta! < 0 ? '#087443' : '#62718a' } })),
+        markLine: { silent: true, symbol: 'none', label: { show: false }, lineStyle: { color: '#62718a', type: 'solid' }, data: [{ xAxis: 0 }] },
+      }] : (['baseline', 'target'] as const).map((side) => ({
+        id: side, name: side, type: 'bar', barMaxWidth: 18,
+        data: rows.map((item) => valid(item[side]) ? item[side] : null),
+      })),
+    }
+    const resize = () => {
+      if (!element.clientWidth || !element.clientHeight) return
+      if (!chart) { chart = init(element); chart.setOption(option) }
+      const left = element.clientWidth < 480 ? 120 : 180
+      chart.setOption({ grid: { left }, yAxis: { axisLabel: { width: left - 20 } } })
+      chart.resize()
+    }
+    const observer = new ResizeObserver(resize)
+    observer.observe(element)
+    resize()
+    return () => { observer.disconnect(); chart?.dispose() }
+  }, [rows, title, unit, ranking, hasData, displayUnit, deltaUnit, baselineLabel, targetLabel])
+
+  return <section className="compare-chart" aria-label={title}>
+    <div className="panel-heading"><h3>{title}</h3><span className="unit">{displayUnit}</span></div>
+    {hasData ? <div ref={host} role="img" aria-label={`${title}，详细数值见下方表格`} style={{ height: Math.max(230, rows.length * (ranking ? 32 : 52) + 100) }} />
+      : <div className="compare-chart-empty">{ranking ? '当前筛选没有可比较的进程，不生成差值排行。' : '暂无有效数据，不以零值填充。'}</div>}
+    <p className="chart-caption">{note} {ranking ? '红色增加、绿色减少，不代表好坏。' : `蓝色为${baselineLabel}，青色为${targetLabel}；缺失不绘柱，零值柱长为零。`} 悬停查看完整名称和数值。</p>
+  </section>
+}
+
 export function Trend({ path, statisticsPath, active = true, ...props }: Omit<ChartProps, 'data' | 'loading' | 'error'> & {
   path: string | null
   statisticsPath?: string | null

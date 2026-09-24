@@ -1,5 +1,10 @@
 """Loopback-only HTTP API and production frontend hosting."""
 from contextlib import asynccontextmanager
+from collections import deque
+from concurrent.futures import CancelledError
+import asyncio
+import json
+import time
 import secrets
 import sqlite3
 import threading
@@ -7,7 +12,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
@@ -190,6 +195,8 @@ def create_app(database, port=8765, development=False, frontend=None):
     store = Store(database)
     token = secrets.token_urlsafe(32)
     import_lock = threading.Lock()
+    compare_slots = threading.BoundedSemaphore(2)
+    report_slots = threading.BoundedSemaphore(2)
     adb = AdbController(Path(database).resolve().parent / "adb_logs")
     top = TopCapture(adb, Path(database).resolve().parent / "top_logs", store, import_lock)
 
@@ -287,6 +294,97 @@ def create_app(database, port=8765, development=False, frontend=None):
     @app.get("/api/token")
     def session_token():
         return {"token": token}
+
+    @app.get("/api/compare")
+    def compare(baseline: str, target: str,
+                baseline_segment: Optional[int] = Query(None, ge=0, le=2**63 - 1),
+                target_segment: Optional[int] = Query(None, ge=0, le=2**63 - 1)):
+        from perf_compare import compare_sessions
+        try:
+            return compare_sessions(store, baseline, target, baseline_segment, target_segment)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    def analysis_stream(compute_result, slots, label):
+        async def events():
+            if not slots.acquire(blocking=False):
+                yield json.dumps(dict(type="error", message=f"已有{label}正在计算，请稍后重试"), ensure_ascii=False) + "\n"
+                return
+            stopped = threading.Event()
+            lock = threading.Lock()
+            messages = deque(maxlen=32)
+            started = time.monotonic()
+
+            def emit(message):
+                payload = json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n"
+                with lock:
+                    messages.append(payload)
+
+            def compute():
+                try:
+                    result = compute_result(
+                        progress=lambda value: emit(dict(type="progress", **value)),
+                        cancelled=stopped.is_set)
+                    if not stopped.is_set():
+                        emit(dict(type="result", data=result))
+                except CancelledError:
+                    pass
+                except KeyError:
+                    emit(dict(type="error", message="会话不存在或已删除"))
+                except ValueError as exc:
+                    emit(dict(type="error", message=str(exc)))
+                except sqlite3.OperationalError:
+                    if not stopped.is_set():
+                        emit(dict(type="error", message="本地数据库忙碌或存储空间不足，请稍后重试"))
+                except Exception:
+                    emit(dict(type="error", message=f"{label}计算失败，请稍后重试"))
+                finally:
+                    slots.release()
+
+            worker = threading.Thread(target=compute, name="session-analysis", daemon=True)
+            try:
+                worker.start()
+            except BaseException:
+                slots.release()
+                raise
+            try:
+                while True:
+                    with lock:
+                        batch = list(messages)
+                        messages.clear()
+                    for payload in batch:
+                        yield payload
+                    if not worker.is_alive():
+                        # A final message may have arrived since draining the queue.
+                        with lock:
+                            tail = list(messages)
+                            messages.clear()
+                        for payload in tail:
+                            yield payload
+                        break
+                    yield json.dumps(dict(type="heartbeat", elapsed=int(time.monotonic() - started))) + "\n"
+                    await asyncio.sleep(0.25)
+            finally:
+                # Abort both Python aggregation and long SQLite sorts on disconnect.
+                stopped.set()
+                await asyncio.to_thread(worker.join)
+
+        return StreamingResponse(events(), media_type="application/x-ndjson",
+                                 headers={"X-Accel-Buffering": "no"})
+
+    @app.get("/api/compare/stream")
+    async def compare_stream(baseline: str, target: str,
+                             baseline_segment: Optional[int] = Query(None, ge=0, le=2**63 - 1),
+                             target_segment: Optional[int] = Query(None, ge=0, le=2**63 - 1)):
+        from perf_compare import compare_sessions
+        return analysis_stream(
+            lambda **callbacks: compare_sessions(store, baseline, target, baseline_segment, target_segment, **callbacks),
+            compare_slots, "对比")
+
+    @app.get("/api/sessions/{session_id}/report/stream")
+    async def report_stream(session_id: str):
+        return analysis_stream(lambda **callbacks: render_report(store, session_id, **callbacks),
+                               report_slots, "性能分析")
 
     @app.get("/api/sessions")
     def sessions():

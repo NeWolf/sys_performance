@@ -310,6 +310,29 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
                        "WHERE session=? AND kind='S'", (old_sid,))
         self.assertIsNone(self.store.process_references(old_sid, 0)["points"][0]["mem_used_mb"])
 
+    def test_explicit_platform_overrides_memory_in_report(self):
+        from perf_report import render_report
+
+        for capacity, memory, platform in ((700, 14725, "8295"), (800, 20617, "8255")):
+            with self.subTest(capacity=capacity):
+                text = header() + f"{capacity}%cpu {capacity / 2}%idle\n"
+                text += MEM.replace("14725", str(memory)) + TABLE + ROW
+                text += header(2, "2026-07-01 12:00:01") + MEM.replace("14725", str(memory))
+                sid = self.load(text)
+                reference = self.store.process_references(sid, 0)
+                self.assertEqual([p["cpu_single_core"] for p in reference["points"]], [capacity / 2, None])
+                payload = self.assert_report(render_report(self.store, sid))
+                system = payload["systems"][0]
+                points = system["series"]["points"]
+                self.assertEqual(points[0]["cpu_platform"], platform)
+                self.assertEqual(points[0]["cpu_detection"], "explicit")
+                self.assertEqual([p["cpu_single_core"] for p in points], [capacity / 2, None])
+                self.assertEqual(system["metrics"]["cpu_total"]["avg"], capacity / 2)
+                self.assertEqual([p["cpu_total"] for p in points], [capacity / 2, None])
+                self.assertEqual(system["metrics"]["cpu_total"]["count"], 1)
+                self.assertEqual(system["cpu_reference_note"], reference["cpu_reference_note"])
+                self.assert_lines(self.report_lines(points, "cpu_single_core"), 1, 0)
+
     def test_single_core_peak_survives_reference_sampling(self):
         text = ""
         for i in range(200):
@@ -343,7 +366,7 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
         payload = self.assert_report(render_report(self.store, sid))
         self.assertEqual(payload["session"]["summary"]["source_format"], "top")
         system, process = payload["systems"][0], payload["processes"][0]
-        self.assert_metric(system["metrics"]["cpu_total"], 4, [35] * 5)
+        self.assert_metric(system["metrics"]["cpu_total"], 4, [280] * 5)
         self.assert_metric(process["metrics"]["cpu1c"], 5, [160] * 5)
         self.assert_metric(process["metrics"]["cpu"], 4, [20] * 5)
         self.assert_metric(process["metrics"]["rss_kb"], 5, [1536] * 5)

@@ -7,9 +7,11 @@ import itertools
 import json
 import math
 import posixpath
+import time
+from concurrent.futures import CancelledError
 from collections import Counter, defaultdict
 
-from perf_metrics import METHOD, metadata, to_kdmips
+from perf_metrics import METHOD, metadata, to_kdmips, system_cpu_reference, cpu_reference_note
 
 
 KDMIPS_PER_CORE = 28.75
@@ -81,6 +83,8 @@ REQUIRED_PROCESSES = tuple(
 PROCESS_FIELDS = ("cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb")
 SYSTEM_FIELDS = ("cpu_total", "cpu_user", "cpu_sys", "cpu_iow", "cpu_irq", "cpu_idle",
                  "mem_total_mb", "mem_avail_mb", "mem_free_mb", "mem_used_mb", "mem_percent")
+SYSTEM_CPU_SINGLE_FIELDS = {field: "cpu_single_core" if field == "cpu_total" else field + "_single_core"
+                            for field in SYSTEM_FIELDS if field.startswith("cpu")}
 INCREMENTS = frozenset(PROCESS_FIELDS[3:])
 FULL_CYCLE_SCHEMA = (
     "cycle", "ts", *PROCESS_FIELDS, "pids", "duplicate_pids", "p_records",
@@ -112,10 +116,15 @@ def _percent(count, total):
 
 
 def _metric_metadata(field):
+    if field in SYSTEM_CPU_SINGLE_FIELDS.values():
+        original = next(key for key, value in SYSTEM_CPU_SINGLE_FIELDS.items() if value == field)
+        return dict(_metric_metadata(original), note="单核口径，逐样本按满载值换算；无法换算留空")
     if field == "cpu_idle":
         return {"label": "空闲", "unit": "%", "note": "每条 S 样本按 100 - cpu_total 计算"}
+    if field == "mem_remaining_mb":
+        return {"label": "剩余内存（总量−已用）", "unit": "MB", "note": "逐样本按总内存−已用内存计算；sysmonitor 对应可用内存，Top 对应其 used 的剩余量，不等同于统一的 MemFree 口径"}
     if field == "mem_used_mb":
-        return {"label": "mem_used_mb", "unit": "MB", "note": "sysmonitor：MemTotal - MemAvailable，含不可回收部分，不把可回收 cache 算作已用；Top：直接使用 Mem 行的 used，不等同于 sysmonitor 口径"}
+        return {"label": "已用内存", "unit": "MB", "note": "sysmonitor：MemTotal - MemAvailable，含不可回收部分，不把可回收 cache 算作已用；Top：直接使用 Mem 行的 used，不等同于 sysmonitor 口径"}
     if field == "mem_percent":
         return {"label": "系统内存使用率", "unit": "%", "note": "已用内存 / 总内存 × 100，仅 total > 0；sysmonitor 已用为 MemTotal - MemAvailable，Top 已用为 Mem 行的 used"}
     return metadata(field)
@@ -174,7 +183,8 @@ def _sample(store, points, count, fields):
             yield dict(id=index, segment=point["segment"], cycle=point["cycle"],
                        data=json.dumps(point, ensure_ascii=False, allow_nan=False))
             previous = point
-    return store._sample(marked(), count, 600)
+    extra = tuple(field for field in SYSTEM_CPU_SINGLE_FIELDS.values() if field in fields)
+    return store._sample(marked(), count, 600, extra_metrics=extra)
 
 
 def _process_cycle(rows):
@@ -260,7 +270,22 @@ def _prepare(db, session_id):
     db.execute("CREATE INDEX temp.report_point_scope ON report_points(scope,id)")
 
 
-def build_report_data(store, session_id):
+def _progress_reporter(progress=None, cancelled=None):
+    last_stage, last_sent = None, 0
+
+    def report(stage, completed=None, total=None):
+        nonlocal last_stage, last_sent
+        if cancelled is not None and cancelled():
+            raise CancelledError()
+        now = time.monotonic()
+        if progress is not None and (stage != last_stage or now - last_sent >= 0.2 or
+                                     (total is not None and completed == total)):
+            progress(dict(stage=stage, completed=completed, total=total))
+            last_stage, last_sent = stage, now
+    return report
+
+
+def build_report_data(store, session_id, progress=None, cancelled=None):
     """Return JSON-safe session/systems/processes/required/method, schema_version=1.
 
     Statistics use all valid samples, charts are bounded, and full_cycles are not.
@@ -268,7 +293,11 @@ def build_report_data(store, session_id):
     Record id ranges are scope-filtered locators in the source session, not an
     assertion that every intervening id belongs to that process.
     """
+    report = _progress_reporter(progress, cancelled)
+    report("prepare")
     with store.connect() as db:
+        if cancelled is not None:
+            db.set_progress_handler(lambda: int(cancelled()), 10000)
         db.execute("PRAGMA temp_store=FILE")
         db.execute("BEGIN")  # Read-consistent session and source snapshot.
         raw = db.execute("SELECT id,name,created,summary FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -276,19 +305,33 @@ def build_report_data(store, session_id):
             raise KeyError(session_id)
         session = dict(raw, summary=json.loads(raw["summary"]))
         _prepare(db, session_id)
+        totals = dict(db.execute("SELECT kind,COUNT(*) FROM report_source GROUP BY kind"))
+        completed = {"process": 0, "system": 0}
+        totals = {"process": totals.get("P", 0) + totals.get("DP", 0), "system": totals.get("S", 0)}
+
+        def advance(stage, count):
+            completed[stage] += count
+            report(stage, completed[stage], totals[stage])
+
+        report("timeline")
         cycle_counts = dict(db.execute("SELECT segment,COUNT(DISTINCT cycle) FROM report_source GROUP BY segment ORDER BY segment"))
         processes, systems, scopes = [], [], {}
+        report("process", 0, totals["process"])
         cursor = db.execute("SELECT * FROM report_source WHERE kind IN ('P','DP') ORDER BY segment,name,cycle,id")
         for (segment, name), rows in itertools.groupby(cursor, key=lambda r: (r["segment"], r["name"])):
-            process = _build_process(db, store, len(processes), segment, name, rows, cycle_counts[segment])
+            process = _build_process(db, store, len(processes), segment, name, rows, cycle_counts[segment], advance)
             processes.append(process)
             scopes[process["id"]] = PROCESS_FIELDS
+        report("system", 0, totals["system"])
         for segment, cycles in cycle_counts.items():
-            system = _build_system(db, store, segment, cycles)
+            system = _build_system(db, store, segment, cycles, advance)
             systems.append(system)
-            scopes[system["id"]] = SYSTEM_FIELDS
+            scopes[system["id"]] = (*SYSTEM_FIELDS, *SYSTEM_CPU_SINGLE_FIELDS.values())
+        report("statistics")
         statistics = _statistics(db, scopes)
+        report("active_statistics")
         active = _statistics(db, {p["id"]: PROCESS_FIELDS for p in processes}, active=True)
+        report("assemble")
         for item in systems + processes:
             item["metrics"] = statistics[item["id"]]
         for process in processes:
@@ -304,7 +347,7 @@ def build_report_data(store, session_id):
         return _payload(session, systems, processes, required)
 
 
-def _build_process(db, store, index, segment, name, rows, cycles):
+def _build_process(db, store, index, segment, name, rows, cycles, advance=None):
     scope = "p" + str(index)
     full, path, all_pids = [], [], set()
     p_records = dp_records = duplicate_cycles = p_cycles = active_cycles = 0
@@ -313,6 +356,8 @@ def _build_process(db, store, index, segment, name, rows, cycles):
         row, values = _process_cycle(list(group))
         full.append(row)
         pids, duplicates, p_count, dp_count = row[9:13]
+        if advance is not None:
+            advance("process", p_count + dp_count)
         all_pids.update(pids)
         p_records += p_count
         dp_records += dp_count
@@ -349,10 +394,11 @@ def _build_process(db, store, index, segment, name, rows, cycles):
     )
 
 
-def _build_system(db, store, segment, cycles):
+def _build_system(db, store, segment, cycles, advance=None):
     scope = "s" + str(segment)
     counts = Counter()
     details, samples, cpu_valid = [], 0, 0
+    profiles = set()
     cursor = db.execute("SELECT * FROM report_source WHERE kind='S' AND segment IS ? ORDER BY cycle,id", (segment,))
     for row in cursor:
         data = json.loads(row["data"])
@@ -366,8 +412,17 @@ def _build_system(db, store, segment, cycles):
         cpu = values["cpu_total"]
         values["cpu_idle"] = 100 - cpu if cpu is not None else None
         values["mem_percent"] = _number(used / total * 100) if used is not None and total is not None and total > 0 else None
+        reference = system_cpu_reference(data)
+        capacity = reference["cpu_capacity"]
+        for field, target in SYSTEM_CPU_SINGLE_FIELDS.items():
+            value = values[field]
+            values[target] = (reference["cpu_single_core"] if field == "cpu_total" else
+                              _number(value * capacity / 100)
+                              if value is not None and capacity is not None else None)
         _insert_values(db, scope, values)
         samples += 1
+        if advance is not None:
+            advance("system", 1)
         if cpu is not None:
             cpu_valid += 1
             for threshold in (90, 95, 99):
@@ -375,7 +430,8 @@ def _build_system(db, store, segment, cycles):
             if cpu > 90 and len(details) < 200:
                 details.append(dict(record_id=row["id"], cycle=row["cycle"], ts=row["ts"],
                                     source=row["source"], line=row["line"], cpu_total=cpu))
-        point = dict(ts=row["ts"], record_id=row["id"], **values)
+        profiles.add((reference["cpu_platform"], reference["cpu_capacity"]))
+        point = dict(ts=row["ts"], record_id=row["id"], **(values | reference))
         db.execute("INSERT INTO report_points VALUES (?,?,?,?,?)",
                    (scope, samples, segment, row["cycle"], json.dumps(point, allow_nan=False)))
     def points():
@@ -385,7 +441,8 @@ def _build_system(db, store, segment, cycles):
         "SELECT cycle,CASE WHEN MIN(ts)=MAX(ts) THEN MIN(ts) END FROM report_source WHERE segment IS ? GROUP BY cycle ORDER BY cycle", (segment,))]
     return dict(id=scope, segment=segment, cycles=cycles, samples=samples,
                 cycle_axis=cycle_axis,
-                series=_sample(store, points(), samples, SYSTEM_FIELDS),
+                series=_sample(store, points(), samples, (*SYSTEM_FIELDS, *SYSTEM_CPU_SINGLE_FIELDS.values())),
+                cpu_reference_note=cpu_reference_note(profiles),
                 cpu_exceedances=dict(valid_samples=cpu_valid,
                     thresholds=[dict(threshold=t, count=counts[t], percent=_percent(counts[t], cpu_valid))
                                 for t in (90, 95, 99)],

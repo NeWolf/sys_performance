@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { api, apiResponse, errorMessage, formatMemory, formatTime, sessionPath, useResource } from './api'
 import type { Session } from './api'
 import { Dashboard } from './Dashboard'
+import { Compare } from './Compare'
 import { Devices } from './Devices'
 import { EditContext, useEditGuard, useWorkspaceGuard } from './Editing'
 import { ViewPanel } from './ViewPanel'
@@ -21,6 +22,7 @@ export default function App() {
 const workspaceViews = [
   { id: 'capture', label: '数据集', description: 'ADB 设备采集 · 本地日志导入' },
   { id: 'analysis', label: '性能分析', description: '系统资源、进程排行、趋势叠加与精确合并' },
+  { id: 'compare', label: '双次采集对比', description: 'CPU、内存与 IO 差异 · 进程变化排行' },
   { id: 'report', label: '配置与导出', description: '分析配置与离线交互 HTML 报告下载' },
   { id: 'advanced', label: '高级功能', description: '采样间隔与采集写入选项' },
 ] as const
@@ -32,6 +34,9 @@ function Workspace() {
   const guard = useEditGuard()
   const [revision, setRevision] = useState(0)
   const sessions = useResource<Session[]>('/api/sessions', revision)
+  const [compareSessions, setCompareSessions] = useState<Session[]>()
+  // 列表刷新不卸载对比页面；成功返回后仍同步删除、新增的会话。
+  if (sessions.data && sessions.data !== compareSessions) setCompareSessions(sessions.data)
   const [selected, setSelected] = useState<string | null>(null)
   const activeId = selected ?? sessions.data?.[0]?.id ?? null
   const active = sessions.data?.find((session) => session.id === activeId)
@@ -166,6 +171,7 @@ function Workspace() {
           {busy &&<div className="banner info" role="status">{busy} 请勿关闭页面。</div>}
           {error && <div className="banner error" role="alert">{error}</div>}
           {notice && <div className="banner success" role="status">{notice}</div>}
+          {view === 'compare' && (compareSessions ? <Compare sessions={compareSessions} /> : <div className="banner info" role="status">{sessions.error || '正在读取采集会话…'}</div>)}
           <ViewPanel active={view === 'analysis' || view === 'report'}>
             {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} /> : <section className="empty-state panel"><img className="empty-symbol" src="/tj.png" alt="sysmonitor 标志" /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据集</button></section>}
           </ViewPanel>

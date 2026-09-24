@@ -9,7 +9,7 @@
   const index = Object.fromEntries(data.full_cycle_schema.map((f, i) => [f, i]));
   const axisIndex = Object.fromEntries(data.cycle_axis_schema.map((f, i) => [f, i]));
   const io = ['rd_kb', 'wr_kb', 'rchar_kb', 'wchar_kb'];
-  const labels = {cpu1c:'CPU', cpu_total:'整机 CPU 总占用', cpu_idle:'空闲', cpu_user:'用户态占用', cpu_sys:'内核态占用', cpu_irq:'irq+softirq 占用', cpu_iow:'iowait 占用', rss_kb:'内存', rd_kb:'物理读', wr_kb:'物理写', rchar_kb:'逻辑读', wchar_kb:'逻辑写', mem_used_mb:'已使用内存', mem_free_mb:'空闲内存', mem_avail_mb:'空闲内存', mem_total_mb:'总内存', mem_percent:'内存使用率'};
+  const labels = {cpu1c:'CPU', cpu_total:'CPU 总占用', cpu_idle:'空闲', cpu_user:'用户态占用', cpu_sys:'内核态占用', cpu_irq:'irq+softirq 占用', cpu_iow:'iowait 占用', rss_kb:'内存', rd_kb:'物理读', wr_kb:'物理写', rchar_kb:'逻辑读', wchar_kb:'逻辑写', mem_used_mb:'已使用内存', mem_free_mb:'空闲内存', mem_avail_mb:'空闲内存', mem_total_mb:'总内存', mem_percent:'内存使用率'};
   const fullTimeLabel = value => {
     const date = new Date(value);
     if (!valid(value) || !Number.isFinite(date.getTime())) return '—';
@@ -108,7 +108,7 @@
     const memSeries = memFields.flatMap((f,i) => overviewSeries(points,f,system.metrics[f],palette[i%palette.length],'MB',true));
     return {
       cpu:{series:cpuSeries,legend:legend(cpuFields,'cpu_total'),
-        yAxis:{type:'value',name:'整机 %',min:0,max:100},
+        yAxis:{type:'value',name:'单核 %',min:0,splitLine:{lineStyle:{color:'#334155'}}},
         title:cpuSeries.length ? undefined : {text:'暂无有效CPU数据',left:'center',top:'center',textStyle:{color:'#94a3b8',fontSize:14}}},
       memory:{series:memSeries,legend:legend(memFields,'mem_used_mb'),
         yAxis:{type:'value',min:0,splitLine:{lineStyle:{color:'#334155'}}},
@@ -134,7 +134,7 @@
       tooltip:{trigger:'axis', renderMode:'richText', confine:true},
       legend:{type:'scroll', top:0, textStyle:{color:'#cbd5e1'}, pageTextStyle:{color:'#cbd5e1'}},
       grid:{left:65,right:45,top:65,bottom:65,containLabel:true},
-      xAxis:{type:'time', name:'时间 (本机)', axisLabel:{formatter:timeLabel,hideOverlap:true},
+      xAxis:{type:'time', axisLabel:{formatter:timeLabel,hideOverlap:true},
         axisPointer:{label:{formatter:params => fullTimeLabel(params.value)}}, splitLine:{show:false}},
       yAxis:{type:'value', splitLine:{lineStyle:{color:'rgba(148,163,184,.12)'}}},
       dataZoom:[{type:'inside',filterMode:'none'}, {type:'slider',bottom:8,height:18,borderColor:'#475569',textStyle:{color:'#94a3b8'},labelFormatter:timeLabel}],
@@ -171,8 +171,8 @@
   function referenceSeries(system, ioPoints, fs) {
     const series = [];
     for (const f of fs) {
-      if (f === 'cpu1c') series.push(...lineSeries(system.series.points, 'cpu_total',
-        '系统 CPU · 整机占用×8', '#ff6b6b', 1 / 8));
+      if (f === 'cpu1c') series.push(...lineSeries(system.series.points, 'cpu_single_core',
+        '系统 CPU · 单核口径', '#ff6b6b'));
       else if (f === 'rss_kb') series.push(...lineSeries(system.series.points, 'mem_used_mb',
         '系统 · 已使用内存', '#ff6b6b'));
       else if (io.includes(f)) series.push(...lineSeries(ioPoints, f,
@@ -254,15 +254,75 @@
     }
     return container;
   }
+  function setupFocusTable(wrap, toggle) {
+    const table = wrap.querySelector('table');
+    const groups = Array.from(table.tBodies);
+    const input = wrap.querySelector('.table-search');
+    const standards = wrap.querySelector('.show-standards');
+    const count = wrap.querySelector('.table-count');
+    const filter = () => {
+      const query = input.value.trim().toLocaleLowerCase();
+      groups.forEach(group => { group.hidden = !group.dataset.search.toLocaleLowerCase().includes(query); });
+      count.textContent = groups.filter(group => !group.hidden).length + ' / ' + groups.length + ' 个进程';
+      wrap.querySelector('.scroll').scrollTop = 0;
+    };
+    input.addEventListener('input',filter);
+    standards.addEventListener('change',() => {
+      groups.forEach(group => {
+        const identity = group.querySelector('.focus-identity');
+        const measured = group.querySelector('.measured');
+        const rows = group.querySelectorAll('.standard');
+        identity.rowSpan = standards.checked ? 3 : 1;
+        (standards.checked ? rows[0] : measured).prepend(identity);
+        rows.forEach(row => { row.hidden = !standards.checked; });
+      });
+    });
+    Array.from(table.tHead.rows[0].cells).forEach((th, column) => {
+      if (column === 1) return;
+      const button = el('button'); button.type = 'button';
+      button.append(...Array.from(th.childNodes)); th.append(button);
+      button.setAttribute('aria-label',column === 0 ? '按进程名称排序' : '按当前实测 ' + th.textContent + ' 排序');
+      let direction = 1;
+      button.addEventListener('click',() => {
+        table.tHead.querySelectorAll('th').forEach(h => h.removeAttribute('aria-sort'));
+        th.setAttribute('aria-sort',direction === 1 ? 'ascending' : 'descending');
+        const value = group => column === 0 ? group.querySelector('.focus-identity strong').textContent
+          : group.querySelectorAll('.measured td[data-sort]')[column - 2].dataset.sort;
+        groups.sort((a,b) => {
+          const x = value(a), y = value(b);
+          if (x === '' || y === '') return x === y ? 0 : x === '' ? 1 : -1;
+          return direction * (column > 1 ? Number(x) - Number(y) : x.localeCompare(y,'zh-CN',{numeric:true}));
+        });
+        table.append(...groups); direction *= -1;
+      });
+    });
+    groups.forEach(group => {
+      const row = group.querySelector('.measured');
+      if (!row.dataset.process) return;
+      row.addEventListener('click',() => toggle(row.dataset.process));
+      row.addEventListener('keydown',e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(row.dataset.process); }
+      });
+    });
+    filter();
+  }
   function setupTable(wrap, toggle) {
+    if (wrap.dataset.table === 'excel') return setupFocusTable(wrap,toggle);
     const table = wrap.querySelector('table'), rows = Array.from(table.tBodies[0].rows);
     const input = wrap.querySelector('.table-search'), count = wrap.querySelector('.table-count');
+    const systemToggle = wrap.dataset.table === 'all' ? wrap.querySelector('.show-system-processes') : null;
     const filter = () => {
       const query = (input?.value || '').toLocaleLowerCase().trim();
-      for (const row of rows) row.hidden = !(row.textContent + ' ' + (row.dataset.search || '')).toLocaleLowerCase().includes(query);
+      for (const row of rows) {
+        const hideSystem = systemToggle && !systemToggle.checked && row.dataset.systemProcess === 'true';
+        row.hidden = hideSystem || !(row.textContent + ' ' + (row.dataset.search || '')).toLocaleLowerCase().includes(query);
+      }
       if (count) count.textContent = rows.filter(row => !row.hidden).length + ' / ' + rows.length + ' 行';
+      const scroll = wrap.querySelector('.scroll');
+      if (scroll) scroll.scrollTop = 0;
     };
     if (input) input.addEventListener('input',filter);
+    if (systemToggle) systemToggle.addEventListener('change',filter);
     filter();
     if (input) Array.from(table.tHead.rows[0].cells).forEach((th, column) => {
       const button = el('button',th.textContent); button.type = 'button'; th.replaceChildren(button);
@@ -335,6 +395,7 @@
     plot(node('peak-top'),rank(ps,'cpu1c','max'),['cpu1c'],{unit:'%',fieldLabels:{cpu1c:'CPU'}});
     refreshOverlay();
     const search = root.querySelector('.merge-search');
+    const mergeSystemToggle = root.querySelector('.merge-show-system-processes');
     const candidates = root.querySelector('.candidate-list'), chosenList = root.querySelector('.selected-list');
     const status = root.querySelector('.merge-status'), resultNode = root.querySelector('.merge-result');
     const apply = root.querySelector('.merge-apply');
@@ -348,11 +409,16 @@
     for (const p of ps) {
       const label = el('label'), check = el('input'); check.type = 'checkbox';
       check.value = p.id;
-      label.append(check,el('span',p.name + ' · PID ' + p.pids.join(', ') + (p.dp_only ? ' · DP-only' : '')));
+      label.title = p.name + ' · PID ' + p.pids.join(', ') + (p.dp_only ? ' · DP-only' : '');
+      label.append(check,el('span',label.title));
       check.addEventListener('change',() => {
         check.checked ? selected.add(p.id) : selected.delete(p.id); refreshSelection();
       });
-      candidates.append(label); checks.set(p.id,{check,label});
+      const name = p.name.trim();
+      const isSystem = !name.startsWith('jkc') && (
+        ['android','com.android','.','vendor','/apex/com.android','/system/','/vendor/'].some(prefix => name.startsWith(prefix)) ||
+        (name.startsWith('[') && name.endsWith(']')) || !name.includes('.'));
+      candidates.append(label); checks.set(p.id,{check,label,isSystem});
     }
     function refreshSelection() {
       selectionVersion++;
@@ -362,16 +428,23 @@
         const p = byId.get(id), row = el('div'), remove = el('button','移除'); remove.type = 'button';
         remove.setAttribute('aria-label','移除合并成员 ' + p.name);
         remove.addEventListener('click',() => { selected.delete(id); refreshSelection(); });
+        row.title = p.name;
         row.append(el('span',p.name),remove); chosenList.append(row);
       }
       root.querySelector('.merge-count').textContent = selected.size;
       apply.disabled = selected.size === 0;
       clearResult(); status.textContent = selected.size ? '选择已变更，请重新计算。' : '请选择同段进程；无选择不生成零值统计。';
     }
-    search.addEventListener('input',() => {
+    function filterCandidates() {
       const query = search.value.trim().toLocaleLowerCase();
-      checks.forEach(({label}) => { label.hidden = !label.textContent.toLocaleLowerCase().includes(query); });
-    });
+      checks.forEach(({label,isSystem}) => {
+        label.hidden = (!mergeSystemToggle.checked && isSystem) || !label.title.toLocaleLowerCase().includes(query);
+      });
+      candidates.scrollTop = 0;
+    }
+    search.addEventListener('input',filterCandidates);
+    mergeSystemToggle.addEventListener('change',filterCandidates);
+    filterCandidates();
     root.querySelector('.merge-clear').addEventListener('click',() => { selected.clear(); refreshSelection(); });
     apply.addEventListener('click',() => {
       const members = [...selected].map(id => byId.get(id));

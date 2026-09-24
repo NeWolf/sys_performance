@@ -31,6 +31,52 @@ def to_kdmips(cpu1c, factor):
     return value if math.isfinite(value) else None
 
 
+def system_cpu_reference(data):
+    """Resolve each S sample independently; never alter normalized CPU values.
+
+    Explicit Top capacity wins. Memory is a heuristic for the two supported
+    devices, not a universal mapping of RAM size to CPU cores.
+    """
+    def number(value):
+        if type(value) not in (int, float):
+            return None
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:
+            return None
+
+    capacity = number(data.get("cpu_capacity"))
+    memory = number(data.get("mem_total_mb"))
+    source = "top" if data.get("source_format") == "top" else "sysmonitor"
+    if capacity is not None and capacity > 0:
+        detection = "explicit"
+    elif memory is not None and 0 < memory < 16 * 1024:
+        capacity, detection = 800, "memory"
+    elif memory is not None and 18 * 1024 <= memory <= 22 * 1024:
+        capacity, detection = 700, "memory"
+    else:
+        capacity, detection = None, "unknown"
+    platform = {800: "8255", 700: "8295"}.get(capacity)
+    if source == "top":
+        # A missing Top CPU row must remain missing, even if RAM is known.
+        single_core = number(data.get("cpu_single_core"))
+    else:
+        cpu = number(data.get("cpu_total"))
+        single_core = number(cpu * capacity / 100) if cpu is not None and capacity is not None else None
+    return dict(cpu_platform=platform, cpu_capacity=capacity,
+                cpu_detection=detection, cpu_single_core=single_core)
+
+
+def cpu_reference_note(profiles):
+    """Describe full-scope profiles, not only the downsampled visible points."""
+    capacities = sorted({capacity for _, capacity in profiles if capacity is not None})
+    labels = [f"{ {800: '8255', 700: '8295'}.get(capacity, '其他平台')} 满载 {capacity:g}%"
+              for capacity in capacities]
+    if any(capacity is None for _, capacity in profiles) or not profiles:
+        labels.append("部分样本平台未知，不推定满载值")
+    return "；".join(labels) + "。逐样本识别：优先 Top 明确满载值，否则按总内存推断（小于16GB为8255，18–22GB为8295）；Top直接取原始占用，sysmonitor按满载值换算；无法换算则留空。"
+
+
 CATEGORIES = {"S": ("boot",), "P": ("pol", "state", "cpu_core")}
 IDENTIFIERS = {"ts", "pid", "name", "exporter", "boot", "pol", "state", "cpu_core"}
 NUMERIC = {kind: tuple(field for field in schema.split() if field not in IDENTIFIERS)

@@ -105,7 +105,7 @@ function ProcessDetail({ id, process, disabled, onClose }: { id: string; process
   const resource = useResource<SeriesData>(seriesPath(id, 'P', process.segment, filters), revision)
   const references = useResource<SeriesData>(`${sessionPath(id)}/process-references?segment=${process.segment}`, revision)
   const referenceData = references.data
-  const cpuReferences = [{ field: 'cpu_total', label: '整机 CPU（总占用 ×8）', data: referenceData, scale: 8 }]
+  const cpuReferences = [{ field: 'cpu_single_core', label: '整机 CPU（单核口径）', data: referenceData }]
   const memoryReferences = [{ field: 'mem_used_mb', label: '系统已使用内存', data: referenceData, scale: 1024 }]
   const ioReferences = [
     { field: 'rd_kb', label: '已采集进程 IO 合计 · 物理读', data: referenceData },
@@ -118,7 +118,7 @@ function ProcessDetail({ id, process, disabled, onClose }: { id: string; process
     {references.loading && <p role="status">正在读取系统与 IO 合计参照，进程趋势不受影响…</p>}
     {references.error && <p role="alert" className="error">参照读取失败：{references.error} <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试参照</button></p>}
     <div className="chart-grid">
-      <SeriesChart title="进程与整机 CPU" unit="%" metrics={cpuMetrics} {...resource} references={cpuReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note="默认对比单核 CPU：整机总占用 ×8，满载 800%；进程使用 cpu1c，缺失不回退。点击图例可隐藏参照。" />
+      <SeriesChart title="进程与整机 CPU" unit="%" metrics={cpuMetrics} {...resource} references={cpuReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note={`默认对比单核 CPU。${referenceData?.cpu_reference_note ?? '整机满载值以参照数据识别结果为准。'}进程使用 cpu1c，缺失不回退。点击图例可隐藏参照。`} />
       <SeriesChart title="进程 RSS 与系统已使用内存" unit="KB" metrics={rssMetrics} {...resource} references={memoryReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note="系统已使用内存＝总内存−MemAvailable，统一换算容量后与 RSS 对比；缺失不补零。" />
       <SeriesChart title="I/O 周期增量" unit="KB / 周期" metrics={ioMetrics} {...resource} references={ioReferences} mode="scatter" note="原始读写增量，不再次差分；参照按同周期全部已采集 P 进程分别汇总物理读、物理写，不受排行搜索或分页影响。仅汇总有效值，可能不完整；无有效值时断开，零值可能源于权限限制。" />
       <Trend path={seriesPath(id, 'DP', process.segment, filters)} title="进程 dmabuf" unit="KB" metrics={dmaMetrics} mode="scatter" note="仅展示实际记录，不以零补齐缺失周期。" />

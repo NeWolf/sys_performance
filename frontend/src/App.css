@@ -206,6 +206,31 @@ details ul { padding-left: 20px; max-height: 270px; overflow: auto; color: #7e8c
 .member-table select { min-width: 92px; }
 .group-results { margin: 20px 0; }
 .group-results .panel-heading { flex-wrap: wrap; }
+.compare-progress { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.compare-progress > span { margin-left: auto; font-variant-numeric: tabular-nums; }
+.compare-progress progress { width: 100%; height: 14px; accent-color: #2563b0; }
+.compare-progress small { flex-basis: 100%; line-height: 1.7; }
+.compare-section { padding: 20px;margin-bottom: 18px; }
+.compare-section > h2 { margin-bottom: 12px; }
+.compare-section p, .compare-section li { line-height: 1.7; }
+.compare-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-bottom: 20px; }
+.compare-choice, .compare-choice label { display: grid; gap: 8px; min-width: 0; }
+.compare-choice select, .compare-choice input { width: 100%; min-width: 0; }
+.compare-coverage { min-width: 0; overflow-wrap: anywhere; }
+.compare-section td:not(:first-child) { white-space: nowrap; }
+.compare-section td small { display: block; color: #62718a; }
+.compare-section .compare-name { min-width: 240px; max-width: 400px; white-space: normal; overflow-wrap: anywhere; }
+.compare-up { color: #b42318; }
+.compare-down { color: #087443; }
+.compare-section details { margin-top: 14px; }
+.compare-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 16px; margin: 18px 0; }
+.compare-chart { min-width: 0; border: 1px solid #e4eaf2; border-radius: 10px; padding: 14px; margin-bottom: 18px; }
+.compare-charts .compare-chart { margin-bottom: 0; }
+.compare-chart .panel-heading { flex-wrap: wrap; gap: 8px; }
+.compare-chart-empty { display: grid; place-items: center; min-height: 160px; color: #62718a; }
+.compare-chart .chart-caption { margin-bottom: 0; }
+@media (max-width: 760px) { .compare-columns { grid-template-columns: minmax(0, 1fr); } .compare-section { padding: 14px; } }
+
 .config-panel > p { overflow-wrap: anywhere; }
 
 @media (max-width: 760px) { .form-grid { grid-template-columns: minmax(0, 1fr); } .config-panel { padding: 16px; } .config-toolbar { align-items: stretch; flex-direction: column; } .config-toolbar select { display: block; width: 100%; margin-top: 6px; } .config-actions button { flex: 1 1 auto; } }

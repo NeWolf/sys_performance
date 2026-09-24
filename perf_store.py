@@ -10,7 +10,7 @@ from pathlib import Path
 from perf_parser import iter_records, rotation_key
 from perf_top_parser import detect_source_format, iter_top_records
 from perf_groups import GroupStore
-from perf_metrics import CATEGORIES, INCREMENTS, LABELS, METHOD, NOTES, NUMERIC, metadata
+from perf_metrics import CATEGORIES, INCREMENTS, LABELS, METHOD, NOTES, NUMERIC, metadata, system_cpu_reference, cpu_reference_note
 
 
 class Store(GroupStore):
@@ -299,16 +299,21 @@ class Store(GroupStore):
             f"SUM(CASE WHEN kind='P' THEN CAST(json_extract(data,'$.{field}') AS REAL) END) AS {field}"
             for field in io_fields)
         with self.connect() as db:
+            profiles = set()
+
+            def reference(raw):
+                resolved = system_cpu_reference(json.loads(raw))
+                profiles.add((resolved["cpu_platform"], resolved["cpu_capacity"]))
+                return resolved["cpu_single_core"]
+
+            db.create_function("system_cpu_reference", 1, reference)
             # Include S-only cycles so absent IO remains NULL, not a fabricated zero.
             # Spill the full cycle aggregation to disk rather than loading all P rows.
             db.execute("PRAGMA temp_store=FILE")
             db.execute("""CREATE TEMP TABLE process_reference_cycles AS
                 SELECT MIN(id) id, segment, cycle, MIN(ts) ts,
                 MAX(CASE WHEN kind='S' THEN json_extract(data,'$.cpu_total') END) cpu_total,
-                MAX(CASE WHEN kind='S' THEN CASE
-                    WHEN json_extract(data,'$.source_format')='top'
-                    THEN json_extract(data,'$.cpu_single_core')
-                    ELSE json_extract(data,'$.cpu_total') * 8 END END) cpu_single_core,
+                MAX(CASE WHEN kind='S' THEN system_cpu_reference(data) END) cpu_single_core,
                 MAX(CASE WHEN kind='S' THEN CASE
                     WHEN json_extract(data,'$.source_format')='top'
                     THEN json_extract(data,'$.mem_used_mb')
@@ -327,7 +332,9 @@ class Store(GroupStore):
                     yield {"id": row["id"], "segment": row["segment"], "cycle": row["cycle"],
                            "data": json.dumps(point)}
 
-            return self._sample(rows(), count, limit, extra_metrics=("cpu_single_core",))
+            result = self._sample(rows(), count, limit, extra_metrics=("cpu_single_core",))
+            result["cpu_reference_note"] = cpu_reference_note(profiles)
+            return result
 
     def report_series(self, session_id, kind, segment, pid=None, name=None, limit=600):
         """Mark real metric gaps before bounded report downsampling."""
