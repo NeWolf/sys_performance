@@ -73,14 +73,22 @@ class TopCapture:
             return self.adb.run("-s", serial, "shell", "-T", "sh -c " + shlex.quote(command),
                                 timeout=remaining(10))
 
+        # Normalize checkout/editor line endings before hashing AND uploading.
+        # Android sh treats CR in CRLF as part of tokens (e.g. "077\r").
         # Content-addressed scripts never overwrite code being read by a worker.
-        digest = hashlib.sha256(self.script.read_bytes()).hexdigest()
+        script_bytes = self.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        digest = hashlib.sha256(script_bytes).hexdigest()
         remote = REMOTE_ROOT + "/control-" + digest + ".sh"
         check = (f'[ ! -L {REMOTE_ROOT} ] && mkdir -p {REMOTE_ROOT} && '
                  f'if [ -f {remote} ] && [ ! -L {remote} ]; then echo ready; fi')
         if shell(check) != "ready":
             staging = remote + "." + uuid.uuid4().hex
-            self.adb.run("-s", serial, "push", str(self.script), staging, timeout=remaining(30))
+            with tempfile.TemporaryDirectory(prefix="jdperf-top-script-") as temporary:
+                local = Path(temporary) / "control.sh"
+                # Binary write avoids Windows newline translation; close before
+                # adb opens the file so Windows file sharing rules are respected.
+                local.write_bytes(script_bytes)
+                self.adb.run("-s", serial, "push", str(local), staging, timeout=remaining(30))
             shell(f"chmod 600 {staging} && mv {staging} {remote}")
         command = "sh " + shlex.quote(remote) + " " + " ".join(
             shlex.quote(str(value)) for value in (action, *args))

@@ -1,4 +1,5 @@
 """Device-owned Top lifecycle, wire protocol and archive safety regressions."""
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -118,6 +119,75 @@ class TopCaptureTests(unittest.TestCase):
     def pulled(self):
         identity = self.finished()
         return self.top.pull("device-1", identity)
+
+    def test_script_upload_normalizes_line_endings_before_hashing(self):
+        normalized = self.top.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        remote = REMOTE_ROOT + "/control-" + hashlib.sha256(normalized).hexdigest() + ".sh"
+        source = self.root / "windows checkout" / "device_top_capture.sh"
+        source.parent.mkdir()
+        self.top.script = source
+        for newline in (b"\n", b"\r\n", b"\r"):
+            with self.subTest(newline=newline):
+                original = normalized.replace(b"\n", newline)
+                source.write_bytes(original)
+                adb = Mock()
+                self.top.adb = adb
+                adb.shell.side_effect = ["", "", "idle"]
+                uploaded = []
+
+                def push(*args, **kwargs):
+                    self.assertEqual(args[:3], ("-s", "device-1", "push"))
+                    local = Path(args[3])
+                    uploaded.append(local)
+                    self.assertNotEqual(local, source)
+                    self.assertEqual(local.read_bytes(), normalized)
+                    self.assertNotIn(b"\r", local.read_bytes())
+                    self.assertTrue(args[4].startswith(remote + "."))
+                    self.assertEqual(kwargs["timeout"], 30)
+
+                adb.run.side_effect = push
+                self.assertEqual(self.top._command("device-1", "status"), "idle")
+                adb.run.assert_called_once()
+                self.assertIn(remote, adb.shell.call_args_list[0].args[1])
+                self.assertEqual(adb.shell.call_args.args[1], "sh " + remote + " status")
+                self.assertFalse(uploaded[0].exists())
+                self.assertEqual(source.read_bytes(), original)
+
+    def test_script_cache_uses_normalized_hash_without_upload(self):
+        normalized = b"#!/system/bin/sh\numask 077\n"
+        source = self.root / "device_top_capture.sh"
+        source.write_bytes(normalized.replace(b"\n", b"\r\n"))
+        self.top.script = source
+        adb = Mock()
+        self.top.adb = adb
+        adb.shell.side_effect = ["ready", "idle"]
+        with patch("perf_top_capture.tempfile.TemporaryDirectory") as temporary:
+            self.assertEqual(self.top._command("device-1", "status"), "idle")
+        temporary.assert_not_called()
+        adb.run.assert_not_called()
+        remote = REMOTE_ROOT + "/control-" + hashlib.sha256(normalized).hexdigest() + ".sh"
+        self.assertIn(remote, adb.shell.call_args_list[0].args[1])
+        self.assertNotIn(hashlib.sha256(source.read_bytes()).hexdigest(),
+                         adb.shell.call_args_list[0].args[1])
+        self.assertEqual(adb.shell.call_args.args[1], "sh " + remote + " status")
+
+    def test_script_upload_failure_does_not_publish_or_execute(self):
+        adb = Mock()
+        self.top.adb = adb
+        adb.shell.return_value = ""
+        uploaded = []
+
+        def failed_push(*args, **kwargs):
+            local = Path(args[3])
+            self.assertTrue(local.is_file())
+            uploaded.append(local)
+            raise AdbError("upload failed", 502)
+
+        adb.run.side_effect = failed_push
+        with self.assertRaisesRegex(AdbError, "upload failed"):
+            self.top._command("device-1", "status")
+        adb.shell.assert_called_once()
+        self.assertFalse(uploaded[0].exists())
 
     def test_clear_keeps_local_archive_across_refresh_and_restart(self):
         state = self.pulled()
