@@ -74,9 +74,18 @@ class GroupStore:
                 if item[field] not in ("待填写", "Y", "N"):
                     raise ValueError(field + " 必须是待填写、Y 或 N")
             if db.execute("""SELECT 1 FROM records WHERE session=? AND segment=?
-                    AND pid=? AND name=? AND kind IN ('P','DP') LIMIT 1""",
-                          (session_id, segment, pid, name)).fetchone() is None:
+                    AND pid=? AND (name=? OR json_extract(data,'$.raw_name')=?)
+                    AND kind IN ('P','DP') LIMIT 1""",
+                          (session_id, segment, pid, name, name)).fetchone() is None:
                 raise ValueError("成员在指定 segment 内没有 P 或 DP 记录")
+            for previous in normalized:
+                if previous["pid"] == pid and db.execute(
+                        "SELECT 1 FROM records WHERE session=? AND segment=? AND pid=? "
+                        "AND kind IN ('P','DP') AND ((name=? AND json_extract(data,'$.raw_name')=?) "
+                        "OR (name=? AND json_extract(data,'$.raw_name')=?)) LIMIT 1",
+                        (session_id, segment, pid, name, previous["name"], previous["name"], name)
+                ).fetchone():
+                    raise ValueError("成员归一化名称与原始命令范围重叠")
             normalized.append(item)
         start, end = config.get("start"), config.get("end")
         for value in (start, end):
@@ -156,9 +165,10 @@ class GroupStore:
             db.executemany("INSERT INTO resource_members VALUES (?,?)",
                            ((m["pid"], m["name"]) for m in group["members"]))
             columns = ",".join("MAX(json_extract(data,'$.%s')) AS %s" % (f, f) for f in fields)
-            db.execute("CREATE TEMP TABLE resource_cycles AS SELECT r.pid,r.name,cycle," + columns +
-                       " FROM records r JOIN resource_members m ON r.pid=m.pid AND r.name=m.name WHERE " +
-                       where + " GROUP BY r.pid,r.name,cycle HAVING COUNT(*)=1", params)
+            db.execute("CREATE TEMP TABLE resource_cycles AS SELECT r.pid,m.name,cycle," + columns +
+                       " FROM records r JOIN resource_members m ON r.pid=m.pid "
+                       "AND (r.name=m.name OR json_extract(r.data,'$.raw_name')=m.name) WHERE " +
+                       where + " GROUP BY r.pid,m.name,cycle HAVING COUNT(*)=1", params)
             db.execute("CREATE INDEX temp.resource_identity ON resource_cycles(pid,name)")
             rows = []
             for member in group["members"]:
@@ -210,10 +220,10 @@ class GroupStore:
             db.executemany("INSERT INTO group_members VALUES (?,?)",
                            ((m["pid"], m["name"]) for m in group["members"]))
             columns = ",".join("MAX(json_extract(r.data,'$.%s')) AS %s" % (f, f) for f in fields)
-            db.execute("""CREATE TEMP TABLE member_cycles AS SELECT r.cycle,r.pid,r.name,
+            db.execute("""CREATE TEMP TABLE member_cycles AS SELECT r.cycle,r.pid,m.name,
                 COUNT(*) n,""" + columns + """ FROM group_scope r JOIN group_members m
-                ON r.pid=m.pid AND r.name=m.name WHERE r.kind=?
-                GROUP BY r.cycle,r.pid,r.name""", (kind,))
+                ON r.pid=m.pid AND (r.name=m.name OR json_extract(r.data,'$.raw_name')=m.name)
+                WHERE r.kind=? GROUP BY r.cycle,r.pid,m.name""", (kind,))
             db.execute("CREATE INDEX temp.member_cycle_index ON member_cycles(cycle)")
             member_count = len(group["members"])
             complete = f"COUNT(m.pid)={member_count} AND MAX(m.n)=1"

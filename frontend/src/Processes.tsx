@@ -55,7 +55,7 @@ export function Processes({ id, segment, onSegment, disabled, members = [], memb
   const pagingDisabled = disabled || resource.loading || searching || Boolean(resource.error)
   const active = selected?.segment === segment ? selected : null
   return <>
-    <div className="section-heading"><div><h2>进程资源排行</h2><p>同一时间段内按名称合并全部 PID，跨段不合并；统计原始样本，不按周期求和。CPU 统计及排序均采用 cpu1c 单核口径，缺失不回退；P95K / P99K = 对应 CPU 百分比 ÷ 100 × 28.75，单位 KDMIPS（派生估算）。点击进程查看趋势。</p></div>
+    <div className="section-heading"><div><h2>进程资源排行</h2><p>同一时间段内按名称合并全部 PID，跨段不合并；统计原始样本，不按周期求和。采集目录 sysmonitor_top_capture 下的 sh 脚本统一合并，不区分脚本版本、任务参数和 PID。CPU 统计及排序均采用 cpu1c 单核口径，缺失不回退；P95K / P99K = 对应 CPU 百分比 ÷ 100 × 28.75，单位 KDMIPS（派生估算）。点击进程查看趋势。</p></div>
       <label>降序排列 <select value={sort} disabled={disabled} onChange={(event) => { setSort(event.target.value as Sort); setPage(0) }}>{sortOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
     </div>
     <section className="panel process-panel" aria-label="进程资源排行">
@@ -111,8 +111,14 @@ function ProcessDetail({ id, process, disabled, onClose }: { id: string; process
     { field: 'rd_kb', label: '已采集进程 IO 合计 · 物理读', data: referenceData },
     { field: 'wr_kb', label: '已采集进程 IO 合计 · 物理写', data: referenceData },
   ]
+  const rawCommands = [...new Set((resource.data?.points ?? [])
+    .map((point) => point.raw_name).filter((name): name is string => typeof name === 'string'))]
   return <section className="process-detail" aria-label="选中进程明细">
     <div className="section-heading"><div><span className="eyebrow">进程深度分析</span><h2 className="wrap-text">{process.name}</h2><p>{pidLabel(process)} · 时间段 {process.segment} · 同名全部 PID 的原始样本统计，不按周期求和。</p><p>变化按相邻有效周期的 PID 集合计算，缺失周期不计变化。{process.concurrent_pids ? '存在并发同名 PID，集合变化不等于重启次数；趋势展示混合样本。' : ''}</p></div><button disabled={disabled} onClick={onClose}>收起明细</button></div>
+    {rawCommands.length > 0 && <details><summary>采集进程原始命令（当前趋势样本内 {rawCommands.length} 种）</summary>
+      <p className="muted">保留原始命令及 PID；此处仅列当前趋势样本中的前 20 种命令，不代表整个会话。旧进程组仍保留原始命令的成员范围。</p>
+      <ul>{rawCommands.slice(0, 20).map((command) => <li className="wrap-text" key={command}>{command}</li>)}</ul>
+    </details>}
     {resource.error && <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试进程趋势</button>}
     {referenceData && <p className="chart-caption">参照范围：时间段 {process.segment} · {referenceData.sampled ? '周期合计后降采样' : '全部周期'} · 展示 {n(referenceData.points.length, 0)} / {n(referenceData.total, 0)} 个周期；参照与进程样本按各自时间戳绘制，不跨段连接。</p>}
     {references.loading && <p role="status">正在读取系统与 IO 合计参照，进程趋势不受影响…</p>}

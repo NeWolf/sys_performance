@@ -266,7 +266,8 @@ export function useResource<T>(path: string | null, revision = 0) {
 export type Progress = { side?: 'baseline' | 'target' | null; stage: string; completed: number | null; total: number | null }
 type StreamState<T> = { key: string; data?: T; error?: string; progress?: Progress; elapsed: number; cancelled?: boolean }
 
-export function useAnalysisStream<T>(path: string | null, run: number, validate?: (data: T) => void) {
+export function useAnalysisStream<T>(path: string | null, run: number,
+  resolve?: (data: T, signal: AbortSignal) => T | Promise<T>, dispose?: (data: T) => void) {
   const key = JSON.stringify([path, run])
   const controllerRef = useRef<AbortController | null>(null)
   const [state, setState] = useState<StreamState<T>>({ key: '', elapsed: 0 })
@@ -277,6 +278,7 @@ export function useAnalysisStream<T>(path: string | null, run: number, validate?
     const controller = new AbortController()
     controllerRef.current = controller
     let active = true
+    let resolved: { data: T } | undefined
     let idleTimer: ReturnType<typeof setTimeout> | undefined
     const started = performance.now()
     const elapsed = () => Math.floor((performance.now() - started) / 1000)
@@ -299,7 +301,7 @@ export function useAnalysisStream<T>(path: string | null, run: number, validate?
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
-        const consume = (line: string) => {
+        const consume = async (line: string) => {
           if (!line.trim()) return false
           const event = JSON.parse(line) as { type: string; data: T; message: string; elapsed: number } & Progress
           if (event.type === 'progress') update({ progress: event })
@@ -307,8 +309,15 @@ export function useAnalysisStream<T>(path: string | null, run: number, validate?
           if (event.type === 'error') throw new Error(event.message || '分析失败，请重试。')
           if (event.type === 'result') {
             if (event.data == null) throw new Error('本地服务未返回分析结果，请重试。')
-            validate?.(event.data)
-            update({ data: event.data })
+            // The optional download has its own timeout; the progress stream is done.
+            clearTimeout(idleTimer)
+            const data = resolve ? await resolve(event.data, controller.signal) : event.data
+            if (!active || controller.signal.aborted) {
+              dispose?.(data)
+              return true
+            }
+            resolved = { data }
+            update({ data })
             return true
           }
           return false
@@ -323,10 +332,10 @@ export function useAnalysisStream<T>(path: string | null, run: number, validate?
             while ((newline = buffer.indexOf('\n')) !== -1) {
               const line = buffer.slice(0, newline)
               buffer = buffer.slice(newline + 1)
-              if (consume(line)) return
+              if (await consume(line)) return
             }
             if (done) {
-              if (consume(buffer)) return
+              if (await consume(buffer)) return
               throw new Error('进度连接已中断，未收到完整结果，请重试。')
             }
           }
@@ -353,9 +362,10 @@ export function useAnalysisStream<T>(path: string | null, run: number, validate?
       clearTimeout(idleTimer)
       clearInterval(clock)
       controller.abort()
+      if (resolved) dispose?.(resolved.data)
       if (controllerRef.current === controller) controllerRef.current = null
     }
-  }, [path, key, validate])
+  }, [path, key, resolve, dispose])
   function cancel() {
     if (!loading) return
     controllerRef.current?.abort()

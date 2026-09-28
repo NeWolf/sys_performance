@@ -13,7 +13,7 @@ import sys
 from macos_compat import MACOS_MIN_VERSION, verify_macos_binaries
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def run(*args):
@@ -36,8 +36,8 @@ def build_icon(output, system):
 
     size = 1024 if system == "Darwin" else 256
     suffix = {"Darwin": ".icns", "Windows": ".ico", "Linux": ".png"}[system]
-    icon = output / ("SysMonitor" + suffix)
-    with Image.open(ROOT / "tj.png") as source:
+    icon = output / ("JDPerf" + suffix)
+    with Image.open(ROOT / "JD_logo.png") as source:
         fitted = ImageOps.contain(source.convert("RGBA"), (size, size), Image.Resampling.LANCZOS)
         canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         canvas.paste(fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2))
@@ -66,75 +66,78 @@ def main():
         run(npm, "--prefix", "frontend", "ci")
         run(npm, "--prefix", "frontend", "run", "build")
         run(npm, "--prefix", "frontend", "run", "lint")
-    for resource in ("frontend/dist/index.html", "frontend/src/sysmonitor_test/sysmonitor",
+    for resource in ("frontend/dist/index.html", "frontend/dist/JD_logo.png", "frontend/src/sysmonitor_test/sysmonitor",
                      "report_assets/report.css", "report_assets/report.js",
                      "report_assets/vendor/echarts.min.js", "report_assets/vendor/ECHARTS-LICENSE",
-                     "report_assets/vendor/ECHARTS-NOTICE", "tj.png"):
+                     "report_assets/vendor/ECHARTS-NOTICE", "JD_logo.png", "device_top_capture.sh"):
         if not (ROOT / resource).is_file():
             parser.error("Missing resource: " + resource)
     arch = platform.machine().lower()
     label = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}[system]
-    stem = f"SysMonitor-{VERSION}-{label}-{arch}"
+    stem = f"JDPerf-{VERSION}-{label}-{arch}"
     output = args.output_dir.resolve() / (stem + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
     output.mkdir(parents=True, exist_ok=False)
     icon = build_icon(output, system)
     icon_args = ["--icon", icon] if system == "Windows" else []
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", *icon_args,
-        "--name", "SysMonitor", "--distpath", output / "portable",
+        "--name", "JDPerf", "--distpath", output / "portable",
         "--workpath", output / "work", "--specpath", output,
         "--add-data", str(ROOT / "frontend/dist") + ":frontend/dist",
         "--add-data", str(ROOT / "frontend/src/sysmonitor_test/sysmonitor") + ":frontend/src/sysmonitor_test",
         "--add-data", str(ROOT / "report_assets") + ":report_assets",
+        "--add-data", str(ROOT / "device_top_capture.sh") + ":.",
         ROOT / "main.py")
-    payload = output / "portable" / "SysMonitor"
+    payload = output / "portable" / "JDPerf"
     artifacts = []
     if system == "Darwin":
         verify_macos_binaries(payload)
         stage = output / "image"
-        app = stage / "SysMonitor.app"
+        app = stage / "JDPerf.app"
         contents = app / "Contents"
         resources = contents / "Resources"
         shutil.copytree(payload, resources / "server")
         shutil.copy2(icon, resources / icon.name)
-        write(contents / "MacOS" / "SysMonitor",
+        write(contents / "MacOS" / "JDPerf",
               (ROOT / "packaging/macos-launcher.sh").read_text(), True)
         write(resources / "Start.command", '''#!/bin/sh
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export PATH="$HOME/Library/Android/sdk/platform-tools:/opt/homebrew/bin:/usr/local/bin:$PATH"
-printf '%s\\n' 'SysMonitor: Control-C stops the local server, not Android collection.'
-exec "$HERE/server/SysMonitor" --open-browser
+printf '%s\\n' 'JDPerf: Control-C stops the local server, not Android collection.'
+exec "$HERE/server/JDPerf" --open-browser
 ''', True)
         with (contents / "Info.plist").open("wb") as handle:
-            plistlib.dump({"CFBundleExecutable": "SysMonitor", "CFBundleName": "SysMonitor",
+            plistlib.dump({"CFBundleExecutable": "JDPerf", "CFBundleName": "JDPerf",
+                          "CFBundleDisplayName": "JDPerf",
                           "CFBundleIdentifier": "local.sysmonitor.desktop", "CFBundlePackageType": "APPL",
                           "CFBundleIconFile": icon.name,
                           "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION,
                           "LSMinimumSystemVersion": MACOS_MIN_VERSION}, handle)
         (stage / "Applications").symlink_to("/Applications", target_is_directory=True)
         dmg = output / (stem + ".dmg")
-        run("hdiutil", "create", "-volname", "SysMonitor", "-srcfolder", stage,
+        run("hdiutil", "create", "-volname", "JDPerf", "-srcfolder", stage,
             "-format", "UDZO", dmg)
         artifacts.append(dmg)
     elif system == "Windows":
-        write(payload / "Start.cmd", '@echo off\r\n"%~dp0SysMonitor.exe" --open-browser\r\npause\r\n')
+        write(payload / "Start.cmd", '@echo off\r\n"%~dp0JDPerf.exe" --open-browser\r\npause\r\n')
         installer = output / "installer.iss"
         write(installer, f'''[Setup]
-AppName=SysMonitor
+AppId=SysMonitor
+AppName=JDPerf
 AppVersion={VERSION}
-DefaultDirName={{localappdata}}\\Programs\\SysMonitor
+DefaultDirName={{localappdata}}\\Programs\\JDPerf
 PrivilegesRequired=lowest
 OutputDir={output}
 OutputBaseFilename={stem}-setup
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile={icon}
-UninstallDisplayIcon={{app}}\\SysMonitor.exe
+UninstallDisplayIcon={{app}}\\JDPerf.exe
 [Files]
 Source: "{payload}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
 [Icons]
-Name: "{{userprograms}}\\SysMonitor"; Filename: "{{app}}\\SysMonitor.exe"; Parameters: "--open-browser"
-Name: "{{userdesktop}}\\SysMonitor"; Filename: "{{app}}\\SysMonitor.exe"; Parameters: "--open-browser"
+Name: "{{userprograms}}\\JDPerf"; Filename: "{{app}}\\JDPerf.exe"; Parameters: "--open-browser"
+Name: "{{userdesktop}}\\JDPerf"; Filename: "{{app}}\\JDPerf.exe"; Parameters: "--open-browser"
 ''')
         compiler = shutil.which("ISCC")
         if compiler:
@@ -144,18 +147,18 @@ Name: "{{userdesktop}}\\SysMonitor"; Filename: "{{app}}\\SysMonitor.exe"; Parame
             print("Inno Setup not found: portable ZIP only; compile installer.iss with ISCC for installer.")
         artifacts.append(Path(shutil.make_archive(str(output / stem), "zip", payload.parent, payload.name)))
     else:
-        shutil.copy2(icon, payload / "sysmonitor.png")
-        write(payload / "start.sh", '#!/bin/sh\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/SysMonitor" --open-browser\n', True)
+        shutil.copy2(icon, payload / "jdperf.png")
+        write(payload / "start.sh", '#!/bin/sh\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/JDPerf" --open-browser\n', True)
         artifacts.append(Path(shutil.make_archive(str(output / stem), "gztar", payload.parent, payload.name)))
         if shutil.which("dpkg-deb"):
             package = output / "deb-root"
-            shutil.copytree(payload, package / "opt/sysmonitor")
+            shutil.copytree(payload, package / "opt/jdperf")
             deb_arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
-            write(package / "DEBIAN/control", f"Package: sysmonitor\nVersion: {VERSION}\nArchitecture: {deb_arch}\nMaintainer: SysMonitor\nDepends: libc6\nDescription: Local Android performance log analysis\n")
+            write(package / "DEBIAN/control", f"Package: jdperf\nVersion: {VERSION}\nArchitecture: {deb_arch}\nMaintainer: JDPerf\nDepends: libc6\nDescription: Local Android performance log analysis\n")
             icon_dir = package / "usr/share/icons/hicolor/256x256/apps"
             icon_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(icon, icon_dir / "sysmonitor.png")
-            write(package / "usr/share/applications/sysmonitor.desktop", "[Desktop Entry]\nType=Application\nName=SysMonitor\nExec=/opt/sysmonitor/SysMonitor --open-browser\nIcon=sysmonitor\nTerminal=true\nCategories=Development;\n")
+            shutil.copy2(icon, icon_dir / "jdperf.png")
+            write(package / "usr/share/applications/jdperf.desktop", "[Desktop Entry]\nType=Application\nName=JDPerf\nExec=/opt/jdperf/JDPerf --open-browser\nIcon=jdperf\nTerminal=true\nCategories=Development;\n")
             deb = output / (stem + ".deb")
             run("dpkg-deb", "--build", "--root-owner-group", package, deb)
             artifacts.append(deb)

@@ -58,14 +58,46 @@ class ReportMarkup(HTMLParser):
             self.styles.append(data)
 
 
+    def payload(self):
+        header = json.loads(self.scripts[0][1])
+        if header.get('report_chunks') != 1:
+            return header
+        holder = {}
+        blocks = self.scripts[1:-2]
+        assert json.loads(self.scripts[-2][1]) == len(blocks)
+        for attrs, raw in blocks:
+            operation = json.loads(raw)
+            path, value = operation[:2]
+            parent, key = holder, 'data'
+            for part in path:
+                parent, key = parent[key], part
+            if len(operation) == 2:
+                if isinstance(parent, list) and key == len(parent):
+                    parent.append(value)
+                else:
+                    parent[key] = value
+            elif value == 'text':
+                parent[key] += operation[2]
+            else:
+                assert len(parent[key]) == value
+                parent[key].extend(operation[2])
+        return holder['data']
+
+
 class ReportAssertions:
     def assert_report(self, report):
         from perf_report_ui import JS, REPORT_CSP
 
         markup = ReportMarkup(report)
-        self.assertEqual(len(markup.scripts), 2)
-        (json_attrs, raw), (js_attrs, script) = markup.scripts
+        self.assertGreaterEqual(len(markup.scripts), 2)
+        json_attrs, raw = markup.scripts[0]
+        js_attrs, script = markup.scripts[-1]
         self.assertEqual(json_attrs, {"type": "application/json", "id": "report-data"})
+        from perf_report_ui import REPORT_DATA_CHUNK_CHARS
+        for attrs, content in markup.scripts[:-1]:
+            self.assertEqual(attrs['type'], 'application/json')
+            self.assertLessEqual(len(content), REPORT_DATA_CHUNK_CHARS)
+            self.assertNotRegex(content, r"[<>&]")
         self.assertEqual(js_attrs, {})
         self.assertEqual(script, JS)
         digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
@@ -73,7 +105,7 @@ class ReportAssertions:
         self.assertEqual(directives["script-src"], "'sha256-" + digest + "'")
         self.assertEqual(directives["default-src"], "'none'")
         self.assertNotRegex(raw, r"[<>&]")
-        data = json.loads(raw)
+        data = markup.payload()
         self.assertEqual(data["schema_version"], 1)
         self.assertEqual(data["process_fields"],
                          ["cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb"])
@@ -156,6 +188,61 @@ console.log(JSON.stringify(lineSeries(points, input.field, input.field, '#123456
             report = render_report(self.store, sid)
         self.assertEqual(report, baseline)
         return self.assert_report(report)
+
+
+class ReportChunkTests(ReportAssertions, unittest.TestCase):
+    def test_chunk_roundtrip_nested_arrays_and_safe_text(self):
+        from unittest.mock import patch
+        from perf_report_ui import report_data_scripts
+        source = (Path(__file__).parent / 'report_assets/report.js').read_text(encoding='utf-8')
+        prefix = source[:source.index('  const data = readReportData();')]
+        payload = {
+            'systems': [{'cycle_axis': [[i, i * 1000] for i in range(250)]}],
+            'processes': [{'name': '进程</script>&', 'full_cycles': [
+                [i, None, [i, i + 1], 0.125] for i in range(500)]}],
+            'long_text': '中文</script>&' * 150,
+            '__proto__': {'polluted': True},
+            'constructor': {'prototype': {'polluted': True}},
+            'empty': [], 'nested': [[['x' * 900]]],
+        }
+        with patch('perf_report_ui.REPORT_DATA_CHUNK_CHARS', 512):
+            markup = ReportMarkup(''.join(report_data_scripts(payload)) + '<script></script>')
+        self.assertEqual(markup.payload(), payload)
+        self.assertGreater(len(markup.scripts), 10)
+        nodes = {}
+        for attrs, raw in markup.scripts[:-1]:
+            self.assertLessEqual(len(raw), 512)
+            self.assertNotRegex(raw, r'[<>&]')
+            nodes[attrs['id']] = raw
+        script = 'const rawNodes = ' + json.dumps(nodes) + ';\n' + """
+const nodes = new Map(Object.entries(rawNodes).map(([id, textContent]) =>
+  [id, {textContent, remove() { nodes.delete(id); }}]));
+global.document = {getElementById: id => nodes.get(id)};
+""" + prefix + """
+const result = readReportData();
+if (nodes.size || Object.prototype.polluted) throw new Error('数据文本未释放或原型被修改');
+console.log(JSON.stringify(result));
+})();
+"""
+        self.assertEqual(json.loads(self.run_report_script(script)), payload)
+
+    def test_chunk_reader_rejects_missing_and_reordered_blocks(self):
+        source = (Path(__file__).parent / 'report_assets/report.js').read_text(encoding='utf-8')
+        prefix = source[:source.index('  const data = readReportData();')]
+        self.run_report_script("""
+const nodes = new Map([
+  ['report-data', {report_chunks:1}], ['report-chunk-count', 2],
+  ['report-chunk-1', [[], []]], ['report-chunk-2', [[], 5, [1]]]
+]);
+global.document = {getElementById: id => nodes.has(id) ? {textContent:JSON.stringify(nodes.get(id))} : null};
+""" + prefix + """
+let errors = 0;
+try { readReportData(); } catch (e) { if (e.message.includes('顺序无效')) errors++; }
+nodes.delete('report-chunk-2');
+try { readReportData(); } catch (e) { if (e.message.includes('缺失')) errors++; }
+if (errors !== 2) throw new Error('未拒绝损坏数据块');
+})();
+""")
 
 
 class ParserTests(unittest.TestCase):
@@ -505,7 +592,7 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(prepare_display(display), display)
         html = render_report(self.store, sid)
         markup = ReportMarkup(html)
-        payload = json.loads(markup.scripts[0][1])
+        payload = markup.payload()
         self.assertEqual(payload["systems"][0]["metrics"], metrics)
         for phrase in ("CPU 总占用", "单核满载为 100%", "irq+softirq", "MemTotal", "MemAvailable", "P95", "P99"):
             self.assertIn(phrase, html)
@@ -870,8 +957,8 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
             headers = re.findall(r'<th scope="col">(.*?)</th>', table)
             expected_headers = PROCESS_HEADERS if has_io else [
                 '序号', '原始进程名', 'PID', '活跃周期', '活跃均值 %',
-                '活跃P95 %', '活跃峰值 %', 'P95K KDMIPS',
-                '峰值K KDMIPS', '内存均值 MB', '内存 P95 MB', '内存峰值 MB', 'PID变化']
+                '活跃P95 %', '活跃峰值 %', '活跃P95K KDMIPS',
+                '活跃峰值K KDMIPS', '内存均值 MB', '内存 P95 MB', '内存峰值 MB', 'PID变化']
             self.assertEqual(headers, expected_headers)
             body_rows = re.findall(r'<tr\b[^>]*>(.*?)</tr>', table.split('<tbody>', 1)[1])
             self.assertEqual(len(body_rows), len(processes))
@@ -883,7 +970,7 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
                                          for h in expected_headers])
 
         html = render_report(self.store, self.import_sample()["id"])
-        data = json.loads(ReportMarkup(html).scripts[0][1])
+        data = ReportMarkup(html).payload()
         system = data['systems'][0]
         foreign = deepcopy(data['processes'][0])
         foreign['segment'] = system['segment'] + 1
@@ -917,7 +1004,7 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
         from perf_report_ui import PROCESS_HEADERS, process_row
 
         html = render_report(self.store, self.import_sample()["id"])
-        payload = json.loads(ReportMarkup(html).scripts[0][1])
+        payload = ReportMarkup(html).payload()
         self.assertIn('</section><details class="panel" open><summary>全进程分析</summary>', html)
         self.assertLess(html.index('<div class="data-table" data-table="all"'), html.index("<summary>关注进程</summary>"))
         for role in ("overlay-cpu", "overlay-rss", "overlay-io"):
@@ -940,6 +1027,12 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
             self.assertIn("p99", p["active"]["metrics"]["cpu1c"])
             self.assertEqual(cells["活跃P95 %"], p["active"]["metrics"]["cpu1c"]["p95"])
             self.assertEqual(cells["活跃峰值 %"], p["active"]["metrics"]["cpu1c"]["max"])
+            for header, key in (("活跃P95K KDMIPS", "p95k"), ("活跃峰值K KDMIPS", "peakk")):
+                expected = p["active"]["metrics"]["cpu1c"][key]
+                if expected is None:
+                    self.assertIsNone(cells[header])
+                else:
+                    self.assertAlmostEqual(cells[header], expected)
             for header, field in (("累计读 KB", "rd_kb"), ("累计写 KB", "wr_kb"),
                                   ("逻辑读累计 KB", "rchar_kb"), ("逻辑写累计 KB", "wchar_kb")):
                 self.assertEqual(cells[header], p["metrics"][field]["total"])
@@ -1190,7 +1283,7 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
                 sid = self.import_sample("\n".join(lines) + "\n")["id"]
                 html = render_report(self.store, sid)
                 markup = ReportMarkup(html)
-                payload = json.loads(markup.scripts[0][1])
+                payload = markup.payload()
                 p, = payload["processes"]
                 self.assertEqual(p["pid_changes"], len(sequence) - 1)
                 self.assertEqual([entry["pids"] for entry in p["pid_path"]], sequence)
@@ -1218,7 +1311,7 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
                     # Fixture mutation bypasses immutable imports: invalidate its prior report.
                     db.execute("DELETE FROM report_cache WHERE session=?", (missing_sid,))
                 html = render_report(self.store, missing_sid)
-                system = json.loads(ReportMarkup(html).scripts[0][1])["systems"][0]
+                system = ReportMarkup(html).payload()["systems"][0]
                 self.assertEqual(system["metrics"][field]["count"], 0)
                 derived = "cpu_idle" if field == "cpu_total" else "mem_used_mb" if field.startswith("mem") else field
                 self.assertIsNone(system["metrics"][derived]["p95"])
@@ -3060,7 +3153,9 @@ class ApiTests(ReportAssertions, unittest.TestCase):
             self.assertEqual(ticks[-1]["completed"], count)
             self.assertTrue(all(e["total"] == count for e in ticks))
         self.assertEqual(events[-1]["type"], "result")
-        document = events[-1]["data"]
+        self.assertEqual(events[-1]["data"], base)
+        self.assertTrue(all(len(line) < 2048 for line in response.text.splitlines()))
+        document = self.client.get(base, headers=self.headers).text
         self.assert_report(document)
         self.assertEqual(build_report_data(self.app.state.store, sid, progress=lambda e: None), expected)
         with patch("perf_report.build_report_data", side_effect=AssertionError("缓存不应重复计算")):
@@ -3068,13 +3163,100 @@ class ApiTests(ReportAssertions, unittest.TestCase):
             cached_events = [json.loads(line) for line in cached.text.splitlines()]
             self.assertEqual([e["stage"] for e in cached_events if e["type"] == "progress"],
                              ["waiting", "cache", "read_cache", "complete"])
-            self.assertEqual(cached_events[-1]["data"], document)
+            self.assertEqual(cached_events[-1]["data"], base)
             download = self.client.get(base, headers=self.headers)
             self.assertEqual(download.text, document)
             self.assertIn("sandbox allow-scripts", download.headers["content-security-policy"])
         self.assertEqual(self.client.get(base + "/stream").status_code, 403)
         missing = self.client.get("/api/sessions/missing/report/stream", headers=self.headers)
         self.assertIn("不存在", json.loads(missing.text.splitlines()[-1])["message"])
+
+    def test_large_report_stream_does_not_serialize_html(self):
+        from unittest.mock import patch
+        sid = self.upload().json()["id"]
+        base = f"/api/sessions/{sid}/report"
+        document = "报告正文\\\"\n" * 200_000
+        with patch("perf_api.render_report", return_value=document) as render:
+            response = self.client.get(base + "/stream", headers=self.headers)
+        self.assertEqual(render.call_count, 1)
+        self.assertLess(len(response.content), 2048)
+        self.assertEqual(json.loads(response.text.splitlines()[-1]), dict(type="result", data=base))
+
+    def test_report_blob_loading_and_stream_cleanup(self):
+        root = Path(__file__).parent
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const root = ROOT;
+const ts = require(root + '/frontend/node_modules/typescript');
+const compile = source => ts.transpileModule(source, {compilerOptions: {
+  target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX
+}}).outputText;
+(async () => {
+  const source = fs.readFileSync(root + '/frontend/src/Dashboard.tsx', 'utf8');
+  const functions = source.slice(source.indexOf('async function loadReport('), source.indexOf('function InteractiveReport('));
+  let calls = 0, created = 0, released = [];
+  const blob = new Blob(['报告正文'], {type: 'text/html'});
+  const urls = {createObjectURL(value) { assert.equal(value, blob); created++; return 'blob:report'; },
+    revokeObjectURL(value) { released.push(value); }};
+  let response = {headers: new Headers({'Content-Type': 'text/html; charset=utf-8'}),
+    blob: async () => blob, text() { throw Error('must not decode HTML'); }};
+  const {loadReport, releaseReport} = new Function('apiResponse', 'URL', compile(functions) +
+    '\nreturn {loadReport, releaseReport};')(async () => { calls++; return response; }, urls);
+  const path = '/api/sessions/' + 'a'.repeat(32) + '/report';
+  const controller = new AbortController();
+  assert.equal(await loadReport(path, controller.signal), 'blob:report');
+  releaseReport('blob:report');
+  assert.deepEqual(released, ['blob:report']);
+  for (const invalid of ['https://example.com/report', '//example.com', '<html>', '', null]) {
+    await assert.rejects(() => loadReport(invalid, controller.signal));
+  }
+  assert.equal(calls, 1);
+  response = {headers: new Headers({'Content-Type': 'application/json'})};
+  await assert.rejects(() => loadReport(path, controller.signal), /格式/);
+  response = {headers: new Headers({'Content-Type': 'text/html'}), blob: async () => new Blob([])};
+  await assert.rejects(() => loadReport(path, controller.signal), /空报告/);
+  response.blob = async () => { controller.abort(); return blob; };
+  await assert.rejects(() => loadReport(path, controller.signal));
+  assert.equal(created, 1);
+  assert.ok(!source.includes('srcDoc={'));
+  assert.ok(source.includes('sandbox="allow-scripts"'));
+
+  const apiSource = fs.readFileSync(root + '/frontend/src/api.ts', 'utf8');
+  let effect, cleanup, state;
+  const react = {useRef: () => ({current: null}), useState: initial => {
+    state = initial; return [state, update => {state = typeof update === 'function' ? update(state) : update;}];
+  }, useEffect: fn => {effect = fn;}};
+  const exports = {};
+  new Function('require', 'exports', compile(apiSource))(() => react, exports);
+  const originalFetch = global.fetch;
+  global.fetch = async url => url === '/api/token' ? Response.json({token: 'test'}) :
+    new Response(JSON.stringify({type: 'result', data: path}) + '\n');
+  const wait = () => new Promise(resolve => setTimeout(resolve, 10));
+  try {
+    let finish, started = false;
+    released = [];
+    const resolve = () => {started = true; return new Promise(done => {finish = done;});};
+    const result = exports.useAnalysisStream('/stream', 0, resolve, releaseReport);
+    cleanup = effect();
+    while (!started) await wait();
+    result.cancel();
+    finish('blob:cancelled');
+    await wait();
+    assert.equal(state.cancelled, true);
+    assert.equal(state.data, undefined);
+    assert.deepEqual(released, ['blob:cancelled']);
+    cleanup();
+    exports.useAnalysisStream('/stream', 1, async () => 'blob:success', releaseReport);
+    cleanup = effect();
+    while (state.data === undefined) await wait();
+    assert.equal(state.data, 'blob:success');
+    cleanup(); cleanup = null;
+    assert.deepEqual(released, ['blob:cancelled', 'blob:success']);
+  } finally {cleanup?.(); global.fetch = originalFetch;}
+})().catch(error => {console.error(error); process.exitCode = 1;});
+'''.replace("ROOT", json.dumps(str(root)))
+        self.run_report_script(script)
 
     def test_report_cancellation_preserves_cache_and_releases_lock(self):
         import sqlite3

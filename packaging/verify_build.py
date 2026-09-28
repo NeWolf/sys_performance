@@ -41,6 +41,12 @@ def smoke(command, folder):
                             raise RuntimeError("Packaged server startup timed out")
                         time.sleep(0.2)
                 response.raise_for_status()
+                if "JDPerf · 性能日志分析" not in response.text:
+                    raise RuntimeError("Packaged frontend has outdated branding; rebuild frontend first")
+                logo = client.get("/JD_logo.png")
+                logo.raise_for_status()
+                if not logo.content.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise RuntimeError("JDPerf frontend logo missing or invalid")
                 assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', response.text)
                 if not assets:
                     raise RuntimeError("Frontend assets missing from packaged homepage")
@@ -71,7 +77,7 @@ def verify_payload(payload, folder, system):
     resource = payload / "_internal/frontend/src/sysmonitor_test/sysmonitor"
     if not resource.is_file() or not resource.stat().st_size:
         raise RuntimeError("Android collector missing from application")
-    executable = payload / ("SysMonitor.exe" if system == "Windows" else "SysMonitor")
+    executable = payload / ("JDPerf.exe" if system == "Windows" else "JDPerf")
     if not executable.is_file():
         raise RuntimeError("Packaged server is missing")
     if system == "Darwin":
@@ -85,13 +91,18 @@ def verify_dmg(archive, folder):
     subprocess.run(["hdiutil", "attach", str(archive.resolve()), "-readonly",
                     "-nobrowse", "-mountpoint", str(mount)], check=True)
     try:
-        contents = mount / "SysMonitor.app/Contents"
+        contents = mount / "JDPerf.app/Contents"
         with (contents / "Info.plist").open("rb") as handle:
             info = plistlib.load(handle)
         verify_macos_metadata(info)
-        if info.get("CFBundleExecutable") != "SysMonitor" or info.get("CFBundlePackageType") != "APPL":
+        if (info.get("CFBundleExecutable") != "JDPerf"
+                or info.get("CFBundleName") != "JDPerf"
+                or info.get("CFBundleDisplayName") != "JDPerf"
+                or info.get("CFBundlePackageType") != "APPL"):
             raise RuntimeError("Invalid macOS application metadata")
-        for launcher in (contents / "MacOS/SysMonitor", contents / "Resources/Start.command"):
+        if info.get("CFBundleIconFile") != "JDPerf.icns" or not (contents / "Resources/JDPerf.icns").is_file():
+            raise RuntimeError("JDPerf application icon missing")
+        for launcher in (contents / "MacOS/JDPerf", contents / "Resources/Start.command"):
             if not launcher.is_file() or not os.access(launcher, os.X_OK):
                 raise RuntimeError(f"Missing or non-executable macOS launcher: {launcher}")
         verify_payload(contents / "Resources/server", folder, "Darwin")
@@ -144,7 +155,7 @@ def main():
             else:
                 with tarfile.open(archive) as bundle:
                     bundle.extractall(folder, filter="data")
-            verify_payload(folder / "SysMonitor", folder, system)
+            verify_payload(folder / "JDPerf", folder, system)
     args.publish_dir.mkdir(parents=True, exist_ok=False)
     for artifact in [*artifacts, manifest]:
         shutil.copy2(artifact, args.publish_dir / artifact.name)

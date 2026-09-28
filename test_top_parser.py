@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from perf_parser import MAX_LINE_BYTES, iter_records
-from perf_store import Store
+from perf_store import CAPTURE_PROCESS_NAME, Store, normalize_process_record
 from perf_top_parser import MAX_SAMPLE_BYTES, detect_source_format, iter_top_records
 from test_perf import ReportAssertions, SAMPLE
 
@@ -233,6 +233,202 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
 
     def load(self, text):
         return self.store.import_files([("top.txt", io.BytesIO(text.encode()))])["id"]
+
+    def test_tcpdump_identity_boundaries(self):
+        prefix = "tcpdump -i any -s0 -w "
+        first = prefix + "/log/android/tcpdump/tcpdump_20260928_120000.pcap"
+        second = prefix + "/log/android/tcpdump/tcpdump_20260928_120001.pcap"
+        normalized = normalize_process_record(dict(name=first))
+        self.assertIn("tcpdump_*.pcap", normalized["name"])
+        self.assertEqual(normalized["raw_name"], first)
+        self.assertEqual(normalize_process_record(dict(name=second))["name"], normalized["name"])
+        self.assertEqual(normalize_process_record(dict(normalized)), normalized)
+        for name in [first.replace("-i any", "-i wlan0"), first.replace("-s0", "-s96"),
+                     first + " port 80", first.replace("/log/android/", "/other/"),
+                     "/system/bin/" + first]:
+            self.assertNotEqual(normalize_process_record(dict(name=name))["name"], normalized["name"])
+        for name in ["echo " + first, "sh -c '" + first + "'", first + "'",
+                     first.replace("tcpdump_20260928_120000.pcap", "fixed.pcap"),
+                     first.replace("/android/", "/../"), "tcpdump -w -",
+                     "tcpdump -r tcpdump_1.pcap", "tcpdump -i any port 80 -w tcpdump_1.pcap",
+                     "tcpdump -- -w tcpdump_1.pcap", "tcpdump --unknown -w tcpdump_1.pcap",
+                     first + " -w tcpdump_2.pcap", first + " -i"]:
+            self.assertEqual(normalize_process_record(dict(name=name)), dict(name=name))
+        for prefix in ["tcpdump -w", "/system/bin/tcpdump -nn -w ", "tcpdump -s 0 -w "]:
+            a = normalize_process_record(dict(name=prefix + "tcpdump_a.pcap"))
+            b = normalize_process_record(dict(name=prefix + "tcpdump_b.pcap"))
+            self.assertEqual(a["name"], b["name"])
+            self.assertIn("raw_name", a)
+        filtered = normalize_process_record(dict(name=first + " 'host example.com'"))
+        self.assertTrue(filtered["name"].endswith("'host example.com'"))
+
+    def test_tcpdump_report_cycles_and_traceability(self):
+        from perf_report_data import build_report_data
+        first = "tcpdump -i any -s0 -w /log/android/tcpdump/tcpdump_a.pcap"
+        second = first.replace("tcpdump_a.pcap", "tcpdump_b.pcap")
+        canonical = normalize_process_record(dict(name=first))["name"]
+        text = header() + CPU + f"PID RES CPU% NAME\n42 1M 10 {first}\n43 3M 30 {second}\n"
+        text += header(2, "2026-07-01 12:00:01") + f"PID RES CPU% NAME\n42 5M 50 {second}\n"
+        text += header(3, "2026-07-01 11:59:59") + f"PID RES CPU% NAME\n99 9M 90 {first}\n"
+        sid = self.load(text)
+        processes = build_report_data(self.store, sid)["processes"]
+        self.assertEqual([(p["segment"], p["name"]) for p in processes], [(0, canonical), (1, canonical)])
+        merged = processes[0]
+        self.assertEqual(merged["pids"], [42, 43])
+        self.assertEqual(merged["metrics"]["cpu1c"]["avg"], 45)
+        self.assertEqual(merged["metrics"]["cpu1c"]["p95"], 50)
+        self.assertEqual(merged["metrics"]["rss_kb"]["avg"], 4608)
+        self.assertIsNone(merged["metrics"]["rd_kb"]["avg"])
+        self.assertEqual(merged["coverage"]["duplicate_cycles"], 0)
+        points = self.store.series(sid, "P", name=canonical, segment=0)["points"]
+        self.assertEqual([p["raw_name"] for p in points], [first, second, second])
+        self.assertEqual(self.store.series(sid, "P", name=first, segment=0)["total"], 1)
+        self.assertEqual(len(self.store.processes(sid, merge_names=True)), 2)
+        duplicate = self.load(header() + CPU + f"PID RES CPU% NAME\n42 1M 10 {first}\n42 3M 30 {second}\n")
+        process = build_report_data(self.store, duplicate)["processes"][0]
+        self.assertEqual(process["coverage"]["duplicate_cycles"], 1)
+        self.assertIsNone(process["metrics"]["cpu1c"]["avg"])
+
+    def test_capture_identity_boundaries(self):
+        root = "/data/local/tmp/sysmonitor_top_capture/"
+        matches = [f"sh {root}control-a.sh worker job-1", f"sh\t{root}control-b.sh worker job-2",
+                   f"/system/bin/sh {root}control-c.sh worker"]
+        for name in matches:
+            data = normalize_process_record(dict(name=name, pid=42))
+            self.assertEqual(data, dict(name=CAPTURE_PROCESS_NAME, raw_name=name, pid=42))
+            self.assertEqual(normalize_process_record(dict(data)), data)
+        for name in ["app  --flag value", f"echo sh {root}a.sh", f"sh -c echo {root}a.sh",
+                     f"bash {root}a.sh", "sh /data/local/tmp/sysmonitor_top_capture_other/a.sh",
+                     f"sh {root}../other.sh", f"sh {root}a/../../other.sh", CAPTURE_PROCESS_NAME]:
+            self.assertEqual(normalize_process_record(dict(name=name)), dict(name=name))
+
+    def test_capture_process_statistics_series_and_groups(self):
+        first = CAPTURE_PROCESS_NAME + "control-a.sh worker job-1"
+        second = CAPTURE_PROCESS_NAME + "control-b.sh worker job-2"
+        text = header() + CPU + "PID RES CPU% NAME\n"
+        text += f"42 1M 10 {first}\n43 3M 30 {second}\n"
+        text += header(2, "2026-07-01 12:00:01") + f"PID RES CPU% NAME\n42 5M 50 {second}\n"
+        text += header(3, "2026-07-01 11:59:59") + f"PID RES CPU% NAME\n99 9M 90 {first}\n"
+        sid = self.load(text)
+        rows = self.store.processes(sid, merge_names=True)
+        self.assertEqual(len(rows), 2)
+        row = next(r for r in rows if r["segment"] == 0)
+        self.assertEqual((row["name"], row["samples"], row["cpu_avg"], row["cpu_p95"]),
+                         (CAPTURE_PROCESS_NAME, 3, 30, 50))
+        self.assertEqual((row["rss_avg_kb"], row["rss_p95_kb"]), (3072, 5120))
+        self.assertEqual(row["pids"], [42, 43])
+        self.assertEqual(row["pid_path"], [[42, 43], [42]])
+        self.assertTrue(row["concurrent_pids"])
+        self.assertEqual(self.store.processes(sid, merge_names=True, q="43"), [row])
+        self.assertEqual(self.store.processes(sid, merge_names=True, q="sysmonitor_top_capture", segment=0), [row])
+        from perf_report_data import build_report_data
+        reports = build_report_data(self.store, sid)["processes"]
+        self.assertEqual([(p["segment"], p["name"]) for p in reports],
+                         [(0, CAPTURE_PROCESS_NAME), (1, CAPTURE_PROCESS_NAME)])
+        self.assertEqual(reports[0]["pids"], [42, 43])
+        # Reports keep their existing per-cycle aggregation; the live rank uses raw samples.
+        self.assertEqual(reports[0]["metrics"]["cpu1c"]["avg"], 45)
+        points = self.store.series(sid, "P", name=CAPTURE_PROCESS_NAME, segment=0)["points"]
+        self.assertEqual([p["raw_name"] for p in points], [first, second, second])
+        self.assertEqual(self.store.statistics(sid, "P", segment=0, name=CAPTURE_PROCESS_NAME)
+                         ["metrics"]["cpu1c"]["avg"], 30)
+        self.assertEqual(self.store.series(sid, "P", pid=42, segment=0, name=first)["total"], 1)
+        self.assertEqual(self.store.statistics(sid, "P", pid=42, segment=0, name=first)
+                         ["metrics"]["cpu1c"]["avg"], 10)
+        group = self.store.save_group(sid, dict(name="collector", segment=0,
+                                     members=[dict(pid=42, name=CAPTURE_PROCESS_NAME)]))
+        result = self.store.group_analysis(sid, group["id"], "P")
+        self.assertEqual(result["statistics"]["metrics"]["cpu1c"]["avg"], 30)
+        with self.assertRaisesRegex(ValueError, "重叠"):
+            self.store.save_group(sid, dict(name="overlap", segment=0, members=[
+                dict(pid=42, name=first), dict(pid=42, name=CAPTURE_PROCESS_NAME)]))
+
+    def test_capture_sysmonitor_process_and_dmabuf_names(self):
+        self.check_sysmonitor_identity(
+            CAPTURE_PROCESS_NAME + "control-sysmonitor.sh worker job", "capture_process_identity_v1")
+
+    def test_tcpdump_sysmonitor_process_and_dmabuf_names(self):
+        self.check_sysmonitor_identity(
+            "tcpdump -i any -s0 -w /log/android/tcpdump/tcpdump_20260928.pcap", "tcpdump_process_identity_v1")
+
+    def check_sysmonitor_identity(self, command, migration):
+        from perf_report_data import build_report_data
+        canonical = normalize_process_record(dict(name=command))["name"]
+        text = SAMPLE.replace("com.desaysv.engmode", command).replace("/system/bin/surfaceflinger", command)
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                if legacy:
+                    text = text.replace("946684800123", "946684800124")
+                    with patch("perf_store.normalize_process_record", side_effect=lambda data: data):
+                        sid = self.load(text)
+                    with self.store.connect() as db:
+                        db.execute("DELETE FROM store_migrations WHERE name=?", (migration,))
+                    self.store = Store(self.store.path)
+                else:
+                    sid = self.load(text)
+                for kind in ("P", "DP"):
+                    points = self.store.series(sid, kind, name=canonical)["points"]
+                    self.assertEqual(len(points), 1)
+                    self.assertEqual(points[0]["raw_name"], command)
+                    self.assertEqual(points[0]["name"], canonical)
+                processes = build_report_data(self.store, sid)["processes"]
+                self.assertEqual(len(processes), 1)
+                self.assertEqual(processes[0]["name"], canonical)
+                self.assertEqual(processes[0]["pids"], [1361, 5589])
+                self.assertEqual(processes[0]["p_records"], 1)
+                self.assertEqual(processes[0]["dp_records"], 1)
+
+    def test_capture_existing_sessions_caches_and_exact_groups(self):
+        self.check_identity_migration(
+            CAPTURE_PROCESS_NAME + "control-old.sh worker old-job",
+            CAPTURE_PROCESS_NAME + "control-new.sh worker new-job",
+            "capture_process_identity_v1")
+
+    def test_tcpdump_existing_sessions_caches_and_exact_groups(self):
+        self.check_identity_migration(
+            "tcpdump -i any -s0 -w /log/android/tcpdump/tcpdump_old.pcap",
+            "tcpdump -i any -s0 -w /log/android/tcpdump/tcpdump_new.pcap",
+            "tcpdump_process_identity_v1")
+
+    def check_identity_migration(self, first, second, migration):
+        text = header() + CPU + f"PID RES CPU% NAME\n42 1M 10 {first}\n"
+        text += header(2, "2026-07-01 12:00:01") + f"PID RES CPU% NAME\n42 3M 30 {second}\n"
+        # Simulate a database written by the previous application version.
+        with patch("perf_store.normalize_process_record", side_effect=lambda data: data):
+            sid = self.load(text)
+        other = self.load(header() + CPU + TABLE + ROW)
+        group = self.store.save_group(sid, dict(name="existing", segment=0, members=[
+            dict(pid=42, name=first, purpose="old purpose"),
+            dict(pid=42, name=second, purpose="new purpose")]))
+        before = self.store.group_analysis(sid, group["id"])
+        resources = self.store.group_resources(sid, group["id"])
+        for session in (sid, other):
+            self.store.processes(session)
+            self.store.processes(session, merge_names=True)
+            self.store.statistics(session, "P")
+        with self.store.connect() as db:
+            db.execute("INSERT INTO report_cache VALUES (?,?,?)", (sid, "old", b"old report"))
+            db.execute("DELETE FROM store_migrations WHERE name=?", (migration,))
+        reopened = Store(self.store.path)
+        tables = ("analysis_cache", "report_cache", "process_rank_v3", "process_rank_ready_v3",
+                  "process_name_rank_v2", "process_name_ready_v2",
+                  "process_rss_rank_v1", "process_rss_ready_v1")
+        with reopened.connect() as db:
+            for table in tables:
+                self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {table} WHERE session=?", (sid,)).fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM process_name_ready_v2 WHERE session=?", (other,)).fetchone()[0], 1)
+        self.assertEqual(reopened.group(sid, group["id"]), group)
+        self.assertEqual(reopened.group_analysis(sid, group["id"]), before)
+        self.assertEqual(reopened.group_resources(sid, group["id"]), resources)
+        reopened.save_group(sid, group, group["id"])
+        self.assertEqual(reopened.series(sid, "P", pid=42, name=first)["total"], 1)
+        merged = reopened.processes(sid, merge_names=True)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual((merged[0]["cpu_avg"], merged[0]["samples"]), (20, 2))
+        self.assertEqual(reopened.import_files([("top.txt", io.BytesIO(text.encode()))]), dict(id=sid, duplicate=True))
+        again = Store(self.store.path)
+        self.assertEqual(again.processes(sid, merge_names=True), merged)
+        self.assertEqual([p["raw_name"] for p in again.series(sid, "P")["points"]], [first, second])
 
     def test_cycles_equal_time_rollback_sources_and_deduplication(self):
         text = header() + CPU + TABLE + ROW
@@ -476,6 +672,54 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
                 system = build_report_data(self.store, sid)["systems"][0]
                 self.assertEqual([p[field] for p in system["series"]["points"]], [0, None])
                 self.assert_metric(system["metrics"][field], 1, [0] * 5)
+
+    def test_report_active_cpu_percentiles_and_kdmips_share_samples(self):
+        from perf_report import render_report
+        from perf_report_ui import PROCESS_HEADERS, process_row
+
+        # Include genuine observed zeros, not fabricated missing-cycle values.
+        cases = {
+            "sparse.app": ([0] * 98 + [3.5, 3.5], 2, 3.5, 3.5),
+            "repeated.app": ([0] * 61 + [3.7] * 37 + [7.4] * 2, 39, 7.4, 7.4),
+            "nineteen.app": ([0] * 81 + list(range(1, 20)), 19, 19, 19),
+            "twenty.app": ([0] * 80 + list(range(1, 21)), 20, 19, 20),
+            "distinct.app": (list(range(1, 101)), 100, 95, 100),
+            "idle.app": ([0] * 100, 0, None, None),
+        }
+        text = []
+        for i in range(100):
+            text.append(header(i + 1, f"2026-07-01 12:{i // 60:02d}:{i % 60:02d}"))
+            text.append("100%cpu 100%idle\nPID RES CPU% NAME\n")
+            for pid, (name, (values, *_)) in enumerate(cases.items(), 42):
+                text.append(f"{pid} 1M {values[i]} {name}\n")
+        html = render_report(self.store, self.load(''.join(text)))
+        payload = self.assert_report(html)
+        self.assertIn("活跃样本为1至19个时二者必然相等", html)
+        self.assertIn("内存与 IO 仍按全部有效观察周期统计", html)
+        for process in payload["processes"]:
+            with self.subTest(name=process["name"]):
+                _, count, p95, peak = cases[process["name"]]
+                active = process["active"]["metrics"]["cpu1c"]
+                self.assertEqual(process["active"]["cycles"], count)
+                self.assertEqual(active["count"], count)
+                self.assertEqual((active["p95"], active["max"]), (p95, peak))
+                self.assertEqual(process["metrics"]["cpu1c"]["count"], 100)
+                cells = dict(zip(PROCESS_HEADERS, process_row(process, 1)))
+                for header_name, key, expected in (
+                        ("活跃P95 %", "p95", p95), ("活跃峰值 %", "max", peak),
+                        ("活跃P95K KDMIPS", "p95k", None if p95 is None else p95 / 100 * 28.75),
+                        ("活跃峰值K KDMIPS", "peakk", None if peak is None else peak / 100 * 28.75)):
+                    if expected is None:
+                        self.assertIsNone(cells[header_name])
+                        self.assertIsNone(active[key])
+                    else:
+                        self.assertAlmostEqual(cells[header_name], expected)
+                        self.assertAlmostEqual(active[key], expected)
+                self.assertEqual(cells["内存均值 MB"], 1)
+                if process["name"] == "sparse.app":
+                    self.assertEqual(process["metrics"]["cpu1c"]["p95"], 0)
+                    self.assertEqual(process["metrics"]["cpu1c"]["p95k"], 0)
+                    self.assertGreater(cells["活跃P95K KDMIPS"], 0)
 
     def test_real_report_nearest_rank_uses_all_observed_values(self):
         from perf_report import render_report

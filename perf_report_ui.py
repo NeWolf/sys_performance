@@ -157,7 +157,7 @@ def stat_cards(metrics):
     return ''.join(out) + '</div>'
 
 
-PROCESS_HEADERS = ["序号", "原始进程名", "PID", "活跃周期", "活跃均值 %", "活跃P95 %", "活跃峰值 %", "P95K KDMIPS", "峰值K KDMIPS", "内存均值 MB", "内存 P95 MB", "内存峰值 MB", "累计读 KB", "累计写 KB"]
+PROCESS_HEADERS = ["序号", "原始进程名", "PID", "活跃周期", "活跃均值 %", "活跃P95 %", "活跃峰值 %", "活跃P95K KDMIPS", "活跃峰值K KDMIPS", "内存均值 MB", "内存 P95 MB", "内存峰值 MB", "累计读 KB", "累计写 KB"]
 for _field, _label in IO_FIELDS:
     PROCESS_HEADERS += [_label + "均值 KB/周期", _label + "P95 KB/周期", _label + "峰值 KB/周期"]
     if _field not in ("rd_kb", "wr_kb"):
@@ -176,7 +176,7 @@ def process_row(p, ordinal):
     rows = [ordinal, p.get("name"), pid_label,
             p.get("active", {}).get("cycles"),
             *[cpu(k, True) for k in ("avg", "p95", "max")],
-            scaled(cpu("p95"), 100 / 28.75), scaled(cpu("max"), 100 / 28.75),
+            scaled(cpu("p95", True), 100 / 28.75), scaled(cpu("max", True), 100 / 28.75),
             *[scaled(metric(p, "rss_kb", k), 1024) for k in ("avg", "p95", "max")],
             metric(p, "rd_kb", "total"), metric(p, "wr_kb", "total")]
     for field, _ in IO_FIELDS:
@@ -337,7 +337,7 @@ def segment_html(data, system):
     out.append('<details class="overview-notes"><summary>查看统计口径与图表说明</summary><p class="note">单核满载为 100%，整机总占用可超过 100%；空闲 = 平台满载值 − 单核口径整机 CPU 总占用。' + esc(system.get("cpu_reference_note", "平台未知，不推定满载值。")) + '总占用曲线红色加粗。默认仅显示 CPU 总占用与已使用内存，点击图例可显示其他曲线。内存单位为 MB；sysmonitor 已使用内存 = MemTotal − MemAvailable，空闲内存指可用的 MemAvailable，已使用含不可回收部分、不把可回收 cache 算作已用。Top 已使用内存直接取 Mem 行的 used，空闲内存直接取 free，沿用设备 top 口径；free 不等于 MemAvailable，不用 free 冒充可用内存，Swap 不计入物理内存。总内存不绘图、不展示分位数。虚线为完整时段全量有效样本的 P95 / P99，缩放不重算；横轴为小时:分钟:秒（本机时间），缺失不补零。</p></details>')
     out.append('</section>')
     reference_note = '<p class="note">默认参照：系统 CPU 使用单核口径。' + esc(system.get("cpu_reference_note", "平台未知，不推定满载值。")) + '已使用内存：sysmonitor＝总内存−MemAvailable，Top＝Mem 行的 used。IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；未采集进程不计入，各字段仅汇总有效值（可能不完整），无有效值时断线。</p>'
-    out.append('<details class="panel" open><summary>全进程分析</summary><details class="report-notes"><summary>查看说明</summary><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。默认隐藏名称以 android、com.android、.、vendor、/apex/com.android、/system/、/vendor/ 开头、以方括号包裹或不含英文句点（.）的系统进程，但以 jkc 开头的名称不归入系统进程；可通过开关展示系统进程；筛选不移除已选曲线。列表按约6行高度展示，其余滚动查看；名称和 PID 完整展示，过长时换行。零活跃及 DP-only 身份完整保留；未启用 JavaScript 时展示全部进程。</p>' + reference_note + '</details>')
+    out.append('<details class="panel" open><summary>全进程分析</summary><details class="report-notes"><summary>查看说明</summary><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。默认隐藏名称以 android、com.android、.、vendor、/apex/com.android、/system/、/vendor/ 开头、以方括号包裹或不含英文句点（.）的系统进程，但以 jkc 开头的名称不归入系统进程；可通过开关展示系统进程；筛选不移除已选曲线。列表按约6行高度展示，其余滚动查看；名称和 PID 完整展示，过长时换行。零活跃及 DP-only 身份完整保留；未启用 JavaScript 时展示全部进程。CPU 百分比与 KDMIPS 列均使用同名同周期合计后有效单核 CPU > 0 的活跃周期；KDMIPS = 对应百分比 ÷ 100 × 28.75，为派生估算。P95 按活跃样本升序取第 ceil(0.95 × 样本数) 项，峰值独立取最大值；活跃样本为1至19个时二者必然相等，高值重复时也可能相等。零活跃时这些 CPU 指标显示缺失；内存与 IO 仍按全部有效观察周期统计。</p>' + reference_note + '</details>')
     out.append('<div class="selection-tags js-only" aria-live="polite"></div>')
     has_io = any((metric(p, field, "count") or 0) > 0
                  for p in processes for field, _ in IO_FIELDS)
@@ -391,10 +391,88 @@ def segment_html(data, system):
     return ''.join(out) + '</section>'
 
 
+# Each JSON script is independently parseable, well below browser string limits.
+REPORT_DATA_CHUNK_CHARS = 1024 * 1024
+
+
+def report_data_scripts(data):
+    def encode(value):
+        return json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(',', ':')).replace(
+            '<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+
+    def script(value, identifier):
+        return '<script type="application/json" id="' + identifier + '">' + value + '</script>'
+
+    count = 0
+
+    def bounded(value):
+        pending = [value]
+        budget = REPORT_DATA_CHUNK_CHARS // 12
+        while pending and budget > 0:
+            item = pending.pop()
+            budget -= 1
+            if isinstance(item, dict):
+                if len(item) * 2 > budget:
+                    return False
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                if len(item) > budget:
+                    return False
+                pending.extend(item)
+            else:
+                budget -= len(str(item))
+        return not pending and budget > 0
+
+    def chunks(value, path):
+        # Bound traversal before serialization, including nested single processes.
+        if bounded(value):
+            raw = encode([path, value])
+            if len(raw) <= REPORT_DATA_CHUNK_CHARS:
+                yield raw
+                return
+        if isinstance(value, dict):
+            yield encode([path, {}])
+            for key, child in value.items():
+                yield from chunks(child, path + [key])
+        elif isinstance(value, list):
+            yield encode([path, []])
+            for start in range(0, len(value), 2048):
+                yield from array_chunks(value[start:start + 2048], path, start)
+        elif isinstance(value, str):
+            yield encode([path, ''])
+            for start in range(0, len(value), REPORT_DATA_CHUNK_CHARS // 12):
+                yield encode([path, 'text', value[start:start + REPORT_DATA_CHUNK_CHARS // 12]])
+        else:
+            raise ValueError('报告数据单值超出分块限制')
+
+    def array_chunks(values, path, start):
+        if bounded(values):
+            raw = encode([path, start, values])
+            if len(raw) <= REPORT_DATA_CHUNK_CHARS:
+                yield raw
+                return
+        if len(values) > 1:
+            middle = len(values) // 2
+            yield from array_chunks(values[:middle], path, start)
+            yield from array_chunks(values[middle:], path, start + middle)
+        else:
+            yield from chunks(values[0], path + [start])
+
+    if bounded(data):
+        raw = encode(data)
+        if len(raw) <= REPORT_DATA_CHUNK_CHARS:
+            yield script(raw, 'report-data')
+            return
+    yield script('{"report_chunks":1}', 'report-data')
+    for raw in chunks(data, []):
+        count += 1
+        yield script(raw, 'report-chunk-' + str(count))
+    yield script(str(count), 'report-chunk-count')
+
+
 def render_document(data):
     data = prepare_display(data)
-    payload = json.dumps(data, ensure_ascii=True, allow_nan=False, separators=(',', ':'))
-    payload = payload.replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
     title = str(data["session"].get("name") or "性能采集报告")
     collection_times = []
     for system in data["systems"] or [{"cycle_axis": []}]:
@@ -413,6 +491,8 @@ def render_document(data):
     out.append('<details class="panel" id="method"><summary>统计口径与数据来源</summary><dl class="method-list">')
     for key, value in data.get("method", {}).items():
         out.append('<dt>' + esc(key) + '</dt><dd>' + esc(value) + '</dd>')
-    out.append('</dl><h3>Excel 配置来源</h3><pre>' + esc(json.dumps(data.get("required_source", {}), ensure_ascii=False, indent=2)) + '</pre></details><footer>离线自包含报告 · 图表仅用于观察趋势，精确统计使用全量有效数据</footer></main><script type="application/json" id="report-data">' + payload + '</script><script>' + JS + '</script></body></html>')
+    out.append('</dl><h3>Excel 配置来源</h3><pre>' + esc(json.dumps(data.get("required_source", {}), ensure_ascii=False, indent=2)) + '</pre></details><footer>离线自包含报告 · 图表仅用于观察趋势，精确统计使用全量有效数据</footer></main>')
+    out.extend(report_data_scripts(data))
+    out.append('<script>' + JS + '</script></body></html>')
     return ''.join(out)
 

@@ -18,7 +18,7 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
-    parser = argparse.ArgumentParser(description="sysmonitor 本地离线分析工具")
+    parser = argparse.ArgumentParser(description="JDPerf 本地离线分析工具")
     parser.add_argument("--port", type=int, default=8765, help="本机服务端口，默认 8765")
     parser.add_argument("--database", type=Path, default=Path.home() / ".sysmonitor" / "sessions.sqlite3",
                         help="SQLite 数据库路径")

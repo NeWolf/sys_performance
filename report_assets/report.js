@@ -1,7 +1,41 @@
 /* Offline report application. Log strings enter DOM only through textContent. */
 (() => {
   'use strict';
-  const data = JSON.parse(document.getElementById('report-data').textContent);
+  function readReportData() {
+    const read = id => {
+      const node = document.getElementById(id);
+      if (!node) throw new Error('报告数据块缺失：' + id);
+      const value = JSON.parse(node.textContent);
+      node.remove?.(); // Release parsed text instead of retaining two full copies.
+      return value;
+    };
+    const header = read('report-data');
+    if (header.report_chunks !== 1) return header;
+    const count = read('report-chunk-count');
+    if (!Number.isSafeInteger(count) || count < 1) throw new Error('报告数据块数量无效');
+    const holder = {};
+    for (let n = 1; n <= count; n++) {
+      const operation = read('report-chunk-' + n);
+      const [path, value, items] = operation;
+      let parent = holder, key = 'data';
+      for (const part of path) {
+        if (!Object.hasOwn(parent, key)) throw new Error('报告数据块顺序无效');
+        parent = parent[key]; key = part;
+      }
+      if (operation.length === 2) {
+        // Define own properties so log keys cannot alter object prototypes.
+        Object.defineProperty(parent, key, {value, writable:true, enumerable:true, configurable:true});
+      } else if (value === 'text') {
+        parent[key] += items;
+      } else {
+        const target = parent[key];
+        if (!Array.isArray(target) || target.length !== value) throw new Error('报告数组块顺序无效');
+        for (const item of items) target.push(item);
+      }
+    }
+    return holder.data;
+  }
+  const data = readReportData();
   document.documentElement.classList.add('js-enabled');
   const valid = v => typeof v === 'number' && Number.isFinite(v);
   const fmt = v => valid(v) ? v.toLocaleString('zh-CN', {maximumFractionDigits: 2}) : '—';

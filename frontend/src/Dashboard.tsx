@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { formatNumber, formatTime, sessionPath, useResource, useAnalysisStream } from './api'
+import { formatNumber, formatTime, sessionPath, useResource, useAnalysisStream, apiResponse } from './api'
 import { AnalysisProgress } from './Progress'
 import type { Overview } from './api'
 import { Groups } from './Groups'
@@ -50,14 +50,30 @@ function Analysis({ data, disabled, view }: { data: Overview; disabled: boolean;
   </>
 }
 
-function validateReport(html: string) {
-  if (typeof html !== 'string' || !html.trim()) throw new Error('本地服务返回了空报告或无效报告，请重试。')
+async function loadReport(path: string, signal: AbortSignal): Promise<string> {
+  // Never send the session token to a URL supplied outside the local report API.
+  if (typeof path !== 'string' || !/^\/api\/sessions\/[a-f0-9]{32}\/report$/.test(path)) {
+    throw new Error('本地服务返回了无效报告地址，请重试。')
+  }
+  const response = await apiResponse(path, { signal })
+  if (response.headers.get('content-type')?.split(';')[0]?.trim() !== 'text/html') {
+    throw new Error('本地服务返回了无效报告格式，请重试。')
+  }
+  // Do not convert the document to text/JSON or pass it through React srcDoc.
+  const blob = await response.blob()
+  signal.throwIfAborted()
+  if (!blob.size) throw new Error('本地服务返回了空报告，请重试。')
+  return URL.createObjectURL(blob)
+}
+
+function releaseReport(url: string) {
+  URL.revokeObjectURL(url)
 }
 
 function InteractiveReport({ id, name, disabled }: { id: string; name: string; disabled: boolean }) {
   const [revision, setRevision] = useState(0)
   const [expanded, setExpanded] = useState(false)
-  const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream`, revision, validateReport)
+  const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream`, revision, loadReport, releaseReport)
   useEffect(() => {
     if (!expanded) return
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setExpanded(false) }
@@ -81,7 +97,7 @@ function InteractiveReport({ id, name, disabled }: { id: string; name: string; d
     {result.cancelled && <div className="banner info" role="status">分析已取消 · 已用时 {result.elapsed} 秒<button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>}
     {result.error && <div className="banner error" role="alert">{result.error} · 已用时 {result.elapsed} 秒<button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>}
     {/* 保留报告自身 CSP；不授予同源、弹窗、下载或顶层导航权限。 */}
-    {result.data && <iframe key={result.key} className="analysis-report-frame" title={`${name} · 性能分析`} sandbox="allow-scripts" referrerPolicy="no-referrer" srcDoc={result.data} />}
+    {result.data && <iframe key={result.key} className="analysis-report-frame" title={`${name} · 性能分析`} sandbox="allow-scripts" referrerPolicy="no-referrer" src={result.data} />}
     <p className="analysis-report-note">{result.data && `分析报告已就绪 · 已用时 ${result.elapsed} 秒。`}图表缩放不改变全量统计；未采集保持缺失。大屏模式可用顶部按钮或 Esc 退出。</p>
   </section>
 }

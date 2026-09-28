@@ -20,7 +20,7 @@ export default function App() {
 }
 
 const workspaceViews = [
-  { id: 'capture', label: '数据集', description: 'ADB 设备采集 · 本地日志导入' },
+  { id: 'capture', label: '数据集', description: 'SysMonitor采集 · Top 采集 · 本地日志导入' },
   { id: 'analysis', label: '性能分析', description: '系统资源、进程排行、趋势叠加与精确合并' },
   { id: 'compare', label: '双次采集对比', description: 'CPU、内存与 IO 差异 · 进程变化排行' },
   { id: 'report', label: '配置与导出', description: '分析配置与离线交互 HTML 报告下载' },
@@ -131,7 +131,7 @@ function Workspace() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><img className="brand-mark" src="/tj.png" alt="sysmonitor 标志" /><div><strong>sysmonitor</strong><small>Android 性能分析</small></div></div>
+        <div className="brand"><img className="brand-mark" src="/JD_logo.png" alt="京东" width={80} height={40} /><strong>JDPerf</strong></div>
         <div className="workspace-label">本地工作空间 <span className="status-dot" /> 离线分析</div>
         <nav className="workspace-nav" aria-label="工作区功能">{workspaceViews.map((item) => (
           <button key={item.id} className={view === item.id ? 'active' : ''} aria-current={view === item.id ? 'page' : undefined} onClick={() => setView(item.id)}><strong>{item.label}</strong><small>{item.description}</small></button>
@@ -173,7 +173,7 @@ function Workspace() {
           {notice && <div className="banner success" role="status">{notice}</div>}
           {view === 'compare' && (compareSessions ? <Compare sessions={compareSessions} /> : <div className="banner info" role="status">{sessions.error || '正在读取采集会话…'}</div>)}
           <ViewPanel active={view === 'analysis' || view === 'report'}>
-            {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} /> : <section className="empty-state panel"><img className="empty-symbol" src="/tj.png" alt="sysmonitor 标志" /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据集</button></section>}
+            {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} /> : <section className="empty-state panel"><img className="empty-symbol" src="/JD_logo.png" alt="JDPerf 标志" width={120} height={60} /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据集</button></section>}
           </ViewPanel>
         </div>
       </main>

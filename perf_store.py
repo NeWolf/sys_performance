@@ -1,6 +1,9 @@
 """Local SQLite sessions. Imported sources are streamed, never retained in RAM."""
 import hashlib
 import json
+import re
+import shlex
+import posixpath
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -11,6 +14,68 @@ from perf_parser import iter_records, rotation_key
 from perf_top_parser import detect_source_format, iter_top_records
 from perf_groups import GroupStore
 from perf_metrics import CATEGORIES, INCREMENTS, LABELS, METHOD, NOTES, NUMERIC, metadata, system_cpu_reference, cpu_reference_note
+
+
+CAPTURE_PROCESS_NAME = "sh /data/local/tmp/sysmonitor_top_capture/"
+_CAPTURE_COMMAND = re.compile(
+    r"^(?:sh|/system/bin/sh)[ \t]+/data/local/tmp/sysmonitor_top_capture/"
+    r"([^\s]+)(?:[ \t]|$)")
+
+
+def _tcpdump_identity(name):
+    """Only mask tcpdump capture filenames, never options or BPF filters."""
+    if not re.match(r"^(?:[^\s]*/)?tcpdump(?:[ \t]|$)", name):
+        return name
+    try:
+        args = shlex.split(name)
+    except ValueError:
+        return name  # Truncated/ambiguous commands retain their logged identity.
+    if not args or posixpath.basename(args[0]) != "tcpdump":
+        return name
+    outputs = []
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--" or not arg.startswith("-") or arg == "-":
+            break  # The rest is a filter, not command options.
+        if len(arg) < 2 or arg.startswith("--"):
+            return name  # Unknown option grammar: do not guess.
+        option = arg[1]
+        if option in "BcCEFGijmMQrsTVwWyzZ":
+            attached = len(arg) > 2
+            if not attached:
+                i += 1
+                if i >= len(args):
+                    return name
+            value = arg[2:] if attached else args[i]
+            if option == "w":
+                outputs.append((i, attached, value))
+        elif not all(flag in "AabdDefhHIKlLnNOpqStuUv xX#".replace(" ", "") for flag in arg[1:]):
+            return name
+        i += 1
+    if len(outputs) != 1:
+        return name
+    index, attached, output = outputs[0]
+    directory, filename = posixpath.split(output)
+    if (not re.fullmatch(r"tcpdump_[\w.-]+\.pcap", filename)
+            or any(part in (".", "..") for part in directory.split("/"))):
+        return name
+    wildcard = posixpath.join(directory, "tcpdump_*.pcap")
+    args[index] = "-w" + wildcard if attached else wildcard
+    return shlex.join(args)
+
+
+def normalize_process_record(data):
+    """Assign stable identities while retaining the exact logged command."""
+    name = data.get("name", "")
+    match = _CAPTURE_COMMAND.match(name)
+    normalized = (CAPTURE_PROCESS_NAME
+                  if match and all(part not in ("", ".", "..") for part in match[1].split("/"))
+                  else _tcpdump_identity(name))
+    if normalized != name:
+        data.setdefault("raw_name", name)
+        data["name"] = normalized
+    return data
 
 
 class Store(GroupStore):
@@ -83,6 +148,51 @@ class Store(GroupStore):
                     total INTEGER NOT NULL
                 );
             """)
+            self._migrate_capture_processes(db)
+            db.commit()
+            self._migrate_capture_processes(
+                db, migration="tcpdump_process_identity_v1",
+                candidate="instr(name,'tcpdump')>0")
+
+    @staticmethod
+    def _migrate_capture_processes(db, migration="capture_process_identity_v1",
+                                   candidate="instr(name,'/data/local/tmp/sysmonitor_top_capture/')>0"):
+        """One atomic, bounded-memory identity migration; unaffected caches stay."""
+        db.execute("CREATE TABLE IF NOT EXISTS store_migrations (name TEXT PRIMARY KEY)")
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM store_migrations WHERE name=?", (migration,)).fetchone():
+            return
+        # Only inspect distinct candidate commands, not every record's JSON.
+        # Both SQL fragments below are internal constants, never user input.
+        commands = migration + "_commands"
+        db.execute(f"CREATE TEMP TABLE {commands} AS SELECT DISTINCT session,name "
+                   "FROM records WHERE kind IN ('P','DP') AND " + candidate)
+        cursor = db.execute(f"SELECT session,name FROM {commands}")
+        mapping = migration + "_mapping"
+        db.execute(f"CREATE TEMP TABLE {mapping} (session TEXT,name TEXT,normalized TEXT,"
+                   "PRIMARY KEY(session,name)) WITHOUT ROWID")
+        affected = set()
+        for row in cursor:
+            data = normalize_process_record(dict(name=row["name"]))
+            if data["name"] == row["name"]:
+                continue
+            db.execute(f"INSERT INTO {mapping} VALUES (?,?,?)",
+                       (row["session"], row["name"], data["name"]))
+            affected.add(row["session"])
+        # Scan each affected session once, not once per rotating capture filename.
+        lookup = f"SELECT normalized FROM {mapping} m WHERE m.session=records.session AND m.name=records.name"
+        for sid in affected:
+            db.execute(f"UPDATE records SET name=({lookup}),"
+                       f"data=json_set(data,'$.name',({lookup}),"
+                       "'$.raw_name',COALESCE(json_extract(data,'$.raw_name'),name)) "
+                       f"WHERE session=? AND kind IN ('P','DP') AND name IN "
+                       f"(SELECT name FROM {mapping} WHERE session=?)", (sid, sid))
+        for table in ("analysis_cache", "report_cache", "process_rank_v3", "process_rank_ready_v3",
+                      "process_name_rank_v2", "process_name_ready_v2",
+                      "process_rss_rank_v1", "process_rss_ready_v1"):
+            db.executemany(f"DELETE FROM {table} WHERE session=?", ((sid,) for sid in affected))
+        # Group configurations retain exact logged names and user annotations.
+        db.execute("INSERT INTO store_migrations VALUES (?)", (migration,))
 
     @contextmanager
     def connect(self):
@@ -181,6 +291,8 @@ class Store(GroupStore):
                         summary["unknown"] += 1
                         continue
                     kind, data = record.kind, dict(record.data)
+                    if kind in ("P", "DP"):
+                        normalize_process_record(data)
                     sample = data.pop("_sample", None)
                     new_sample = source_format == "top" and sample != last_sample
                     last_sample = sample
@@ -237,8 +349,12 @@ class Store(GroupStore):
         where, params = "session=? AND kind=?", [session_id, kind]
         for key, value in (("pid", pid), ("segment", segment), ("name", name)):
             if value is not None:
-                where += " AND " + key + "=?"
-                params.append(value)
+                if key == "name":
+                    where += " AND (name=? OR json_extract(data,'$.raw_name')=?)"
+                    params.extend([value, value])
+                else:
+                    where += " AND " + key + "=?"
+                    params.append(value)
         with self.connect() as db:
             cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope=?",
                                 (session_id, scope)).fetchone()
@@ -283,8 +399,12 @@ class Store(GroupStore):
         params = [session_id, kind]
         for key, value in (("pid", pid), ("segment", segment), ("name", name)):
             if value is not None:
-                where += " AND " + key + "=?"
-                params.append(value)
+                if key == "name":
+                    where += " AND (name=? OR json_extract(data,'$.raw_name')=?)"
+                    params.extend([value, value])
+                else:
+                    where += " AND " + key + "=?"
+                    params.append(value)
         # Buckets preserve min/max for each numeric metric (not simple stride sampling).
         with self.connect() as db:
             count = db.execute("SELECT COUNT(*) FROM records WHERE " + where, params).fetchone()[0]
@@ -345,8 +465,12 @@ class Store(GroupStore):
         where, params = "session=? AND kind=? AND segment=?", [session_id, kind, segment]
         for key, value in (("pid", pid), ("name", name)):
             if value is not None:
-                where += " AND " + key + "=?"
-                params.append(value)
+                if key == "name":
+                    where += " AND (name=? OR json_extract(data,'$.raw_name')=?)"
+                    params.extend([value, value])
+                else:
+                    where += " AND " + key + "=?"
+                    params.append(value)
 
         def marked_rows(cursor):
             previous = None

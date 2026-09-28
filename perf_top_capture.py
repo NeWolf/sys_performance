@@ -1,21 +1,24 @@
-"""Rootless, bounded Top capture with explicit import and durable raw archives."""
-from datetime import datetime
+"""Device-owned Top jobs; explicit, bounded local archives and imports."""
+import hashlib
 import math
 import os
 from pathlib import Path
-import subprocess
+import re
+import shlex
 import tempfile
 import threading
 import time
 import uuid
 
 from perf_adb import AdbError
-from perf_top_parser import top_header_fields
 
-MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
-MAX_SAMPLE_BYTES = 16 * 1024 * 1024
-TOP_TIMEOUT = 10
+MAX_ARCHIVE_BYTES = 1_000_000_000
 CHUNK_BYTES = 64 * 1024
+STOP_TIMEOUT_SECONDS = 20
+STOP_POLL_SECONDS = 0.5
+REMOTE_ROOT = "/data/local/tmp/sysmonitor_top_capture"
+ID_PATTERN = r"[0-9a-f]{32}"
+SERIAL_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,199}"
 
 
 class TopCapture:
@@ -24,28 +27,170 @@ class TopCapture:
         self.archive_root = Path(archive).resolve()
         self.store = store
         self.import_lock = import_lock
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = None
+        self._lock = threading.RLock()
         self._closed = False
         self._import_done = threading.Event()
         self._import_done.set()
         self._capture_error = None
         self._archives = {}
-        self._state = dict(status="idle", running=False, stopping=False,
-                           importing=False, count=0, target_count=0, interval=1,
-                           serial=None, title="", error=None, archive=None,
-                           id=None, session_id=None, duplicate=False, bytes=0)
+        self._states = {}
+        self._state = self._empty()
+        self.script = Path(__file__).with_name("device_top_capture.sh")
 
-    def status(self):
+    @staticmethod
+    def _empty(serial=None):
+        return dict(status="idle", running=False, stopping=False,
+                    importing=False, count=0, target_count=0, interval=1,
+                    serial=serial, title="", error=None, archive=None,
+                    id=None, session_id=None, duplicate=False, bytes=0,
+                    max_bytes=MAX_ARCHIVE_BYTES, remote_path=None,
+                    connected=False, connection_error=None,
+                    started_at=None, ended_at=None, elapsed_seconds=None,
+                    remote_cleaned=False)
+
+    @staticmethod
+    def _serial(serial):
+        if not isinstance(serial, str) or not re.fullmatch(SERIAL_PATTERN, serial):
+            raise AdbError("无效的设备序列号", 400)
+
+    @staticmethod
+    def _identity(capture_id):
+        if not isinstance(capture_id, str) or not re.fullmatch(ID_PATTERN, capture_id):
+            raise AdbError("无效的 Top 任务标识", 400)
+
+    def _command(self, serial, action, *args, output=None, deadline=None):
+        def remaining(limit):
+            if deadline is None:
+                return limit
+            value = min(limit, deadline - time.monotonic())
+            if value <= 0:
+                raise AdbError("停止确认超时；任务可能仍在运行，请查询状态或重试停止。未拉取日志。", 504)
+            return value
+
+        def shell(command):
+            if deadline is None:
+                return self.adb.shell(serial, command)
+            return self.adb.run("-s", serial, "shell", "-T", "sh -c " + shlex.quote(command),
+                                timeout=remaining(10))
+
+        # Content-addressed scripts never overwrite code being read by a worker.
+        digest = hashlib.sha256(self.script.read_bytes()).hexdigest()
+        remote = REMOTE_ROOT + "/control-" + digest + ".sh"
+        check = (f'[ ! -L {REMOTE_ROOT} ] && mkdir -p {REMOTE_ROOT} && '
+                 f'if [ -f {remote} ] && [ ! -L {remote} ]; then echo ready; fi')
+        if shell(check) != "ready":
+            staging = remote + "." + uuid.uuid4().hex
+            self.adb.run("-s", serial, "push", str(self.script), staging, timeout=remaining(30))
+            shell(f"chmod 600 {staging} && mv {staging} {remote}")
+        command = "sh " + shlex.quote(remote) + " " + " ".join(
+            shlex.quote(str(value)) for value in (action, *args))
+        if output is not None:
+            return self.adb.run("-s", serial, "shell", "-T", "sh -c " + shlex.quote(command),
+                                timeout=600, output=output)
+        return shell(command)
+
+    def _decode(self, serial, raw):
+        if raw == "idle":
+            return dict(self._empty(serial), connected=True)
+        fields = raw.splitlines()
+        unconfirmed = bool(fields and fields[-1] == "unconfirmed")
+        if unconfirmed:
+            fields.pop()
+        remote_cleaned = bool(fields and fields[-1] == "cleaned")
+        if remote_cleaned:
+            fields.pop()
+        if len(fields) == 7:
+            fields.append("")  # adb.run strips the empty hex-encoded title.
+        try:
+            if len(fields) not in {8, 9, 11}:
+                raise ValueError()
+            started_at = ended_at = elapsed_seconds = None
+            if len(fields) == 11:
+                if any(not re.fullmatch(r"[0-9]{1,12}", value) for value in fields[8:]):
+                    raise ValueError()
+                started_at, ended_at, observed_at = map(int, fields[8:])
+                elapsed_seconds = max(0, (ended_at or observed_at) - started_at) if started_at else None
+                started_at = started_at or None
+                ended_at = ended_at or None
+            identity, status, count, target, interval, size, error, title = fields[:8]
+            self._identity(identity)
+            if status not in {"starting", "running", "stopped", "completed", "error"}:
+                raise ValueError()
+            if any(not re.fullmatch(r"[0-9]{1,10}", value) for value in (count, size)):
+                raise ValueError()
+            if not re.fullmatch(r"-1|[0-9]{1,6}", target):
+                raise ValueError()
+            if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", interval) or len(interval) > 24:
+                raise ValueError()
+            count, target, interval, size = int(count), int(target), float(interval), int(size)
+            if not (target == -1 or 1 <= target <= 100000) or not 1 <= interval <= 3600:
+                raise ValueError()
+            if count > 10_000_000 or size > MAX_ARCHIVE_BYTES:
+                raise ValueError()
+            if error not in {"none", "size_limit", "top_failed_or_timeout", "sample_limit",
+                             "invalid_top", "disk_error", "detach_failed", "interrupted"}:
+                raise ValueError()
+            if len(title) > 960 or not re.fullmatch(r"(?:[0-9a-f]{2})*", title):
+                raise ValueError()
+            title = bytes.fromhex(title).decode("utf-8")
+            if len(title) > 120:
+                raise ValueError()
+        except (ValueError, AdbError) as exc:
+            raise AdbError("设备 Top 状态无效，未执行任务操作", 502) from exc
+        return dict(self._empty(serial), id=identity, status=status,
+                    running=unconfirmed or status in {"starting", "running"}, count=count,
+                    target_count=target, interval=interval, bytes=size, title=title,
+                    connected=not unconfirmed, error=None if error == "none" else error,
+                    connection_error=("无法确认旧任务已停止；请重试停止或查询状态，未拉取日志。"
+                                      if unconfirmed else None),
+                    started_at=started_at, ended_at=ended_at, elapsed_seconds=elapsed_seconds,
+                    remote_cleaned=remote_cleaned,
+                    remote_path=None if remote_cleaned else f"{REMOTE_ROOT}/{identity}/raw.txt")
+
+    def _query(self, serial, deadline=None):
+        state = self._decode(serial, self._command(serial, "status", deadline=deadline))
+        old = self._states.get(serial, {})
+        if old.get("id") == state["id"] and state["id"]:
+            for key in ("archive", "session_id", "duplicate", "importing"):
+                state[key] = old[key]
+            if old["status"] in {"imported", "importing"}:
+                state["status"] = old["status"]
+        if state["id"]:
+            path = self.archive_root / (state["id"] + ".txt")
+            if (not state["running"] and path.is_file() and not path.is_symlink()
+                    and 0 < path.stat().st_size == state["bytes"] <= MAX_ARCHIVE_BYTES):
+                self._archives[state["id"]] = path
+                state["archive"] = "/api/top/archive?capture_id=" + state["id"]
+        if old.get("importing") and old.get("id") == state["id"]:
+            old.update(state)
+            state = old
+        self._states[serial] = state
+        # A new task (even on the same device) must not replace an import.
+        if not self._state["importing"] or self._state is state:
+            self._state = state
+            self._capture_error = state["error"]
+        return dict(state)
+
+    def status(self, serial=None):
         with self._lock:
-            return dict(self._state)
+            if serial is None:
+                return dict(self._state)
+            self._serial(serial)
+            try:
+                with self.adb.device(serial):
+                    return self._query(serial)
+            except AdbError as exc:
+                state = self._states.setdefault(serial, self._empty(serial))
+                state.update(connected=False, connection_error=str(exc))
+                if not self._state["importing"]:
+                    self._state = state
+                return dict(state)
 
     def _busy(self):
-        return (self._state["running"] or self._state["importing"]
-                or (self._thread is not None and self._thread.is_alive()))
+        return self._state["running"] or self._state["importing"]
 
     def start(self, serial, count=-1, interval=1, title=""):
+        self._serial(serial)
         if type(count) is not int or not (count == -1 or 1 <= count <= 100000):
             raise ValueError("采样次数必须为 -1 或 1 至 100000 的整数")
         if (isinstance(interval, bool) or not isinstance(interval, (int, float))
@@ -53,195 +198,138 @@ class TopCapture:
             raise ValueError("采样间隔必须为 1 至 3600 秒的有限数")
         if not isinstance(title, str) or len(title) > 120:
             raise ValueError("会话名称最多 120 个字符")
-        if not isinstance(serial, str):
-            raise ValueError("无效的设备序列号")
-        ready, startup_errors = threading.Event(), []
         with self._lock:
-            if self._closed:
-                raise AdbError("应用正在关闭", 503)
-            if self._busy():
-                raise AdbError("Top 任务运行、停止或导入中，请稍后重试", 409)
-            self._stop.clear()
-            self._capture_error = None
-            self._state.update(status="starting", running=True, stopping=False,
-                               importing=False, count=0, target_count=count,
-                               interval=interval, serial=serial, title=title.strip(),
-                               error=None, archive=None, id=uuid.uuid4().hex,
-                               session_id=None, duplicate=False, bytes=0)
-            self._thread = threading.Thread(target=self._capture,
-                                            args=(ready, startup_errors),
-                                            name="top-capture", daemon=False)
-            try:
-                self._thread.start()
-            except Exception as exc:
-                self._state.update(status="error", running=False, error=str(exc))
-                raise ValueError("无法启动 Top 采集线程") from exc
-        # Device validation errors are returned to the start caller, not hidden.
-        ready.wait()
-        if startup_errors:
-            raise startup_errors[0]
-        return self.status()
+            self._available()
+            with self.adb.device(serial):
+                state = self._query(serial)
+                if state["running"]:
+                    raise AdbError("设备 Top 任务尚未停止", 409)
+                identity = uuid.uuid4().hex
+                self._command(serial, "start", identity, count, format(interval, ".15f").rstrip("0").rstrip("."),
+                              title.strip().encode("utf-8").hex())
+                result = self._query(serial)
+                if result["id"] != identity or result["status"] in {"starting", "error"}:
+                    raise AdbError("设备独立采集启动失败，请刷新设备状态", 502)
+                return result
 
-    def stop(self):
+    def _available(self):
+        if self._closed:
+            raise AdbError("应用正在关闭", 503)
+        if self._state["importing"]:
+            raise AdbError("Top 导入中，请稍后重试", 409)
+
+    def _current(self, serial, capture_id):
+        state = self._query(serial)
+        if state["id"] != capture_id:
+            raise AdbError("Top 任务已切换，请刷新状态后重试", 409)
+        return state
+
+    def _stop_confirmed(self, serial, capture_id):
+        # Send the marker before status: a legacy recovery scan may itself fail.
+        # The device validates identity; never signal a guessed process/PID.
+        cached = self._states.get(serial)
+        if cached and cached.get("id") and cached["id"] != capture_id:
+            raise AdbError("Top 任务已切换，请刷新状态后重试", 409)
+        deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+        try:
+            self._command(serial, "stop", capture_id, deadline=deadline)
+            while True:
+                state = self._query(serial, deadline=deadline)
+                if state["id"] != capture_id:
+                    raise AdbError("Top 任务已切换，请刷新状态后重试", 409)
+                if not state["running"]:
+                    return state
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AdbError("停止确认超时；任务可能仍在运行，请查询状态或重试停止。未拉取日志。", 504)
+                time.sleep(min(STOP_POLL_SECONDS, remaining))
+        except AdbError as exc:
+            cached = self._states.get(serial)
+            if cached and cached["id"] == capture_id:
+                cached.update(stopping=False, connected=False,
+                              connection_error="停止未确认，可重试停止或查询状态：" + str(exc))
+                if cached["status"] == "stopping":
+                    cached["status"] = "running"
+            raise
+
+    def stop(self, serial, capture_id):
+        self._serial(serial)
+        self._identity(capture_id)
         with self._lock:
-            if self._state["running"]:
-                self._stop.set()
-                self._state.update(status="stopping", stopping=True)
-            return dict(self._state)
+            self._available()
+            with self.adb.device(serial):
+                return self._stop_confirmed(serial, capture_id)
+
+    def clear(self, serial, capture_id):
+        self._serial(serial)
+        self._identity(capture_id)
+        with self._lock:
+            self._available()
+            with self.adb.device(serial):
+                state = self._current(serial, capture_id)
+                if state["running"] or state["stopping"]:
+                    raise AdbError("请先停止 Top 采集并等待结束，再清理设备日志", 409)
+                self._command(serial, "clear", capture_id)
+                return self._query(serial)
+
+    def pull(self, serial, capture_id):
+        self._serial(serial)
+        self._identity(capture_id)
+        with self._lock:
+            self._available()
+            with self.adb.device(serial):
+                state = self._stop_confirmed(serial, capture_id)
+                if state["remote_cleaned"]:
+                    raise AdbError("设备 Top 日志已清理，本地已拉取的归档不受影响", 409)
+                if state["bytes"] == 0:
+                    raise AdbError("设备没有完整的 Top 样本", 404)
+                self.archive_root.mkdir(parents=True, exist_ok=True)
+                path = self.archive_root / (capture_id + ".txt")
+                if path.exists() or path.is_symlink():
+                    if (capture_id not in self._archives or path.is_symlink()
+                            or not path.is_file() or path.stat().st_size != state["bytes"]):
+                        raise AdbError("本地归档目标已存在，拒绝覆盖", 409)
+                    return dict(self._state)
+                # Anonymous staging is never exposed through the archive API.
+                with tempfile.TemporaryFile(dir=self.archive_root) as staging:
+                    self._command(serial, "pull", capture_id, output=staging)
+                    size = staging.tell()
+                    if size > MAX_ARCHIVE_BYTES:
+                        raise AdbError("Top 原始归档超过 1GB（1000000000 字节）", 413)
+                    after = self._current(serial, capture_id)
+                    if (after["running"] or after["remote_cleaned"] or size != state["bytes"]
+                            or size != after["bytes"]):
+                        raise AdbError("设备归档长度或状态变化，未发布本地文件", 502)
+                    staging.flush()
+                    os.fsync(staging.fileno())
+                    staging.seek(0)
+                    # Hard-link publication is atomic and never overwrites a success.
+                    pending = self.archive_root / (capture_id + "." + uuid.uuid4().hex + ".part")
+                    created = False
+                    try:
+                        with pending.open("xb") as output:
+                            created = True
+                            for block in iter(lambda: staging.read(CHUNK_BYTES), b""):
+                                self._write_all(output, block)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        try:
+                            os.link(pending, path)
+                        except FileExistsError as exc:
+                            raise AdbError("本地归档目标已存在，拒绝覆盖", 409) from exc
+                    finally:
+                        # Only this operation's private staging file is removed.
+                        if created:
+                            pending.unlink(missing_ok=True)
+                self._archives[capture_id] = path
+                self._state["archive"] = "/api/top/archive?capture_id=" + capture_id
+                return dict(self._state)
 
     def close(self):
+        # Device jobs deliberately survive local service shutdown.
         with self._lock:
             self._closed = True
-            self._stop.set()
-            if self._state["running"]:
-                self._state.update(status="stopping", stopping=True)
-            thread = self._thread
-        if thread is not None and thread.ident is not None:
-            thread.join()
         self._import_done.wait()
-
-    def _sample(self, serial, output):
-        """Bound both stdout and stderr, including when adb stalls mid-line."""
-        if not self.adb.executable:
-            raise AdbError("未找到 adb，请安装 Android platform-tools", 503)
-        command = [self.adb.executable, "-s", serial, "shell", "-T",
-                   "top", "-b", "-n", "1", "-d", "1"]
-        expired = threading.Event()
-        try:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       shell=False)
-        except OSError as exc:
-            raise AdbError("无法执行 ADB，请检查安装及本机文件权限", 503) from exc
-
-        def timeout():
-            if process.poll() is None:
-                expired.set()
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-
-        timer = threading.Timer(TOP_TIMEOUT, timeout)
-        size = 0
-        try:
-            timer.start()
-            while True:
-                block = process.stdout.read1(CHUNK_BYTES)
-                if not block:
-                    break
-                size += len(block)
-                if size > MAX_SAMPLE_BYTES:
-                    raise ValueError("单次 Top 输出超过 16 MiB，已停止；已有样本保留")
-                output.write(block)
-            process.wait()
-            if expired.is_set():
-                raise AdbError("Top 采集超时（10 秒）；已有样本保留", 504)
-            if process.returncode:
-                output.seek(0)
-                message = output.read(600).decode("utf-8", "replace").strip()
-                raise AdbError("Top 执行失败：" + (message or "请检查设备连接与 top 支持"), 502)
-            output.seek(0)
-            if not self._valid_top(output):
-                raise ValueError("Top 输出为空或不是有效进程列表；已有样本保留")
-            output.seek(0)
-            return size
-        finally:
-            timer.cancel()
-            if timer.ident is not None:
-                timer.join()
-            if process.poll() is None:
-                process.kill()
-            process.wait()
-            process.stdout.close()
-
-    @staticmethod
-    def _valid_top(output):
-        columns = None
-        while True:
-            line = output.readline(CHUNK_BYTES)
-            if not line:
-                return False
-            text = line.decode("utf-8", "replace")
-            fields = text.split()
-            upper = top_header_fields(text)
-            if upper:
-                columns = None
-                if (any(item in upper for item in ("%CPU", "CPU%"))
-                        and any(item in upper for item in ("ARGS", "CMD", "COMMAND", "NAME"))):
-                    cpu_column = next(i for i, name in enumerate(upper) if name in ("%CPU", "CPU%"))
-                    columns = upper.index("PID"), cpu_column, len(upper)
-            elif columns is not None:
-                pid_column, cpu_column, width = columns
-                if len(fields) < width or not fields[pid_column].isdigit():
-                    continue
-                try:
-                    cpu = float(fields[cpu_column].rstrip("%"))
-                except ValueError:
-                    continue
-                if math.isfinite(cpu) and cpu >= 0:
-                    return True
-
-    def _capture(self, ready, startup_errors):
-        """Own the device lock until the archive is closed, including on errors."""
-        state = self.status()
-        path = self.archive_root / (state["id"] + ".txt")
-        error = None
-        try:
-            with self.adb.device(state["serial"]):
-                self.archive_root.mkdir(parents=True, exist_ok=True)
-                with path.open("x+b", buffering=0) as archive:
-                    with self._lock:
-                        if not self._stop.is_set():
-                            self._state["status"] = "running"
-                    ready.set()
-                    count, size = 0, 0
-                    while not self._stop.is_set():
-                        started = time.monotonic()
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        with tempfile.TemporaryFile(mode="w+b") as sample:
-                            sample_size = self._sample(state["serial"], sample)
-                            header = (f"========== Top 采集 #{count + 1} 时间: "
-                                      f"{timestamp} ==========\n").encode("utf-8")
-                            added = len(header) + sample_size + 2
-                            if size + added > MAX_ARCHIVE_BYTES:
-                                raise AdbError("Top 归档超过 1 GiB，已停止；已有样本保留", 413)
-                            try:
-                                self._write_all(archive, header)
-                                sample.seek(0)
-                                for block in iter(lambda: sample.read(CHUNK_BYTES), b""):
-                                    self._write_all(archive, block)
-                                self._write_all(archive, b"\n\n")
-                                archive.flush()
-                                os.fsync(archive.fileno())
-                            except Exception:
-                                # A failed write must not leave half a sample after good ones.
-                                archive.seek(size)
-                                archive.truncate()
-                                os.fsync(archive.fileno())
-                                raise
-                        count += 1
-                        size += added
-                        with self._lock:
-                            self._state.update(count=count, bytes=size)
-                        if state["target_count"] != -1 and count >= state["target_count"]:
-                            break
-                        self._stop.wait(max(0, state["interval"] - (time.monotonic() - started)))
-        except Exception as exc:
-            if isinstance(exc, OSError):
-                exc = AdbError("本地 Top 归档写入失败，请检查磁盘空间与权限；已有样本保留", 503)
-            error = str(exc)
-            if not ready.is_set():
-                startup_errors.append(exc)
-        finally:
-            with self._lock:
-                self._capture_error = error
-                if self._state["count"]:
-                    self._archives[state["id"]] = path
-                    self._state["archive"] = "/api/top/archive?capture_id=" + state["id"]
-                self._state.update(status="error" if error else "stopped" if self._stop.is_set()
-                                   else "completed", running=False, stopping=False, error=error)
-            ready.set()
 
     @staticmethod
     def _write_all(stream, data):
@@ -253,24 +341,25 @@ class TopCapture:
             remaining = remaining[written:]
 
     def archive_path(self, capture_id=None):
-        """Resolve a completed immutable archive, never a caller-supplied path."""
         with self._lock:
             return self._archive_path_locked(capture_id)
 
     def _archive_path_locked(self, capture_id=None):
         capture_id = self._state["id"] if capture_id is None else capture_id
+        if capture_id is not None:
+            self._identity(capture_id)
         if capture_id == self._state["id"] and self._state["running"]:
-            raise AdbError("Top 采集尚未结束，请停止后下载或导入", 409)
+            raise AdbError("Top 采集尚未结束，请停止后拉取", 409)
         path = self._archives.get(capture_id)
-        if path is None or not path.is_file():
-            raise AdbError("没有可用的已完成 Top 归档", 404)
+        if (path is None or path.is_symlink() or not path.is_file()
+                or path.resolve().parent != self.archive_root
+                or not 0 < path.stat().st_size <= MAX_ARCHIVE_BYTES):
+            raise AdbError("没有可用的本地 Top 归档，请先显式拉取", 404)
         return path
 
     def import_capture(self, capture_id=None):
-        """Explicit synchronous import; reserve both locks before opening the file."""
         with self._lock:
-            if self._closed:
-                raise AdbError("应用正在关闭", 503)
+            self._available()
             if self._busy():
                 raise AdbError("Top 任务运行、停止或导入中，请稍后重试", 409)
             if capture_id is not None and capture_id != self._state["id"]:
@@ -281,6 +370,7 @@ class TopCapture:
             if not self.import_lock.acquire(blocking=False):
                 raise AdbError("已有导入正在进行，请稍后重试", 409)
             title = self._state["title"]
+            serial = self._state["serial"]
             self._import_done.clear()
             self._state.update(importing=True, status="importing", error=self._capture_error)
         try:
@@ -294,14 +384,13 @@ class TopCapture:
             if isinstance(exc, OSError):
                 exc = AdbError("本地 Top 归档读取失败，请检查磁盘与权限后重试", 503)
             with self._lock:
-                message = "导入失败，可重试：" + str(exc)
-                if self._capture_error:
-                    message = self._capture_error + "；" + message
-                self._state.update(status="error", error=message)
+                self._state.update(status="error", error="导入失败，可重试：" + str(exc))
             raise exc
         finally:
             with self._lock:
                 self.import_lock.release()
                 self._state["importing"] = False
+                cached = self._states.get(serial)
+                if cached is None or cached["id"] == self._state["id"]:
+                    self._states[serial] = self._state
                 self._import_done.set()
-

@@ -134,6 +134,11 @@ class TopImportRequest(TopConfirmRequest):
     capture_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
+class TopTaskRequest(TopConfirmRequest):
+    serial: str = Field(min_length=1, max_length=200)
+    capture_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class TopStartRequest(TopConfirmRequest):
     serial: str = Field(min_length=1, max_length=200)
     count: int = Field(default=-1, ge=-1, le=100000, strict=True)
@@ -214,8 +219,8 @@ def create_app(database, port=8765, development=False, frontend=None):
     app.state.top = top
 
     @app.get("/api/top/status")
-    def top_status():
-        return top.status()
+    def top_status(serial: Optional[str] = Query(None, min_length=1, max_length=200)):
+        return top.status(serial)
 
     @app.post("/api/top/start")
     def top_start(body: TopStartRequest):
@@ -225,11 +230,24 @@ def create_app(database, port=8765, development=False, frontend=None):
             raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/top/stop")
-    def top_stop(body: TopConfirmRequest):
+    def top_stop(body: TopTaskRequest):
         try:
-            return top.stop()
+            return top.stop(body.serial, body.capture_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/top/pull")
+    def top_pull(body: TopTaskRequest):
+        try:
+            return top.pull(body.serial, body.capture_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(503, "本地归档写入失败，未覆盖已有归档") from exc
+
+    @app.post("/api/top/clear")
+    def top_clear(body: TopTaskRequest):
+        return top.clear(body.serial, body.capture_id)
 
     @app.post("/api/top/import")
     def top_import(body: TopImportRequest):
@@ -383,8 +401,13 @@ def create_app(database, port=8765, development=False, frontend=None):
 
     @app.get("/api/sessions/{session_id}/report/stream")
     async def report_stream(session_id: str):
-        return analysis_stream(lambda **callbacks: render_report(store, session_id, **callbacks),
-                               report_slots, "性能分析")
+        def prepare_report(**callbacks):
+            # Keep HTML out of NDJSON: long reports can exceed browser string limits.
+            # The authenticated download endpoint reuses the completed disk cache.
+            render_report(store, session_id, **callbacks)
+            return f"/api/sessions/{session_id}/report"
+
+        return analysis_stream(prepare_report, report_slots, "性能分析")
 
     @app.get("/api/sessions")
     def sessions():
