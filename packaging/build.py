@@ -14,7 +14,7 @@ from macos_compat import MACOS_MIN_VERSION, verify_macos_binaries
 from node_runtime import official_node_files, verify_skill
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 
 def run(*args):

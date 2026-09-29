@@ -51,8 +51,8 @@ class AdmissionJobsTests(unittest.TestCase):
     def build(self, store, session, template, directory, scenes, factor):
         self.assertIs(store, self.store)
         self.assertEqual(template, "template")
-        directory.joinpath("report.md").write_text("report", encoding="utf-8")
-        return {"markdown": "report", "html": "<p>safe</p>", "warnings": ["统计提示"]}
+        directory.joinpath("report.md").write_text("safe report", encoding="utf-8")
+        return {"markdown": "safe report", "html": "<p>untrusted alternate preview</p>", "warnings": ["统计提示"]}
 
     def create(self, draft=D, session=S, manager=None):
         return (manager or self.manager).create(session, draft, "报告", {1: "unknown"}, None)
@@ -76,6 +76,84 @@ class AdmissionJobsTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, status)
         self.assertNotIn("SECRET", str(caught.exception))
 
+    def test_artifact_sync_requires_writable_handle_and_fails_closed(self):
+        original_open = Path.open
+        original_sync = jobs.os.fsync
+        for fail_sync, draft in ((False, D), (True, D2)):
+            with self.subTest(fail_sync=fail_sync):
+                streams = []
+                synced = []
+
+                def tracked_open(path, *args, **kwargs):
+                    stream = original_open(path, *args, **kwargs)
+                    if path.resolve() == (self.root / draft / "report.md").resolve():
+                        streams.append(stream)
+                    return stream
+
+                def windows_sync(fd):
+                    for stream in streams:
+                        if not stream.closed and stream.fileno() == fd:
+                            synced.append(stream.writable())
+                            if not stream.writable() or fail_sync:
+                                raise OSError("artifact flush rejected")
+                    return original_sync(fd)
+
+                with patch.object(Path, "open", tracked_open), patch.object(jobs.os, "fsync", windows_sync):
+                    self.create(draft)
+                    value = self.wait(draft, state="failed" if fail_sync else "ready")
+                self.assertEqual(synced, [True])
+                self.assertEqual((self.root / draft / "report.md").read_text(encoding="utf-8"), "safe report")
+                if fail_sync:
+                    self.assertIn("草稿生成失败", value["error"])
+                    self.error(409, self.publish, draft)
+        self.publisher.assert_not_called()
+
+    def test_body_hash_blocks_changed_and_legacy_drafts(self):
+        self.create()
+        self.wait()
+        preview = self.manager.preview(S, D)
+        self.assertIn("safe report", preview)
+        self.assertNotIn("untrusted alternate preview", preview)
+        path = self.root / D / "report.md"
+        for content in ("changed", "![image](remote)", " "):
+            path.write_text(content, encoding="utf-8")
+            self.error(409, self.manager.preview, S, D)
+            self.error(409, self.publish)
+        path.write_text("safe report", encoding="utf-8")
+        with self.manager._mutex:
+            record = dict(self.manager._records[D])
+            record.pop("source_sha256")
+            self.manager._persist(record)
+            self.manager._records[D] = record
+        self.manager.close()
+        manager = self.open()
+        self.error(409, manager.preview, S, D)
+        self.error(409, self.publish, D, manager)
+        self.publisher.assert_not_called()
+
+    def test_worker_rechecks_body_and_passes_expected_hash(self):
+        self.create()
+        self.wait()
+        digest = self.manager._records[D]["source_sha256"]
+        self.publish()
+        self.wait(state="published")
+        self.assertEqual(self.publisher.call_args.kwargs, {"expected_sha256": digest})
+        self.create(D2)
+        self.wait(D2)
+        record = dict(self.manager._records[D2], state="publishing",
+                      publish_request={"placement": "personal", "parent_page": None})
+        (self.root / D2 / "report.md").write_text("changed in queue", encoding="utf-8")
+        self.publisher.reset_mock()
+        self.manager._publish(record)
+        self.assertEqual(self.manager.get(S, D2)["state"], "unknown")
+        self.publisher.assert_not_called()
+
+    def test_preview_never_allows_data_images(self):
+        source = '<p>text</p><img src="data:image/png;base64,iVBORw0KGgo=">'
+        preview = jobs._preview(source)
+        self.assertNotIn("<img", preview)
+        self.assertIn("img-src 'none'", preview)
+
     def test_concurrent_create_and_configuration_conflicts(self):
         gate = self.gate()
         original = self.build
@@ -97,7 +175,7 @@ class AdmissionJobsTests(unittest.TestCase):
         self.create()
         self.wait()
         gate, entered = self.gate(), self.gate()
-        def remote(*args):
+        def remote(*args, **kwargs):
             entered.set()
             gate.wait(5)
             return {"pageId": "Verified"}
@@ -136,7 +214,7 @@ class AdmissionJobsTests(unittest.TestCase):
         self.wait()
         self.wait(D2)
         gate = self.gate()
-        self.publisher.side_effect = lambda *a: (gate.wait(5), {"pageId": "P"})[1]
+        self.publisher.side_effect = lambda *a, **kw: (gate.wait(5), {"pageId": "P"})[1]
         self.publish()
         self.error(409, self.create, "d" * 32)
         self.error(409, self.publish, D2)
@@ -185,7 +263,7 @@ class AdmissionJobsTests(unittest.TestCase):
         self.create()
         self.wait()
         entered, gate = self.gate(), self.gate()
-        self.publisher.side_effect = lambda *a: (entered.set(), gate.wait(5), {"pageId": "P"})[2]
+        self.publisher.side_effect = lambda *a, **kw: (entered.set(), gate.wait(5), {"pageId": "P"})[2]
         self.publish()
         self.assertTrue(entered.wait(3))
         thread = threading.Thread(target=self.manager.close)
@@ -262,6 +340,9 @@ class AdmissionJobsTests(unittest.TestCase):
                             '<p>https://example.invalid/report?a=1&amp;b=2</p>'
                             '<img src="file:///private/a"><a href="javascript:bad()">text</a>'
                             '<svg onload="bad()"></svg><iframe src="https://evil"></iframe>')
+            args[3].joinpath("report.md").write_text(
+                'safe /Users/private/a\n/system/bin/surfaceflinger /vendor/bin/hw/service\n'
+                'https://example.invalid/report?a=1&b=2', encoding="utf-8")
             data["warnings"] = ["文件 /Users/private/a"]
             return data
         self.builder.side_effect = build
@@ -293,7 +374,7 @@ class AdmissionJobsTests(unittest.TestCase):
     def test_post_remote_commit_failure_stays_unknown_after_restart(self):
         self.create()
         self.wait()
-        def remote(*args):
+        def remote(*args, **kwargs):
             self.manager._db.execute("PRAGMA query_only=ON")
             return {"pageId": "AlreadyCreated"}
         self.publisher.side_effect = remote
@@ -308,7 +389,7 @@ class AdmissionJobsTests(unittest.TestCase):
     def test_remote_observes_committed_publishing_record(self):
         self.create()
         self.wait()
-        def remote(*args):
+        def remote(*args, **kwargs):
             db = sqlite3.connect(self.root / "admission.sqlite3")
             try:
                 row = db.execute("SELECT data FROM drafts WHERE id=?", (D,)).fetchone()

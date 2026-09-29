@@ -288,9 +288,19 @@ class NodeRuntimePackagingTests(unittest.TestCase):
                 if system != "Windows":
                     audit = "node:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)" if system == "Darwin" else "libc.so.6 => /lib/libc.so.6 (0x123)"
                     results.insert(0, subprocess.CompletedProcess([], 0, stdout=audit))
+                def execute(command, **kwargs):
+                    if command[-1].endswith("core-smoke.js"):
+                        script = Path(command[-1])
+                        self.assertEqual(script.suffix, ".js")
+                        self.assertEqual(script.read_text(encoding="utf-8"), node_runtime.CORE_SMOKE)
+                        self.assertEqual((script.parent / "package.json").read_text(encoding="utf-8"), "{}")
+                        self.assertEqual(script.parent.parent, root.resolve())
+                        self.assertEqual(command, [str(node.resolve()), str(script)])
+                    return results.pop(0)
+
                 with patch.object(node_runtime.platform, "machine", return_value="x86_64"), \
                         patch.dict(node_runtime.os.environ, {"NODE_OPTIONS": "--require=bad", "PATH": "/bad", "SECRET": "unused", "LD_PRELOAD": "bad"}), \
-                        patch.object(node_runtime.subprocess, "run", side_effect=results) as run:
+                        patch.object(node_runtime.subprocess, "run", side_effect=execute) as run:
                     self.assertEqual(node_runtime.verify_node(node, license_path, system, root, True), info)
                 for call in run.call_args_list:
                     self.assertEqual(call.kwargs["env"]["PATH"], "")
@@ -298,7 +308,38 @@ class NodeRuntimePackagingTests(unittest.TestCase):
                     for key in ("NODE_OPTIONS", "SECRET", "LD_PRELOAD"):
                         self.assertNotIn(key, call.kwargs["env"])
                     self.assertEqual(call.kwargs["timeout"], 20)
-                self.assertEqual(run.call_args.args[0], [str(node.resolve()), "-e", node_runtime.CORE_SMOKE])
+                script = Path(run.call_args.args[0][-1])
+                self.assertEqual(script.name, "core-smoke.js")
+                self.assertFalse(script.parent.exists())
+
+    def test_core_smoke_errors_include_diagnostics_and_fail_closed(self):
+        import json
+        failures = (
+            subprocess.CalledProcessError(1, ["node"], output="probe output", stderr="SyntaxError: module failed"),
+            subprocess.TimeoutExpired(["node"], 20, output=b"probe output", stderr=b"module stalled"),
+            subprocess.CompletedProcess([], 0, stdout="wrong marker", stderr="module warning"),
+        )
+        for failure, detail in zip(failures, ("SyntaxError: module failed", "module stalled", "wrong marker")):
+            with self.subTest(detail=detail), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                node = root / "node.exe"
+                node.write_bytes(b"mock-node")
+                license_path = root / "LICENSE"
+                license_path.write_text("Node.js\nPermission is hereby granted, free of charge", encoding="utf-8")
+                info = dict(version="v24.14.0", platform="win32", arch="x64")
+                results = [subprocess.CompletedProcess([], 0, stdout=json.dumps(info)), failure]
+                with patch.object(node_runtime.platform, "machine", return_value="x86_64"), \
+                        patch.object(node_runtime.subprocess, "run", side_effect=results) as run:
+                    with self.assertRaises(RuntimeError) as raised:
+                        node_runtime.verify_node(node, license_path, "Windows", root, True)
+                message = str(raised.exception)
+                self.assertIn("Node core smoke", message)
+                self.assertIn(detail, message)
+                self.assertIn("v24.14.0", message)
+                self.assertIn(str(node.resolve()), message)
+                script = Path(run.call_args.args[0][-1])
+                self.assertEqual(script.name, "core-smoke.js")
+                self.assertFalse(script.parent.exists())
 
     def test_verifier_checks_runtime_before_server_smoke(self):
         spec = importlib.util.spec_from_file_location(

@@ -39,7 +39,7 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertIs(store, self.store.return_value)
         self.assertEqual(template, "mock template")
         self.assertEqual(session, S)
-        directory.joinpath("report.md").write_text("mock report", encoding="utf-8")
+        directory.joinpath("report.md").write_text("mock preview", encoding="utf-8")
         return {"html": "<p>mock preview</p><script>bad()</script>", "warnings": []}
 
     def open(self, name="business.sqlite3", lifespan=True):

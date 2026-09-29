@@ -3,6 +3,8 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { blocksToMarkdown } from "../../joyspace-read-doc/scripts/read_joyspace_doc.js";
 
 const DEFAULT_JOYSPACE_API_BASE = "https://apijoyspace.jd.com";
 const DEFAULT_COLOR_GATEWAY_BASE = "https://api.m.jd.com";
@@ -407,14 +409,112 @@ async function createJoySpacePage({ markdown, title, location, cookieHeader, tea
   });
 }
 
-async function verifyJoySpacePage({ pageId, cookieHeader, teamHeaderId }) {
-  return requestJoySpaceJson({
-    method: "POST",
-    url: "/v1/pages/content",
-    cookieHeader,
-    teamHeaderId,
-    body: { pageId },
+export function assertImageFree(markdown) {
+  if (!markdown.trim() || /!\[|<\s*(?:img|picture|svg|image)\b/i.test(markdown)) {
+    throw new Error("Image-free report required; regenerate and review before publishing");
+  }
+}
+
+// Compare visible text and table cell boundaries, not Markdown formatting bytes.
+// Fail closed for unsupported round trips rather than accept partial content.
+function normalizedText(markdown, inline = false) {
+  return markdown.replace(/\r\n?/g, "\n").split("\n")
+    .filter(line => inline || (!/^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(line)
+      && !/^\s*(?:---+|\*\*\*+)\s*$/.test(line)))
+    .map(line => inline ? line : line.replace(/^\s*(?:#{1,6}\s+|[-+*]\s+|\d+\.\s+|>\s*)/, ""))
+    .join("\n")
+    .replace(/<br\s*\/?\s*>/gi, " ")
+    .replace(/<\/?u>/gi, "")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&(?:nbsp|amp|lt|gt|quot|apos);/g, entity => ({
+      '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'",
+    })[entity])
+    .replace(/(?<!\\)(\*\*|~~|`)(?=\S)([^\n]+?\S|\S)\1/g, "$2")
+    .replace(/(?<![\\*])\*([^*\n]+)\*(?!\*)/g, "$1")
+    .replace(/\\([\\`*{}\[\]()#+\-.!|_>])/g, "$1")
+    .split("\n").map(line => line.replace(/[\t ]+/g, " ").trim())
+    .filter(Boolean).join("\n");
+}
+
+// Split before unescaping or decoding entities: literal pipes stay inside cells.
+function tableCells(line) {
+  const cells = [];
+  let cell = "";
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "\\" && index + 1 < line.length) {
+      cell += char + line[++index];
+    } else if (char === "|") {
+      cells.push(cell); cell = "";
+    } else cell += char;
+  }
+  if (!cells.length) return null;
+  cells.push(cell);
+  if (!cells[0].trim()) cells.shift();
+  if (!cells.at(-1).trim()) cells.pop();
+  return cells;
+}
+
+function normalizedBody(markdown) {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  const separator = cells => cells?.length && cells.every(cell => /^\s*:?-{3,}:?\s*$/.test(cell));
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = tableCells(lines[index]);
+    const divider = tableCells(lines[index + 1] || "");
+    if (header && separator(divider)) {
+      if (header.length !== divider.length) throw new Error("Invalid report table");
+      const rows = [header.map(cell => normalizedText(cell, true))];
+      index += 1;
+      while (index + 1 < lines.length) {
+        const cells = tableCells(lines[index + 1]);
+        if (!cells) break;
+        if (cells.length !== header.length) throw new Error("Invalid report table width");
+        rows.push(cells.map(cell => normalizedText(cell, true)));
+        index += 1;
+      }
+      blocks.push(["table", rows]);
+    } else {
+      const text = normalizedText(lines[index]);
+      if (text) blocks.push(["text", text]);
+    }
+  }
+  return blocks.length ? JSON.stringify(blocks) : "";
+}
+
+export async function verifyJoySpacePage({ pageId, title, markdown, scratchPageId,
+                                         imageFree = false, cookieHeader, teamHeaderId }) {
+  if (typeof pageId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(pageId)
+      || pageId === scratchPageId) throw new Error("Invalid formal page ID");
+  const basic = await requestJoySpaceJson({
+    method: "GET", url: `/v3/pages/${pageId}/basic?sendRecent=0`, cookieHeader, teamHeaderId,
   });
+  if (basic?.title !== title || /^\[hermes-upload-scratch\]/i.test(basic.title)) {
+    throw new Error("Published page title mismatch");
+  }
+  const result = await requestJoySpaceJson({
+    method: "POST", url: "/v1/pages/content", cookieHeader, teamHeaderId, body: { pageId },
+  });
+  if (!Array.isArray(result?.content) || !result.content.length) {
+    throw new Error("Published page content missing");
+  }
+  if (imageFree) {
+    const inspect = node => {
+      if (!node || typeof node !== "object") return;
+      if (/^(?:img|image|picture|svg|diagram)$/i.test(node.type || "")) {
+        throw new Error("Published page contains images");
+      }
+      for (const value of Object.values(node)) inspect(value);
+    };
+    inspect(result.content);
+  }
+  const actual = blocksToMarkdown(result.content);
+  if (imageFree) assertImageFree(actual);
+  const expected = normalizedBody(markdown);
+  if (!expected || normalizedBody(actual) !== expected) {
+    throw new Error("Published page content mismatch");
+  }
+  return { title: basic.title, sourceSha256: createHash("sha256").update(markdown).digest("hex") };
 }
 
 function parseArgs(argv) {
@@ -469,6 +569,13 @@ function parseArgs(argv) {
         break;
       case "--config":
         options.configPath = next || options.configPath;
+        index += 1;
+        break;
+      case "--image-free":
+        options.imageFree = true;
+        break;
+      case "--source-sha256":
+        options.sourceSha256 = next || "";
         index += 1;
         break;
       case "--skip-image-upload":
@@ -654,12 +761,16 @@ async function main() {
   }
 
   const rawMarkdown = await fs.readFile(options.filePath, "utf8");
+  if (options.imageFree) assertImageFree(rawMarkdown);
+  if (options.sourceSha256 && createHash("sha256").update(rawMarkdown).digest("hex") !== options.sourceSha256) {
+    throw new Error("Report changed after review");
+  }
   const auth = await resolveAuth(options);
   const { teamHeaderId } = requireTenantConfig(options.tenantCode);
   const cookieHeader = buildCookieHeader(auth);
 
   // Pre-process: upload local image references and rewrite markdown.
-  const skipUpload = options.skipImageUpload;
+  const skipUpload = options.skipImageUpload || options.imageFree;
   const { markdown, imageReport } = skipUpload
     ? { markdown: rawMarkdown, imageReport: { skipped: true } }
     : await preprocessLocalImages({
@@ -684,8 +795,12 @@ async function main() {
     cookieHeader,
     teamHeaderId,
   });
-  const verified = await verifyJoySpacePage({
+  const verification = await verifyJoySpacePage({
     pageId: created.id,
+    title,
+    markdown,
+    scratchPageId: imageReport.scratchPageIdUsed,
+    imageFree: options.imageFree,
     cookieHeader,
     teamHeaderId,
   });
@@ -695,13 +810,15 @@ async function main() {
       {
         authMode: auth.mode,
         pageId: created.id,
-        title: created.title || title,
+        title: verification.title,
         link: created.link || `https://joyspace.jd.com/pages/${created.id}`,
         teamId: created.team_id || location.teamId,
         folderId: created.folder_id || location.folderId || "",
         parentPageId: location.categoryId || "",
         locationSource: location.source,
-        verified: Array.isArray(verified?.content) && verified.content.length > 0,
+        verified: true,
+        sourceSha256: verification.sourceSha256,
+        imageFree: options.imageFree === true,
         images: imageReport,
       },
       null,

@@ -1,7 +1,6 @@
 """Durable, bounded admission jobs independent of the business store."""
 from __future__ import annotations
 
-import base64
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import html
@@ -14,8 +13,8 @@ import re
 import sqlite3
 import threading
 
-from perf_admission import build_admission
-from perf_joyspace import PUBLISH_UNKNOWN, _page_id, publish_markdown, read_template
+from perf_admission import build_admission, _preview as render_report
+from perf_joyspace import PUBLISH_UNKNOWN, _page_id, publish_markdown, read_template, report_snapshot
 
 
 # Shared across every manager in this interpreter, including different roots.
@@ -64,15 +63,6 @@ class _Preview(HTMLParser):
             self.blocked.append(tag)
         elif tag in self.TAGS:
             self.parts.append("<" + tag + ">")
-        elif tag == "img":
-            src = dict(attrs).get("src", "")
-            if re.fullmatch(r"data:image/png;base64,[A-Za-z0-9+/=]+", src):
-                try:
-                    data = base64.b64decode(src.split(",", 1)[1], validate=True)
-                    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-                        self.parts.append('<img alt="Performance trend" src="' + src + '">')
-                except ValueError:
-                    pass
 
     def handle_endtag(self, tag):
         if self.blocked:
@@ -97,11 +87,11 @@ def _preview(source):
     parser.close()
     return ('<!doctype html><html><head><meta charset="utf-8">'
             '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-            'script-src \'none\'; img-src data:; style-src \'unsafe-inline\'; '
+            'script-src \'none\'; img-src \'none\'; style-src \'unsafe-inline\'; '
             'base-uri \'none\'; form-action \'none\'">'
             '<style>body{font:14px sans-serif;overflow-wrap:anywhere}'
             'table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px}'
-            'img{max-width:100%}</style></head><body>'
+            '</style></head><body>'
             + "".join(parser.parts) + '</body></html>')
 
 
@@ -313,7 +303,8 @@ class AdmissionJobs:
             directory.mkdir(exist_ok=True)
             result = build_admission(self._store, record["session_id"], read_template(), directory,
                                      dict(record["config"]["scenes"]), record["config"]["factor"])
-            record["preview"] = _preview(result["html"])
+            markdown, record["source_sha256"] = report_snapshot(directory / "report.md")
+            record["preview"] = _preview(render_report(markdown))
             record["warnings"] = [_text(w) for w in result["warnings"]]
             # Flush every generated artifact before committing the ready state.
             if not (directory / "report.md").is_file():
@@ -321,7 +312,8 @@ class AdmissionJobs:
             for path in directory.iterdir():
                 if path.is_symlink() or not path.is_file():
                     raise ValueError("unsafe artifact")
-                with path.open("rb") as stream:
+                # Windows FlushFileBuffers needs a writable handle; never truncate.
+                with path.open("r+b") as stream:
                     os.fsync(stream.fileno())
             _sync_directory(directory)
             _sync_directory(self._root)
@@ -330,6 +322,18 @@ class AdmissionJobs:
             record.update(state="failed", error="草稿生成失败，请检查会话、场景配置及模板；此草稿不可重试。")
         self._finish(record)
 
+    def _checked_markdown(self, record):
+        try:
+            path = self._directory(record) / "report.md"
+            if path.is_symlink():
+                raise ValueError("unsafe report")
+            markdown, digest = report_snapshot(path)
+            if digest != record.get("source_sha256"):
+                raise ValueError("changed or legacy report")
+            return markdown
+        except Exception:
+            raise AdmissionJobError("草稿内容已变化或版本过旧，请重新生成并完整预览后再发布。", 409) from None
+
     def preview(self, session_id, draft_id):
         session_id, draft_id = _id(session_id), _id(draft_id)
         with self._mutex:
@@ -337,7 +341,7 @@ class AdmissionJobs:
             record = self._find(session_id, draft_id)
             if "preview" not in record:
                 raise AdmissionJobError("草稿预览尚不可用。", 409)
-            return _preview(record["preview"])
+            return _preview(render_report(self._checked_markdown(record)))
 
     def publish(self, session_id, draft_id, placement, parent_page, confirmed):
         session_id, draft_id = _id(session_id), _id(draft_id)
@@ -365,6 +369,7 @@ class AdmissionJobs:
             self._unblocked(session_id)
             if record["state"] != "ready":
                 raise AdmissionJobError("仅可发布已就绪且从未发布的草稿。", 409)
+            self._checked_markdown(record)
             record = deepcopy(record)
             record.update(state="publishing", publish_request=request)
             return self._enqueue(record, self._publish)
@@ -376,8 +381,10 @@ class AdmissionJobs:
                 if self._broken:
                     raise AdmissionJobError("journal unavailable", 503)
             request = record["publish_request"]
+            self._checked_markdown(record)
             result = publish_markdown(self._directory(record) / "report.md", record["title"],
-                                      request["placement"], request["parent_page"])
+                                      request["placement"], request["parent_page"],
+                                      expected_sha256=record["source_sha256"])
             page = result["pageId"]
             if not isinstance(page, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", page):
                 raise ValueError("invalid result")

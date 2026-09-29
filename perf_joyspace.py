@@ -1,4 +1,5 @@
 """Safe bridge to the bundled JoySpace read/import tools (no npm dependency)."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -126,7 +127,23 @@ def read_template():
     return content
 
 
-def publish_markdown(file_path, title, placement="personal", parent_page=None):
+def report_snapshot(file_path):
+    """Read and validate one image-free draft snapshot without remote I/O."""
+    try:
+        content = Path(file_path).read_bytes()
+        markdown = content.decode("utf-8")
+    except (OSError, UnicodeError):
+        raise JoySpaceError("无法读取报告，请重新生成并预览。") from None
+    if not markdown.strip() or re.search(r"!\[|<\s*(?:img|picture|svg|image)\b", markdown, re.I):
+        raise JoySpaceError("报告为空或含图片标记（包括代码及字面文本中的标记），暂不支持发布；请检查完整正文后重新生成并预览。")
+    return markdown, hashlib.sha256(content).hexdigest()
+
+
+def report_sha256(file_path):
+    return report_snapshot(file_path)[1]
+
+
+def publish_markdown(file_path, title, placement="personal", parent_page=None, *, expected_sha256=None):
     if placement not in ("personal", "child", "sibling"):
         raise JoySpaceError("发布位置必须是 personal、child 或 sibling。")
     if not isinstance(title, str) or not title.strip() or len(title) > 200 or "\x00" in title:
@@ -142,16 +159,21 @@ def publish_markdown(file_path, title, placement="personal", parent_page=None):
         target = _page_id(parent_page)
     elif parent_page:
         raise JoySpaceError("个人空间发布不接受目标页面。")
+    source_sha256 = report_sha256(path)
+    if expected_sha256 is not None and source_sha256 != expected_sha256:
+        raise JoySpaceError("报告内容已变化，请重新生成并预览后再发布。")
     node, skill = _check_runtime()
-    args = [str(skill / IMPORT_SCRIPT), "--file", str(path), "--title", title.strip()]
+    args = [str(skill / IMPORT_SCRIPT), "--file", str(path), "--title", title.strip(),
+            "--image-free", "--source-sha256", source_sha256]
     if placement == "child":
         args.extend(["--parent-page-id", target])
     elif placement == "sibling":
         args.extend(["--page-url", "https://joyspace.jd.com/pages/" + target])
     data = _invoke(node, args, skill, timeout=180, publish=True)
     page_id = data.get("pageId")
-    if (data.get("verified") is not True or not isinstance(page_id, str)
-            or not PAGE_ID.fullmatch(page_id)):
+    if (data.get("verified") is not True or data.get("imageFree") is not True
+            or data.get("title") != title.strip() or data.get("sourceSha256") != source_sha256
+            or not isinstance(page_id, str) or not PAGE_ID.fullmatch(page_id)):
         raise JoySpaceError(PUBLISH_UNKNOWN)
     # Do not forward arbitrary links, authentication metadata or local paths.
     return {"pageId": page_id, "link": "https://joyspace.jd.com/pages/" + page_id}

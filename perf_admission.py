@@ -1,13 +1,10 @@
 """Isolated offline admission reports. No authentication, publishing or store writes."""
 from __future__ import annotations
 
-import base64
 import html
-import io
 import math
 import re
 from pathlib import Path
-from urllib.parse import quote
 
 from perf_report_data import REQUIRED_PROCESSES, build_report_data
 
@@ -136,7 +133,109 @@ def _inline(text):
     return re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
 
 
-def _preview(markdown, images):
+def _without_images(markdown):
+    """Remove template images, preserving surrounding text and table columns."""
+    if not isinstance(markdown, str):
+        raise ValueError("模板必须是字符串")
+
+    def closing(text, start, left, right):
+        depth, escaped = 0, False
+        for index in range(start, len(text)):
+            char = text[index]
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+            elif char == left:
+                depth += 1
+            elif char == right:
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        raise ValueError("模板图片语法不完整，请检查模板")
+
+    # Protect literal code and escaped punctuation before scanning image syntax.
+    # Tokens cannot collide with the input and are restored byte-for-byte.
+    token_prefix = "\x00literal"
+    while token_prefix in markdown:
+        token_prefix += "_"
+    literals = []
+
+    def protect(value):
+        token = f"{token_prefix}{len(literals)}\x00"
+        if value.endswith("\n"):
+            token += "\n"
+        literals.append((token, value))
+        return token
+
+    lines, fence, block = [], None, []
+    for line in markdown.splitlines(keepends=True):
+        if fence:
+            block.append(line)
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*(?:\r?\n)?", line):
+                lines.append(protect("".join(block)))
+                fence, block = None, []
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if opening:
+            fence, block = opening[1], [line]
+        elif line.startswith(("    ", "\t")):
+            lines.append(protect(line))
+        else:
+            lines.append(line)
+    if block:
+        lines.append(protect("".join(block)))
+    markdown = "".join(lines)
+    markdown = re.sub(r"\\[!`<\\]", lambda m: protect(m[0]), markdown)
+    markdown = re.sub(r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)",
+                      lambda m: protect(m[0]), markdown, flags=re.S)
+
+    definitions = re.compile(r"^ {0,3}\[([^]\n]+)\]:[^\n]*(?:\n|$)", re.M)
+    normalize_ref = lambda value: " ".join(value.split()).casefold()
+    defined_refs = {normalize_ref(m[1]) for m in definitions.finditer(markdown)}
+    result, cursor, image_refs = [], 0, set()
+    while True:
+        start = markdown.find("![", cursor)
+        if start < 0:
+            result.append(markdown[cursor:])
+            break
+        result.append(markdown[cursor:start])
+        end = closing(markdown, start + 1, "[", "]")
+        label = markdown[start + 2:end - 1]
+        if markdown[end:end + 1] in ("(", "["):
+            left, ref_start = markdown[end], end
+            end = closing(markdown, end, left, ")" if left == "(" else "]")
+            if left == "[":
+                ref = normalize_ref(markdown[ref_start + 1:end - 1] or label)
+                if ref in defined_refs:
+                    image_refs.add(ref)
+                else:
+                    result.append(markdown[start:end])
+        else:
+            ref = normalize_ref(label)
+            if ref in defined_refs:
+                image_refs.add(ref)
+            else:
+                result.append(markdown[start:end])
+        cursor = end
+    text = "".join(result)
+    # Drop definitions used only by removed images; preserve shared text links.
+    definitions = re.compile(r"^ {0,3}\[([^]\n]+)\]:[^\n]*(?:\n|$)", re.M)
+    body = definitions.sub("", text)
+    remaining_refs = {normalize_ref(m) for m in re.findall(r"\[([^]\n]+)\]", body)}
+    text = definitions.sub(lambda m: "" if normalize_ref(m[1]) in image_refs - remaining_refs else m[0], text)
+    text = re.sub(r"<(picture|svg)\b[^>]*>.*?</\1\s*>", "", text, flags=re.I | re.S)
+    text = re.sub(r"<(?:img|image)\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>", "", text, flags=re.I)
+    # Do not silently accept malformed containers that could hide report text.
+    if re.search(r"<\s*/?\s*(?:img|image|picture|svg)\b", text, re.I):
+        raise ValueError("模板图片 HTML 不完整，请检查模板")
+    for token, value in reversed(literals):
+        text = text.replace(token, value)
+    return text
+
+
+def _preview(markdown):
     result, table = [], False
     for line in markdown.splitlines():
         if line.lstrip().startswith("|") and line.rstrip().endswith("|"):
@@ -151,19 +250,16 @@ def _preview(markdown, images):
         if table:
             result.append("</table>")
             table = False
-        if line in images:
-            encoded = base64.b64encode(images[line]).decode("ascii")
-            result.append('<img alt="Performance trend" src="data:image/png;base64,' + encoded + '">')
-        elif line.strip():
+        if line.strip():
             result.append("<p>" + _inline(line) + "</p>")
     if table:
         result.append("</table>")
     return ('<!doctype html><html><head><meta charset="utf-8">'
             '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-            'img-src data:; style-src \'unsafe-inline\';">'
+            'img-src \'none\'; style-src \'unsafe-inline\';">'
             '<style>body{font:14px sans-serif;margin:20px;overflow-wrap:anywhere}'
             'table{border-collapse:collapse;width:100%;margin:16px 0}'
-            'td{border:1px solid #ccc;padding:6px}img{max-width:100%;height:auto}</style>'
+            'td{border:1px solid #ccc;padding:6px}</style>'
             '</head><body>' + "\n".join(result) + '</body></html>')
 
 
@@ -173,63 +269,14 @@ def _write(path, content):
     path.write_bytes(content)
 
 
-def _trend_runs(points, field, divisor=1):
-    """Sampled cycle gaps may connect only when upstream run IDs prove continuity."""
-    runs, previous = [], None
-    for point in points:
-        if not _valid(point.get("ts")) or not _valid(point.get(field)):
-            previous = None
-            continue
-        run = point.get("_run_" + field)
-        connected = (previous is not None and run is not None and
-                     run == previous.get("_run_" + field) and
-                     point.get("segment") == previous.get("segment") and
-                     point["ts"] > previous["ts"] and
-                     point["cycle"] > previous["cycle"])
-        if not connected:
-            runs.append([])
-        runs[-1].append((point["ts"], point[field] / divisor))
-        previous = point
-    return runs
-
-
-def _png(points, field, title, divisor=1):
-    from PIL import Image, ImageDraw
-
-    runs = _trend_runs(points, field, divisor)
-    if not runs:
-        return None
-    all_points = [point for run in runs for point in run]
-    low_x, high_x = min(p[0] for p in all_points), max(p[0] for p in all_points)
-    low_y, high_y = min(0, min(p[1] for p in all_points)), max(p[1] for p in all_points)
-    width, height = 960, 320
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    draw.text((64, 14), title, fill="#222222")
-    draw.line([(64, 48), (64, 270), (928, 270)], fill="#666666")
-    draw.text((6, 48), format(high_y, ".4g"), fill="#444444")
-    draw.text((6, 258), format(low_y, ".4g"), fill="#444444")
-    draw.text((64, 290), "Timestamp (ms): " + str(low_x) + " to " + str(high_x), fill="#444444")
-    for run in runs:
-        pixels = [(64 + (x - low_x) / (high_x - low_x or 1) * 864,
-                   270 - (y - low_y) / (high_y - low_y or 1) * 222) for x, y in run]
-        if len(pixels) > 1:
-            draw.line(pixels, fill="#2463a6", width=2)
-        for x, y in pixels:
-            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill="#2463a6")
-    stream = io.BytesIO()
-    image.save(stream, format="PNG")
-    return stream.getvalue()
-
-
 def build_admission(store, session_id, template: str, output_dir: Path,
                     scenes: dict[int, str], factor: float | None) -> dict:
-    """Write report.md and PNGs; return markdown, sandbox-safe html and warnings.
+    """Write an image-free report.md; return markdown, sandbox-safe html and warnings.
 
     Every observed segment needs an explicit scene. Invalid templates, scenes or
     factors raise ValueError before output. Only one read-consistent payload is used.
     """
-    prefix, body, suffix, total, indices = _template(template)
+    prefix, body, suffix, total, indices = _template(_without_images(template))
     if factor is not None and (not _valid(factor) or factor <= 0):
         raise ValueError("factor必须是显式正有限数值或None")
     if (not isinstance(scenes, dict) or any(type(k) is not int for k in scenes) or
@@ -271,49 +318,18 @@ def build_admission(store, session_id, template: str, output_dir: Path,
     missing = [r["name"] for r, group in zip(data["required"], matched) if not any(p["p_records"] for p in group)]
     if missing:
         warnings.append("未可靠采集：" + "、".join(missing))
-    return _finish(output_dir, prefix, body, suffix, data, matched, warnings)
+    return _finish(output_dir, prefix, body, suffix, warnings)
 
 
-def _finish(output_dir, prefix, body, suffix, data, matched, warnings):
+def _finish(output_dir, prefix, body, suffix, warnings):
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    images, charts = {}, []
     newline = "\r\n" if body[0].endswith("\r\n") else "\n"
-
-    def chart(item, field, divisor, name, title, english):
-        content = _png(item["series"]["points"], field, english, divisor)
-        if content is None:
-            return
-        path = output_dir / (name + ".png")
-        _write(path, content)
-        # Resolve beside report.md on every platform; never expose the host path.
-        markdown = "![趋势图](" + quote(path.name, safe="") + ")"
-        images[markdown] = content
-        charts.extend(["", "### " + title, "", markdown])
-
-    for system in data["systems"]:
-        segment = system["segment"]
-        for field, divisor, key, title, unit in (
-                ("cpu_single_core", 1, "cpu", "整机CPU趋势", "CPU single-core (%)"),
-                ("mem_used_mb", 1024, "memory", "整机内存趋势", "Memory (GB)")):
-            chart(system, field, divisor, f"system_s{segment}_{key}",
-                  f"段{segment} {title}", f"System segment {segment} - {unit}")
-    for number, (required, group) in enumerate(zip(data["required"], matched), 1):
-        for process in group:
-            segment = process["segment"]
-            for field, divisor, key, title, unit in (
-                    ("cpu1c", 1, "cpu", "CPU趋势", "CPU single-core (%)"),
-                    ("rss_kb", 1024, "memory", "内存趋势", "RSS (MB)")):
-                chart(process, field, divisor, f"process_{number:02d}_s{segment}_{key}",
-                      f"段{segment} {required['name']} {title}",
-                      f"Process {number} segment {segment} - {unit}")
-    if not images:
-        warnings.append("无有效时间与指标点，未生成趋势PNG。")
-    body = [line for line in body
-            if line.lstrip().startswith("|") or "折线图占位" not in line]
-    additions = ["", "### 统计口径与覆盖说明", ""] + ["- " + warning for warning in warnings] + charts + ["", ""]
+    body = [line for line in body if not re.fullmatch(
+        r"\s*[\s*]*【[\s*]*折线图占位[\s*]*】[^\r\n]*\s*", line)]
+    additions = ["", "### 统计口径与覆盖说明", ""] + ["- " + warning for warning in warnings] + ["", ""]
     markdown = "".join(prefix + body) + newline.join(additions) + "".join(suffix)
-    preview = _preview(markdown, images)
+    preview = _preview(markdown)
     _write(output_dir / "report.md", markdown.encode("utf-8"))
     return dict(markdown=markdown, html=preview, warnings=warnings)
 

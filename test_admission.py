@@ -1,4 +1,3 @@
-import base64
 import html
 import io
 import tempfile
@@ -7,8 +6,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image
-from perf_admission import build_admission, _cells, _template, _trend_runs, _png
+from perf_admission import build_admission, _cells, _template
 from perf_parser import SCHEMAS
 from perf_report_data import REQUIRED_PROCESSES, build_report_data
 from perf_store import Store
@@ -162,7 +160,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(rows[-1][5:], [""] * 14)
         self.assertEqual(rows[names.index("/system/bin/mediaserver")][5], "40")
         self.assertEqual([row[1:] for row in totals], [["", ""], ["", ""]])
-        self.assertEqual(len(list(self.output.glob("*.png"))), 4)
+        self.assertEqual(len(list(self.output.glob("*.png"))), 0)
         self.assertTrue(any("IO" in warning for warning in result["warnings"]))
 
     def test_factor_and_scene_validation(self):
@@ -176,7 +174,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         result = self.build(s(1) + p(1), {0: "unknown"})
         self.assertEqual(self.rows(result["markdown"])[0][0][5:], [""] * 14)
-        self.assertEqual(len(list(self.output.glob("*.png"))), 4)
+        self.assertEqual(len(list(self.output.glob("*.png"))), 0)
 
     def test_structure_changes_rejected_before_read(self):
         original = template()
@@ -194,7 +192,7 @@ class AdmissionTests(unittest.TestCase):
                 builder.assert_not_called()
         self.assertFalse(self.output.exists())
 
-    def test_safe_preview_and_png(self):
+    def test_safe_image_free_preview(self):
         attack = '<script>alert(1)</script><img src="https://bad/x" onerror="bad()">\n'
         attack += '![remote](https://bad/image.png)\n![local](/etc/passwd)\n[x](javascript:bad)\n'
         result = self.build(s(1) + p(1) + s(2) + p(2), source=attack + template())
@@ -205,30 +203,66 @@ class AdmissionTests(unittest.TestCase):
         self.assertIn(html.escape("<script>"), preview)
         self.assertNotIn(str(self.output), preview)
         images = [attrs["src"] for tag, attrs in tags if tag == "img"]
-        self.assertEqual(len(images), 4)
-        for src in images:
-            self.assertTrue(src.startswith("data:image/png;base64,"))
-            with Image.open(io.BytesIO(base64.b64decode(src.split(",", 1)[1]))) as image:
-                image.verify()
-        self.assertNotIn(str(self.output.resolve()), result["markdown"])
-        for path in self.output.glob("*.png"):
-            self.assertIn("![趋势图](" + path.name + ")", result["markdown"])
-            with Image.open(path) as image:
-                self.assertEqual(image.size, (960, 320))
+        self.assertEqual(images, [])
+        self.assertEqual([p.name for p in self.output.iterdir()], ["report.md"])
+        self.assertNotIn("![", result["markdown"])
+        self.assertNotIn("<img", result["markdown"])
+        self.assertNotIn("折线图占位", result["markdown"])
         self.assertTrue(any("default-src 'none'" in attrs.get("content", "") for _, attrs in tags))
 
-    def test_trend_discontinuities_and_invalid_points(self):
-        def point(cycle, ts, value=1, segment=0, run=0):
-            return dict(cycle=cycle, ts=ts, value=value, segment=segment, _run_value=run)
-        points = [point(1, 1), point(5, 5), point(6, 6, None), point(7, 7),
-                  point(9, 9, run=1), point(10, 10, segment=1, run=1),
-                  point(11, 10, segment=1, run=1), point(11, 11, segment=1, run=1),
-                  point(12, 9, segment=1, run=1), point(13, None), point(14, 14),
-                  point(15, 15, float("nan")), point(16, 16, float("inf"))]
-        runs = _trend_runs(points, "value")
-        self.assertEqual([len(run) for run in runs], [2, 1, 1, 1, 1, 1, 1, 1])
-        self.assertIsNone(_png([point(1, 1, None), point(2, None)], "value", "Missing"))
-        self.assertIsNotNone(_png([point(1, 1, 0)], "value", "Zero"))
+    def test_template_images_removed_everywhere_and_text_preserved(self):
+        images = ('![nested](a(b).png)![ref][figure]![short]'
+                  '<IMG src="remote.png" title="a>b">'
+                  '<picture><source srcset="x"><img src="x"></picture>'
+                  '<svg><path d="x"/></svg>')
+        source = template().replace("人工前言", "前" + images + "后人工前言")
+        source = source.replace("人工后台", "左" + images + "右人工后台")
+        source += "尾前" + images + "尾后\n[figure]: https://example/image.png\n[short]: short.png\n"
+        source = source.replace("- 各个进程占用", "人工折线图占位说明需保留\n- 各个进程占用")
+        result = self.build(s(1) + p(1), source=source)
+        markdown = result["markdown"]
+        self.assertIn("前后人工前言", markdown)
+        self.assertIn("尾前尾后", markdown)
+        self.assertIn("人工折线图占位说明需保留", markdown)
+        self.assertEqual(self.rows(markdown)[0][0][4], "左右人工后台")
+        for marker in ("![", "<IMG", "<picture", "<svg", "[figure]:"):
+            self.assertNotIn(marker, markdown)
+        self.assertEqual([item.name for item in self.output.iterdir()], ["report.md"])
+
+    def test_image_only_references_removed_shared_links_preserved(self):
+        from perf_admission import _without_images
+        source = ('前![a][shared]后 [文档][shared]\n![only][]\n'
+                  '[shared]: https://example/shared\n[only]: https://example/only\n'
+                  '<image href="x" title="a>b"/>尾')
+        cleaned = _without_images(source)
+        self.assertIn('前后 [文档][shared]', cleaned)
+        self.assertIn('[shared]: https://example/shared', cleaned)
+        self.assertNotIn('https://example/only', cleaned)
+        self.assertNotIn('<image', cleaned)
+        self.assertTrue(cleaned.endswith('尾'))
+
+    def test_literal_image_syntax_is_not_deleted(self):
+        from perf_admission import _without_images
+        for source in ('注意 ![未通过] 请复查', '注意 ![a][missing] 后',
+                       '注意 ![missing][] 后', r'转义 \![a](x.png)',
+                       '`![a](x.png)`', '``literal ` ![a](x.png)``',
+                       '```markdown\n![a](x.png)\n```',
+                       '~~~markdown\n<img src="x">\n~~~',
+                       '    ![a](x.png)\n', '`![x][a]`\n[a]: image.png\n'):
+            with self.subTest(source=source):
+                self.assertEqual(_without_images(source), source)
+        source = '```\n![literal](x)\n```\n![real][a]\n[a]: image.png\n'
+        self.assertEqual(_without_images(source), '```\n![literal](x)\n```\n\n')
+
+    def test_malformed_images_fail_before_store_read(self):
+        for image in ("![broken", "![image](broken", "![image][broken",
+                      '<img src="broken>', '<picture>unfinished', '<svg/>',
+                      '<svg><svg></svg></svg>', '</image>'):
+            with patch("perf_admission.build_report_data") as builder:
+                with self.assertRaises(ValueError):
+                    build_admission(None, "none", image + template(),self.output, {}, None)
+                builder.assert_not_called()
+        self.assertFalse(self.output.exists())
 
     def test_missing_field_never_falls_back(self):
         sid = self.load(s(1) + p(1))

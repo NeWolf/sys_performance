@@ -5,6 +5,7 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import tempfile
 
 
 PLATFORMS = {"Darwin": "darwin", "Windows": "win32", "Linux": "linux"}
@@ -107,11 +108,32 @@ def verify_node(node, license_path, system, folder=None, core_smoke=False):
                             capture_output=True, text=True, timeout=20, env=env, cwd=folder)
     info = check_identity(result.stdout, system)
     if core_smoke:
-        # No --input-type: exercises the original skill's ESM syntax detection.
-        result = subprocess.run([str(node), "-e", CORE_SMOKE], check=True,
-                                capture_output=True, text=True, timeout=20, env=env, cwd=folder)
-        if result.stdout.strip() != "joyspace-node-core-ok":
-            raise RuntimeError("Bundled Node core smoke failed")
+        # Match the skill's .js entrypoints, not Node's separate eval parser.
+        # An empty package boundary prevents inherited module-type settings.
+        with tempfile.TemporaryDirectory(prefix="node-core-smoke-", dir=folder) as temporary:
+            smoke_root = Path(temporary)
+            (smoke_root / "package.json").write_text("{}", encoding="utf-8")
+            script = smoke_root / "core-smoke.js"
+            script.write_text(CORE_SMOKE, encoding="utf-8")
+            label = f"Node core smoke ({info['version']} {info['platform']}/{info['arch']}, {node})"
+
+            def output_text(value):
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return value or "(empty)"
+
+            try:
+                result = subprocess.run([str(node), str(script)], check=True,
+                                        capture_output=True, text=True, timeout=20, env=env, cwd=folder)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                status = f"exit {exc.returncode}" if isinstance(exc, subprocess.CalledProcessError) else "timeout after 20s"
+                raise RuntimeError(
+                    f"{label} failed: {status}\nstdout:\n{output_text(exc.stdout)}"
+                    f"\nstderr:\n{output_text(exc.stderr)}") from exc
+            if result.stdout.strip() != "joyspace-node-core-ok":
+                raise RuntimeError(
+                    f"{label} failed: unexpected output\nstdout:\n{output_text(result.stdout)}"
+                    f"\nstderr:\n{output_text(result.stderr)}")
     return info
 
 
