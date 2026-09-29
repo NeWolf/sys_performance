@@ -54,9 +54,30 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '24.14.0'
+          architecture: ${{ matrix.arch }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Select official Node distribution for redistribution
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          sys.path.insert(0, "packaging")
+          import platform
+          from node_runtime import official_node_files
+          node = Path(shutil.which("node")).resolve()
+          cache = Path(os.environ["RUNNER_TOOL_CACHE"]).resolve()
+          if not node.is_relative_to(cache):
+              raise RuntimeError("Expected official actions/setup-node tool-cache runtime")
+          root = node.parent if os.name == "nt" else node.parent.parent
+          official_node_files(root, platform.system())
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"JDPERF_NODE_DIST_DIR={root}\n")
+          PY
 
       - name: Set macOS deployment baseline
         if: runner.os == 'macOS'
@@ -72,7 +93,7 @@ jobs:
           npm --prefix frontend run lint
 
       - name: Run backend regression tests
-        run: python -m unittest test_perf test_adb test_packaging
+        run: python -m unittest test_perf test_adb test_packaging test_joyspace test_admission test_admission_jobs test_admission_api
 
       - name: Locate Windows installer compiler
         if: runner.os == 'Windows'

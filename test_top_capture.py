@@ -516,7 +516,7 @@ class TopCaptureTests(unittest.TestCase):
         self.error(502, self.top.pull, "device-1", identity)
         self.assertEqual(list(self.top.archive_root.rglob("*.txt")), [])
         self.device.fail_pull = False
-        self.device.payload = RAW[:-1]
+        self.device.payload = b""
         self.error(502, self.top.pull, "device-1", identity)
         self.device.payload = RAW
         with patch("perf_top_capture.os.fsync", side_effect=OSError("disk")):
@@ -525,6 +525,172 @@ class TopCaptureTests(unittest.TestCase):
         self.error(404, self.top.archive_path)
         self.top.pull("device-1", identity)
         self.assertEqual(self.top.archive_path().read_bytes(), RAW)
+
+    def test_pull_unsafe_state_diagnostics_and_safe_retry(self):
+        original = self.device.action
+        cases = (
+            ("running", RAW, len(RAW), "running", None),
+            ("cleaned", RAW, len(RAW), "stopped", "cleaned"),
+            ("unconfirmed", RAW, len(RAW), "stopped", "unconfirmed"),
+        )
+        for name, payload, after_size, after_status, marker in cases:
+            with self.subTest(case=name):
+                self.device.action = original
+                identity = self.finished()
+                self.device.payload = payload
+
+                def changed(serial, args, output=None):
+                    result = original(serial, args, output)
+                    if args[0] == "pull":
+                        job = self.device.jobs[serial]
+                        job[1], job[5] = after_status, str(after_size)
+                        if marker:
+                            job.append(marker)
+                    return result
+
+                self.device.action = changed
+                with self.assertRaises(AdbError) as caught:
+                    self.top.pull("device-1", identity)
+                self.assertEqual(caught.exception.status, 502)
+                detail = str(caught.exception)
+                for text in (
+                    "未发布本地文件", f"本地实际={len(payload)} 字节",
+                    f"拉取前={len(RAW)} 字节", f"拉取后={after_size} 字节",
+                    "拉取前状态=stopped", f"拉取后状态={after_status}",
+                    "拉取后仍运行=" + ("是" if after_status == "running" or marker == "unconfirmed" else "否"),
+                    "拉取后已清理=" + ("是" if marker == "cleaned" else "否"),
+                ):
+                    self.assertIn(text, detail)
+                self.assertNotIn(str(self.root), detail)
+                self.assertNotIn("PID USER", detail)
+                self.assertEqual(list((self.top.archive_root / identity).glob("*.txt")), [])
+                self.assertEqual(list(self.top.archive_root.glob("*.part")), [])
+                unavailable = 409 if after_status == "running" or marker == "unconfirmed" else 404
+                self.error(unavailable, self.top.archive_path, identity)
+                self.store.import_files.assert_not_called()
+                self.assertFalse(any(args[0] == "clear" for _, args in self.device.commands))
+                self.device.action = original
+                self.device.jobs["device-1"] = self.device.jobs["device-1"][:8]
+                self.device.finish()
+                self.device.payload = RAW
+                self.top.pull("device-1", identity)
+                self.assertEqual(self.top.archive_path(identity).read_bytes(), RAW)
+
+    def test_warning_metadata_failure_does_not_block_retry(self):
+        def partial_write(data, stream):
+            stream.write('{"size":')
+            raise OSError("metadata write failed")
+
+        cases = (
+            ("write", "perf_top_capture.json.dump", partial_write),
+            ("sync", "perf_top_capture.os.fsync", [None, None, OSError("sync failed")]),
+            ("link", "perf_top_capture.os.link", OSError("link failed")),
+        )
+        for name, target, failure in cases:
+            with self.subTest(case=name):
+                identity = self.finished()
+                self.device.payload = RAW[:-1]
+                with patch(target, side_effect=failure):
+                    with self.assertRaises(OSError):
+                        self.top.pull("device-1", identity)
+                directory = self.top.archive_root / identity
+                self.assertEqual(list(directory.iterdir()), [])
+                self.assertEqual(list(self.top.archive_root.glob("*.part")), [])
+                self.error(404, self.top.archive_path, identity)
+                self.assertTrue(self.top.pull("device-1", identity)["warning"])
+                self.assertEqual(self.top.archive_path(identity).read_bytes(), RAW[:-1])
+
+    def test_warning_metadata_conflicts_are_not_overwritten_or_trusted(self):
+        for name in ("invalid", "symlink", "valid_but_different"):
+            with self.subTest(case=name):
+                identity = self.finished()
+                self.device.payload = RAW[:-1]
+                state = self.top.status("device-1")
+                # Keep the legacy fake's missing start time deterministic.
+                with patch("perf_top_capture.time.time", return_value=1700000045):
+                    path = self.top._local_path(state)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    marker = path.with_suffix(".warning.json")
+                    content = b"user metadata"
+                    if name == "symlink":
+                        target = self.root / "user-metadata.json"
+                        target.write_bytes(content)
+                        try:
+                            marker.symlink_to(target)
+                        except (OSError, NotImplementedError):
+                            continue
+                    else:
+                        if name == "valid_but_different":
+                            content = ('{"size":%d,"before":1,"after":2}' % (len(RAW) - 1)).encode()
+                        marker.write_bytes(content)
+                    self.error(409, self.top.pull, "device-1", identity)
+                    self.assertEqual(marker.read_bytes(), content)
+                    self.assertEqual(marker.is_symlink(), name == "symlink")
+                    self.assertFalse(path.exists())
+                    self.assertEqual(list(self.top.archive_root.glob("*.part")), [])
+                    self.assertIsNone(self.controller().status("device-1")["archive"])
+
+    def test_pull_size_warning_allows_download_import_retry_and_restart(self):
+        original = self.device.action
+        cases = (
+            ("truncated", RAW[:-1], len(RAW)),
+            ("expanded_newlines", RAW.replace(b"\n", b"\r\n"), len(RAW)),
+            ("before_size_only", RAW[:-1], len(RAW) - 1),
+            ("after_size_only", RAW, len(RAW) + 1),
+        )
+        for name, payload, after_size in cases:
+            with self.subTest(case=name):
+                self.device.action = original
+                identity = self.finished()
+                self.device.payload = payload
+
+                def changed(serial, args, output=None):
+                    result = original(serial, args, output)
+                    if args[0] == "pull":
+                        self.device.jobs[serial][5] = str(after_size)
+                    return result
+
+                self.device.action = changed
+                pulled = self.top.pull("device-1", identity)
+                warning = pulled["warning"]
+                for text in ("字节数不一致", f"本地实际={len(payload)} 字节",
+                             f"拉取前={len(RAW)} 字节", f"拉取后={after_size} 字节"):
+                    self.assertIn(text, warning)
+                self.assertNotIn(str(self.root), warning)
+                self.assertNotIn("PID USER", warning)
+                self.assertIsNone(pulled["error"])
+                self.assertTrue(pulled["archive"])
+                self.assertEqual(self.top.archive_path(identity).read_bytes(), payload)
+                self.assertEqual(self.top.status("device-1")["warning"], warning)
+                count = sum(args[0] == "pull" for _, args in self.device.commands)
+                self.assertEqual(self.top.pull("device-1", identity)["warning"], warning)
+                self.assertEqual(sum(args[0] == "pull" for _, args in self.device.commands), count)
+                self.assertEqual(list(self.top.archive_root.glob("*.part")), [])
+                self.assertFalse(any(args[0] == "clear" for _, args in self.device.commands))
+                recovered = self.controller()
+                restored = recovered.status("device-1")
+                self.assertEqual(restored["archive"], pulled["archive"])
+                self.assertEqual(restored["warning"], warning)
+                self.assertEqual(recovered.pull("device-1", identity)["archive"], pulled["archive"])
+                self.store.import_files.side_effect = ValueError("parse failure")
+                with self.assertRaisesRegex(ValueError, "parse failure"):
+                    recovered.import_capture(identity)
+                self.assertEqual(recovered.archive_path(identity).read_bytes(), payload)
+
+                def imported(files, title):
+                    self.assertEqual(files[0][1].read(), payload)
+                    return {"id": "session-1", "duplicate": False}
+
+                self.store.import_files.side_effect = imported
+                self.assertEqual(recovered.import_capture(identity)["id"], "session-1")
+                self.assertEqual(recovered.status("device-1")["status"], "imported")
+                self.assertEqual(self.top.status("device-1")["warning"], warning)
+                self.store.import_files.side_effect = None
+                self.device.action = original
+                # A warning belongs only to its capture, never the next task.
+                self.assertIsNone(self.top.start("device-1", count=1)["warning"])
+                self.device.finish()
+                self.top.status("device-1")
 
     def test_pull_stream_over_limit(self):
         identity = self.finished()
@@ -698,13 +864,23 @@ class TopCaptureTests(unittest.TestCase):
             self.device.finish()
             client.get("/api/top/status", params={"serial": "device-1"})
             self.assertEqual(client.get("/api/top/archive").status_code, 404)
+            self.device.payload = RAW[:-1]
             pulled = client.post("/api/top/pull", json=task)
             self.assertEqual(pulled.status_code, 200, pulled.text)
+            detail = pulled.json()["warning"]
+            self.assertIn(f"本地实际={len(RAW) - 1} 字节", detail)
+            self.assertIn(f"拉取前={len(RAW)} 字节", detail)
+            self.assertIn(f"拉取后={len(RAW)} 字节", detail)
+            self.assertEqual(client.get(pulled.json()["archive"]).content, RAW[:-1])
+            polled = client.get("/api/top/status", params={"serial": "device-1"}).json()
+            self.assertEqual(polled["warning"], detail)
+            self.assertEqual(client.post("/api/top/pull", json=task).status_code, 200)
             cleared = client.post("/api/top/clear", json=task)
             self.assertEqual(cleared.status_code, 200, cleared.text)
             self.assertTrue(cleared.json()["remote_cleaned"])
             downloaded = client.get(pulled.json()["archive"])
-            self.assertEqual(downloaded.content, RAW)
+            self.assertEqual(downloaded.content, RAW[:-1])
+            self.assertEqual(cleared.json()["warning"], detail)
             filename = self.top.archive_path(identity).name
             self.assertRegex(filename, r"^Top[0-9]{14}\.txt$")
             self.assertEqual(downloaded.headers["content-disposition"], f'attachment; filename="{filename}"')

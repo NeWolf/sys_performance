@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 from macos_compat import MACOS_MIN_VERSION, verify_macos_binaries
+from node_runtime import official_node_files, verify_skill
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "1.2.2"
@@ -53,6 +54,8 @@ def main():
     parser.add_argument("--skip-frontend", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "release",
                         help="Parent directory for build outputs (default: release)")
+    parser.add_argument("--node-dist-dir", type=Path, default=os.environ.get("JDPERF_NODE_DIST_DIR"),
+                        help="Official Node distribution root containing LICENSE and bin/node (or node.exe)")
     args = parser.parse_args()
     system = platform.system()
     if system not in ("Darwin", "Windows", "Linux"):
@@ -72,6 +75,8 @@ def main():
                      "report_assets/vendor/ECHARTS-NOTICE", "JD_logo.png", "device_top_capture.sh"):
         if not (ROOT / resource).is_file():
             parser.error("Missing resource: " + resource)
+    skill = verify_skill(ROOT)
+    node, node_license = official_node_files(args.node_dist_dir, system)
     arch = platform.machine().lower()
     label = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}[system]
     stem = f"JDPerf-{VERSION}-{label}-{arch}"
@@ -86,6 +91,11 @@ def main():
         "--add-data", str(ROOT / "frontend/src/sysmonitor_test/sysmonitor") + ":frontend/src/sysmonitor_test",
         "--add-data", str(ROOT / "report_assets") + ":report_assets",
         "--add-data", str(ROOT / "device_top_capture.sh") + ":.",
+        "--add-data", str(skill) + ":joyspace_assets/joyspace-kit",
+        # Keep Node out of PyInstaller binary dependency discovery and signing.
+        "--add-data", str(node) + ":joyspace_assets/node",
+        "--add-data", str(node_license) + ":joyspace_assets/node",
+        "--hidden-import", "perf_joyspace",
         ROOT / "main.py")
     payload = output / "portable" / "JDPerf"
     artifacts = []

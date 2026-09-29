@@ -1,0 +1,29 @@
+.admission-dialog { width: min(1180px, calc(100vw - 40px)); max-width: none; max-height: calc(100dvh - 40px); margin: auto; padding: 0; border: 1px solid #dce4f0; border-radius: 14px; color: #43536d; background: #fff; box-shadow: 0 24px 80px #0b112040; }
+.admission-dialog::backdrop { background: #0b1120aa; }
+.admission-heading { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 22px; background: #fff; border-bottom: 1px solid #e2e8f1; }
+.admission-heading h2 { font-size: 18px; color: #223454; }
+.admission-content { padding: 20px 22px; min-width: 0; }
+.admission-content p { margin: 12px 0; line-height: 1.7; }
+.admission-content .banner { margin: 14px 0; }
+.admission-content .actions { flex-wrap: wrap; }
+.admission-content small { color: #7b879b; line-height: 1.6; }
+.admission-section { border-top: 1px solid #e2e8f1; margin-top: 24px; padding-top: 4px; }
+.admission-section h3 { font-size: 15px; margin-right: auto; }
+.admission-table-scroll, .admission-preview-scroll { max-width: 100%; overflow-x: auto; border: 1px solid #e2e8f1; border-radius: 10px; }
+.admission-table-scroll table { width: 100%; min-width: 760px; border-collapse: collapse; }
+.admission-table-scroll th, .admission-table-scroll td { padding: 12px; text-align: left; border-bottom: 1px solid #edf1f6; white-space: nowrap; }
+.admission-table-scroll th { background: #f7f9fd; font-weight: 600; }
+.admission-table-scroll select { min-width: 150px; }
+.admission-draft-picker { display: grid; gap: 8px; margin: 16px 0; }
+.admission-draft-picker select { width: 100%; min-width: 0; }
+.admission-id { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.admission-unknown { border: 2px solid #c45c69; font-weight: 600; }
+.admission-preview { display: block; width: 100%; height: 65vh; min-height: 360px; border: 0; background: #fff; }
+.admission-confirm { display: flex; align-items: flex-start; gap: 10px; margin: 16px 0; line-height: 1.7; }
+.admission-confirm input { width: auto; margin-top: 5px; flex-shrink: 0; }
+.admission-content ul.banner { padding-left: 36px; line-height: 1.8; }
+@media (max-width: 760px) {
+  .admission-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
+  .admission-heading, .admission-content { padding: 14px; }
+  .admission-content .form-grid { grid-template-columns: minmax(0, 1fr); }
+}

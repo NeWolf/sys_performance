@@ -5,6 +5,7 @@ import type { Overview } from './api'
 import { Groups } from './Groups'
 import { ReportConfig } from './ReportConfig'
 import { ViewPanel } from './ViewPanel'
+import { AdmissionReport } from './AdmissionReport'
 
 type DashboardProps = { id: string; disabled: boolean; view: string }
 
@@ -23,7 +24,7 @@ function Analysis({ data, disabled, view }: { data: Overview; disabled: boolean;
   const [segment, setSegment] = useState(data.segments[0]?.segment ?? 0)
   return <>
     <ViewPanel active={view === 'analysis'}>
-      <InteractiveReport key={data.id} id={data.id} name={data.name} disabled={disabled} />
+      <InteractiveReport key={data.id} id={data.id} name={data.name} segments={data.segments} disabled={disabled} />
       <details className="panel diagnostics">
         <summary>日志质量与来源</summary>
         <p className="muted">{formatNumber(data.summary.cycles, 0)} 个周期 · {data.summary.segments} 个时间段 · {formatTime(data.summary.first_ts)} → {formatTime(data.summary.last_ts)}</p>
@@ -70,7 +71,7 @@ function releaseReport(url: string) {
   URL.revokeObjectURL(url)
 }
 
-function InteractiveReport({ id, name, disabled }: { id: string; name: string; disabled: boolean }) {
+function InteractiveReport({ id, name, segments, disabled }: { id: string; name: string; segments: Overview['segments']; disabled: boolean }) {
   const [revision, setRevision] = useState(0)
   const [expanded, setExpanded] = useState(false)
   const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream`, revision, loadReport, releaseReport)
@@ -88,6 +89,7 @@ function InteractiveReport({ id, name, disabled }: { id: string; name: string; d
     <div className="analysis-report-toolbar">
       <div><strong>交互性能分析</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
       <div className="actions">
+        <AdmissionReport id={id} name={name} segments={segments} disabled={disabled} />
         <button disabled={disabled || result.loading} onClick={reload}>重新加载</button>
         {result.loading && <button onClick={result.cancel}>取消分析</button>}
         <button aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? '退出大屏' : '大屏查看'}</button>

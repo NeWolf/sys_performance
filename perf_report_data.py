@@ -285,7 +285,7 @@ def _progress_reporter(progress=None, cancelled=None):
     return report
 
 
-def build_report_data(store, session_id, progress=None, cancelled=None):
+def build_report_data(store, session_id, progress=None, cancelled=None, include_full_system=False):
     """Return JSON-safe session/systems/processes/required/method, schema_version=1.
 
     Statistics use all valid samples, charts are bounded, and full_cycles are not.
@@ -324,7 +324,7 @@ def build_report_data(store, session_id, progress=None, cancelled=None):
             scopes[process["id"]] = PROCESS_FIELDS
         report("system", 0, totals["system"])
         for segment, cycles in cycle_counts.items():
-            system = _build_system(db, store, segment, cycles, advance)
+            system = _build_system(db, store, segment, cycles, advance, include_full_system)
             systems.append(system)
             scopes[system["id"]] = (*SYSTEM_FIELDS, *SYSTEM_CPU_SINGLE_FIELDS.values())
         report("statistics")
@@ -394,7 +394,7 @@ def _build_process(db, store, index, segment, name, rows, cycles, advance=None):
     )
 
 
-def _build_system(db, store, segment, cycles, advance=None):
+def _build_system(db, store, segment, cycles, advance=None, include_full_system=False):
     scope = "s" + str(segment)
     counts = Counter()
     details, samples, cpu_valid = [], 0, 0
@@ -440,6 +440,7 @@ def _build_system(db, store, segment, cycles, advance=None):
     cycle_axis = [list(row) for row in db.execute(
         "SELECT cycle,CASE WHEN MIN(ts)=MAX(ts) THEN MIN(ts) END FROM report_source WHERE segment IS ? GROUP BY cycle ORDER BY cycle", (segment,))]
     return dict(id=scope, segment=segment, cycles=cycles, samples=samples,
+                **({"full_points": list(points())} if include_full_system else {}),
                 cycle_axis=cycle_axis,
                 series=_sample(store, points(), samples, (*SYSTEM_FIELDS, *SYSTEM_CPU_SINGLE_FIELDS.values())),
                 cpu_reference_note=cpu_reference_note(profiles),

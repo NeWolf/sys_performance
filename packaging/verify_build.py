@@ -17,6 +17,7 @@ import zipfile
 import httpx
 
 from macos_compat import verify_macos_binaries, verify_macos_metadata
+from node_runtime import verify_joyspace_payload
 
 
 def smoke(command, folder):
@@ -82,6 +83,7 @@ def verify_payload(payload, folder, system):
         raise RuntimeError("Packaged server is missing")
     if system == "Darwin":
         verify_macos_binaries(payload)
+    verify_joyspace_payload(payload / "_internal", folder, system)
     smoke([str(executable)], folder)
 
 

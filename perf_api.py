@@ -3,7 +3,9 @@ from contextlib import asynccontextmanager
 from collections import deque
 from concurrent.futures import CancelledError
 import asyncio
+import hashlib
 import json
+import re
 import time
 import secrets
 import sqlite3
@@ -63,7 +65,10 @@ class LocalBoundary:
         except ValueError:
             error = (400, "无效的请求长度")
         if error:
-            return await JSONResponse({"detail": error[1]}, status_code=error[0])(scope, receive, send)
+            payload = {"detail": error[1]}
+            if _admission_path(scope["path"]):
+                payload["accepted"] = False
+            return await JSONResponse(payload, status_code=error[0])(scope, receive, send)
         received = 0
 
         async def bounded_receive():
@@ -196,6 +201,58 @@ class ReportSettingsRequest(BaseModel):
     conclusion_notes: str = Field(default="", max_length=8000)
 
 
+class AdmissionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    draft_id: str = Field(pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
+    title: str = Field(min_length=1, max_length=200)
+    scenes: dict[int, Literal["background", "foreground", "unknown"]]
+    factor: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonical_input(cls, values):
+        if not isinstance(values, dict):
+            raise ValueError("请求必须是对象")
+        values = dict(values)
+        title = values.get("title")
+        if isinstance(title, str) and (not title.strip() or "\x00" in title):
+            raise ValueError("标题无效")
+        scenes = values.get("scenes")
+        if not isinstance(scenes, dict) or any(
+            not isinstance(key, str) or not re.fullmatch(r"0|[1-9][0-9]*", key)
+            for key in scenes
+        ):
+            raise ValueError("场景段号必须是规范非负整数")
+        values["scenes"] = {int(key): value for key, value in scenes.items()}
+        return values
+
+
+class AdmissionPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    placement: Literal["personal", "child", "sibling"]
+    parent_page: Optional[str] = None
+    confirmed: bool
+
+    @model_validator(mode="after")
+    def explicit_confirmation(self):
+        if self.confirmed is not True:
+            raise ValueError("必须显式确认发布")
+        return self
+
+
+def _admission_path(path):
+    return re.fullmatch(r"/api/sessions/[^/]+/admission/drafts(?:/[^/]+(?:/(?:preview|publish))?)?", path) is not None
+
+
+def _admission_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("重复JSON字段")
+        result[key] = value
+    return result
+
+
 def create_app(database, port=8765, development=False, frontend=None):
     store = Store(database)
     token = secrets.token_urlsafe(32)
@@ -205,18 +262,131 @@ def create_app(database, port=8765, development=False, frontend=None):
     adb = AdbController(Path(database).resolve().parent / "adb_logs")
     top = TopCapture(adb, Path(database).resolve().parent / "top_logs", store, import_lock)
 
+    from perf_admission_jobs import AdmissionJobs
+
+    admission_lock = threading.Lock()
+    admission_closed = False
+    database_path = Path(database).resolve()
+    database_key = hashlib.sha256(str(database_path).encode("utf-8")).hexdigest()
+    admission_root = database_path.parent / "admission_jobs" / database_key
+
+    def admission_jobs():
+        from perf_admission_jobs import AdmissionJobError
+        with admission_lock:
+            if admission_closed:
+                raise AdmissionJobError("草稿服务已关闭", 503)
+            if app.state.admission_jobs is None:
+                app.state.admission_jobs = AdmissionJobs(store, admission_root)
+            return app.state.admission_jobs
+
+    def close_services():
+        nonlocal admission_closed
+        try:
+            with admission_lock:
+                admission_closed = True
+                jobs = app.state.admission_jobs
+            if jobs is not None:
+                jobs.close()  # Wait for durable workers before releasing the root lock.
+        finally:
+            top.close()
+
     @asynccontextmanager
     async def lifespan(_app):
         try:
             yield
         finally:
-            await run_in_threadpool(top.close)
+            await run_in_threadpool(close_services)
 
     app = FastAPI(title="sysmonitor 本地分析", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
     app.state.store = store
     app.state.adb = adb
     app.state.top = top
+    app.state.admission_jobs = None
+    app.state.close_services = close_services
+
+    def admission_error(status, accepted=None):
+        messages = {
+            400: "草稿请求无效，请检查配置和发布位置。",
+            404: "草稿不存在或不属于当前会话。",
+            409: "草稿配置或状态冲突，请查询已有草稿。",
+            422: "草稿请求校验失败，请检查字段、类型和编号。",
+            429: "草稿任务队列已满，请稍后重试。",
+            503: "草稿服务暂不可用；请求可能已受理，请保留编号并查询，勿自动重发。",
+        }
+        status = status if status in messages else 503
+        payload = {"detail": messages[status]}
+        if accepted is False and status != 503:
+            payload["accepted"] = False
+        return JSONResponse(payload, status_code=status)
+
+    async def admission_call(operation, session_id, draft_id=None, request=None):
+        from perf_admission_jobs import AdmissionJobError
+        # Validate before opening the journal or entering any write operation.
+        if any(not re.fullmatch(r"[0-9a-f]{32}", value)
+               for value in (session_id, draft_id) if value is not None):
+            return admission_error(422, False)
+        body = None
+        if request is not None:
+            try:
+                media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if media_type != "application/json":
+                    raise ValueError("JSON required")
+                raw = json.loads(await request.body(), object_pairs_hook=_admission_json_pairs,
+                                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+                model = AdmissionCreateRequest if operation == "create" else AdmissionPublishRequest
+                body = model.model_validate(raw)
+            except (ValueError, OverflowError, RecursionError):
+                # Do not echo Pydantic input/ctx (paths, URLs, NaN, credentials).
+                return admission_error(422, False)
+            except HTTPException as exc:
+                return JSONResponse({"detail": "请求体超过限制。", "accepted": False},
+                                    status_code=exc.status_code)
+        try:
+            def invoke():
+                jobs = admission_jobs()
+                if operation == "create":
+                    return jobs.create(session_id, **body.model_dump())
+                if operation == "publish":
+                    return jobs.publish(session_id, draft_id, **body.model_dump())
+                if operation == "list":
+                    return jobs.list(session_id)
+                return getattr(jobs, operation)(session_id, draft_id)
+            result = await run_in_threadpool(invoke)
+            if operation == "preview":
+                return HTMLResponse(result, headers={
+                    "Content-Security-Policy": "default-src 'none'; script-src 'none'; img-src data:; "
+                                               "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+                })
+            return result
+        except AdmissionJobError as exc:
+            # These service branches precede persistence/enqueue. 503 is ambiguous,
+            # including commit failure and executor.submit failure: never unlock it.
+            rejected = ((operation == "create" and exc.status in {400, 409, 429}) or
+                        (operation == "publish" and exc.status in {400, 404, 429}))
+            return admission_error(exc.status, False if rejected else None)
+        except Exception:
+            return admission_error(503)
+
+    @app.get("/api/sessions/{session_id}/admission/drafts")
+    async def admission_list(session_id: str):
+        return await admission_call("list", session_id)
+
+    @app.post("/api/sessions/{session_id}/admission/drafts")
+    async def admission_create(session_id: str, request: Request):
+        return await admission_call("create", session_id, request=request)
+
+    @app.get("/api/sessions/{session_id}/admission/drafts/{draft_id}")
+    async def admission_get(session_id: str, draft_id: str):
+        return await admission_call("get", session_id, draft_id)
+
+    @app.get("/api/sessions/{session_id}/admission/drafts/{draft_id}/preview")
+    async def admission_preview(session_id: str, draft_id: str):
+        return await admission_call("preview", session_id, draft_id)
+
+    @app.post("/api/sessions/{session_id}/admission/drafts/{draft_id}/publish")
+    async def admission_publish(session_id: str, draft_id: str, request: Request):
+        return await admission_call("publish", session_id, draft_id, request)
 
     @app.get("/api/top/status")
     def top_status(serial: Optional[str] = Query(None, min_length=1, max_length=200)):

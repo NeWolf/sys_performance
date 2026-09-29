@@ -8,7 +8,7 @@ type PullResult = { id: string; duplicate: boolean; archive: string; files: stri
 type TopStatus = {
   id: string | null; status: string; running: boolean; stopping: boolean; importing: boolean
   count: number; target_count: number; interval: number; serial: string | null
-  error: string | null; archive: string | null; session_id: string | null
+  error: string | null; warning?: string | null; archive: string | null; session_id: string | null
   bytes: number; max_bytes: number; remote_path: string | null
   connected: boolean; connection_error: string | null; remote_cleaned: boolean
   started_at: number | null; ended_at: number | null; elapsed_seconds: number | null
@@ -356,6 +356,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
         <p>Top 状态：{topLabels[topStatus.status] || topStatus.status} · 设备：{topStatus.serial || '—'} · 已采样：{topStatus.count} / {topStatus.target_count === -1 ? '持续' : topStatus.target_count} · 间隔：{topStatus.interval} 秒</p>
         <p>开始时间：{topStatus.started_at ? new Date(topStatus.started_at * 1000).toLocaleString('zh-CN', { hour12: false }) : topStatus.id ? '未记录（旧版任务）' : '—'} · 已采集时长：{topStatus.id ? formatCaptureDuration(topStatus.elapsed_seconds) : '—'}{(!connected || !topStatus.connected || topPollError) && topStatus.id ? '（最后已知）' : ''}</p>
         <p>{topStatus.remote_cleaned ? '设备日志已清理 · 清理前大小' : '原始文件'}：{(topStatus.bytes / 1_000_000).toFixed(2)} / {(topStatus.max_bytes / 1_000_000).toFixed(0)} MB · {topStatus.archive ? '已拉取到本地' : topStatus.remote_cleaned ? '无本地归档' : '尚未拉取到本地'}</p>
+        {topStatus.warning && <p className="banner warning">{topStatus.warning}</p>}
         {topStatus.remote_path && <p>设备路径：{topStatus.remote_path}</p>}
         {(!connected || !topStatus.connected || topPollError) && <p className="error">当前状态未确认，仅展示最后已知数据；不代表设备采集已停止。同设备在线时仍可重试停止或拉取日志并分析，由后端确认任务身份与停止结果。{topStatus.connection_error}</p>}
         {topStatus.error && <p className="error">{topErrors[topStatus.error] || topStatus.error}{topStatus.archive ? '；已拉取样本可下载或导入。' : !topStatus.remote_cleaned && topStatus.bytes ? '；可拉取日志并分析，自动确认停止并保留已完成样本。' :''}</p>}
@@ -364,6 +365,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   </section>
   {view !== 'capture' && (topActive || topPollError || topStatus?.error) && <div className="banner warning" role="status">Top 采集：{topPollError || topStatus?.error || `${topLabels[topStatus!.status] || topStatus!.status} · ${topStatus!.count} 次`}。请到数据集查看或停止任务。</div>}
   {view !== 'capture' && (disconnected || devices.error || pollError || error) && <div className="banner warning" role="status">设备采集提示：{disconnected ? '设备已断开连接或不可用，正在自动检测重连。' : devices.error || pollError || error} 请到数据采集查看详情。</div>}
+  {view !== 'capture' && topStatus?.warning && <div className="banner warning" role="status">{topStatus.warning}</div>}
   {view !== 'capture' && notice && <div className="banner success device-notice" role="status">{notice}</div>}
   {view !== 'capture' && busy && <div className="banner info" role="status">{busyMessage}</div>}
   </>

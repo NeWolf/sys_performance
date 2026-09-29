@@ -1,5 +1,6 @@
 """Device-owned Top jobs; explicit, bounded local archives and imports."""
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -46,7 +47,7 @@ class TopCapture:
                     max_bytes=MAX_ARCHIVE_BYTES, remote_path=None,
                     connected=False, connection_error=None,
                     started_at=None, ended_at=None, elapsed_seconds=None,
-                    remote_cleaned=False)
+                    remote_cleaned=False, warning=None)
 
     @staticmethod
     def _serial(serial):
@@ -179,20 +180,52 @@ class TopCapture:
             stamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
         return directory / ("Top" + stamp + ".txt")
 
+    @staticmethod
+    def _size_warning(size, before, after):
+        return (
+            f"Top 归档字节数不一致：本地实际={size} 字节，"
+            f"拉取前={before} 字节，拉取后={after} 字节。"
+            "本地归档已保留，可继续分析或下载；数据可能不完整，请留意分析结果。")
+
+    def _saved_warning(self, path, size):
+        marker = path.with_suffix(".warning.json")
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        try:
+            with marker.open("rb") as stream:
+                data = json.loads(stream.read(1024))
+            if (not isinstance(data, dict) or set(data) != {"size", "before", "after"}
+                    or any(type(value) is not int or not 0 <= value <= MAX_ARCHIVE_BYTES
+                           for value in data.values()) or data["size"] != size):
+                return None
+            return self._size_warning(size, data["before"], data["after"])
+        except (OSError, ValueError):
+            return None
+
     def _query(self, serial, deadline=None):
         state = self._decode(serial, self._command(serial, "status", deadline=deadline))
         old = self._states.get(serial, {})
         if old.get("id") == state["id"] and state["id"]:
-            for key in ("archive", "session_id", "duplicate", "importing"):
+            for key in ("archive", "session_id", "duplicate", "importing", "warning"):
                 state[key] = old[key]
             if old["status"] in {"imported", "importing"}:
                 state["status"] = old["status"]
         if state["id"]:
             path = self._local_path(state)
-            if (not state["running"] and path.is_file() and not path.is_symlink()
-                    and 0 < path.stat().st_size == state["bytes"] <= MAX_ARCHIVE_BYTES):
-                self._archives[state["id"]] = path
-                state["archive"] = "/api/top/archive?capture_id=" + state["id"]
+            if not state["running"] and path.is_file() and not path.is_symlink():
+                size = path.stat().st_size
+                saved_warning = self._saved_warning(path, size)
+                if (0 < size <= MAX_ARCHIVE_BYTES
+                        and (size == state["bytes"] or saved_warning
+                             or state["id"] in self._archives)):
+                    self._archives[state["id"]] = path
+                    state["archive"] = "/api/top/archive?capture_id=" + state["id"]
+                    state["warning"] = state["warning"] or saved_warning
+                    if size != state["bytes"] and not state["warning"]:
+                        state["warning"] = (
+                            f"Top 归档字节数不一致：本地实际={size} 字节，"
+                            f"设备记录={state['bytes']} 字节。"
+                            "本地归档已保留，可继续分析或下载；数据可能不完整，请留意分析结果。")
         if old.get("importing") and old.get("id") == state["id"]:
             old.update(state)
             state = old
@@ -320,7 +353,7 @@ class TopCapture:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if path.exists() or path.is_symlink():
                     if (capture_id not in self._archives or path.is_symlink()
-                            or not path.is_file() or path.stat().st_size != state["bytes"]):
+                            or not path.is_file() or not 0 < path.stat().st_size <= MAX_ARCHIVE_BYTES):
                         raise AdbError("本地归档目标已存在，拒绝覆盖", 409)
                     return dict(self._state)
                 # Anonymous staging is never exposed through the archive API.
@@ -333,14 +366,30 @@ class TopCapture:
                     if size > MAX_ARCHIVE_BYTES:
                         raise AdbError("Top 原始归档超过 1GB（1000000000 字节）", 413)
                     after = self._current(serial, capture_id)
-                    if (after["running"] or after["remote_cleaned"] or size != state["bytes"]
-                            or size != after["bytes"]):
-                        raise AdbError("设备归档长度或状态变化，未发布本地文件", 502)
+                    if after["running"] or after["remote_cleaned"]:
+                        # Only validated protocol fields and the on-disk size: never
+                        # expose archive contents, host paths or command output.
+                        raise AdbError(
+                            "设备归档长度或状态变化，未发布本地文件；"
+                            f"本地实际={size} 字节，拉取前={state['bytes']} 字节，"
+                            f"拉取后={after['bytes']} 字节；"
+                            f"拉取前状态={state['status']}，拉取后状态={after['status']}；"
+                            f"拉取后仍运行={'是' if after['running'] else '否'}，"
+                            f"拉取后已清理={'是' if after['remote_cleaned'] else '否'}。"
+                            "请保留设备日志，并反馈此完整错误信息。", 502)
+                    if size == 0:
+                        raise AdbError("拉取到的 Top 日志为空，未发布本地文件，请重试拉取", 502)
+                    warning = None
+                    if size != state["bytes"] or size != after["bytes"]:
+                        warning = self._size_warning(size, state["bytes"], after["bytes"])
                     os.fsync(staging.fileno())
                     staging.seek(0)
                     # Hard-link publication is atomic and never overwrites a success.
                     pending = self.archive_root / (capture_id + "." + uuid.uuid4().hex + ".part")
                     created = False
+                    marker_created = False
+                    published = False
+                    marker = path.with_suffix(".warning.json")
                     try:
                         with pending.open("xb") as output:
                             created = True
@@ -348,16 +397,33 @@ class TopCapture:
                                 self._write_all(output, block)
                             output.flush()
                             os.fsync(output.fileno())
+                        if warning:
+                            # Persist validated numeric diagnostics before publishing
+                            # the archive, so restart recovery can identify it.
+                            if marker.exists() or marker.is_symlink():
+                                if self._saved_warning(path, size) != warning:
+                                    raise AdbError("本地归档提示记录已存在，拒绝覆盖", 409)
+                            else:
+                                with marker.open("x", encoding="utf-8") as metadata:
+                                    marker_created = True
+                                    json.dump({"size": size, "before": state["bytes"],
+                                               "after": after["bytes"]}, metadata)
+                                    metadata.flush()
+                                    os.fsync(metadata.fileno())
                         try:
                             os.link(pending, path)
+                            published = True
                         except FileExistsError as exc:
                             raise AdbError("本地归档目标已存在，拒绝覆盖", 409) from exc
                     finally:
-                        # Only this operation's private staging file is removed.
+                        # Never remove pre-existing metadata or published archives.
+                        if marker_created and not published:
+                            marker.unlink(missing_ok=True)
                         if created:
                             pending.unlink(missing_ok=True)
                 self._archives[capture_id] = path
                 self._state["archive"] = "/api/top/archive?capture_id=" + capture_id
+                self._state["warning"] = warning
                 return dict(self._state)
 
     def close(self):
