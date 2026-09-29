@@ -155,6 +155,30 @@ class TopCapture:
                     remote_cleaned=remote_cleaned,
                     remote_path=None if remote_cleaned else f"{REMOTE_ROOT}/{identity}/raw.txt")
 
+    def _local_path(self, state):
+        identity = state["id"]
+        legacy = self.archive_root / (identity + ".txt")
+        if legacy.exists() or legacy.is_symlink():
+            return legacy
+        directory = self.archive_root / identity
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise AdbError("本地归档目录无效，拒绝写入", 409)
+        # Per-task directories prevent collisions between devices started in
+        # the same second, while keeping the actual filename readable.
+        existing = sorted(directory.glob("Top*.txt"))
+        existing = [p for p in existing if re.fullmatch(r"Top[0-9]{14}\.txt", p.name)]
+        if len(existing) > 1:
+            raise AdbError("本地任务存在多个归档，拒绝自动选择", 409)
+        if existing:
+            return existing[0]
+        try:
+            stamp = time.strftime("%Y%m%d%H%M%S", time.localtime(state["started_at"] or time.time()))
+            if not re.fullmatch(r"[0-9]{14}", stamp):
+                raise ValueError()
+        except (ValueError, OverflowError, OSError):
+            stamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        return directory / ("Top" + stamp + ".txt")
+
     def _query(self, serial, deadline=None):
         state = self._decode(serial, self._command(serial, "status", deadline=deadline))
         old = self._states.get(serial, {})
@@ -164,7 +188,7 @@ class TopCapture:
             if old["status"] in {"imported", "importing"}:
                 state["status"] = old["status"]
         if state["id"]:
-            path = self.archive_root / (state["id"] + ".txt")
+            path = self._local_path(state)
             if (not state["running"] and path.is_file() and not path.is_symlink()
                     and 0 < path.stat().st_size == state["bytes"] <= MAX_ARCHIVE_BYTES):
                 self._archives[state["id"]] = path
@@ -292,7 +316,8 @@ class TopCapture:
                 if state["bytes"] == 0:
                     raise AdbError("设备没有完整的 Top 样本", 404)
                 self.archive_root.mkdir(parents=True, exist_ok=True)
-                path = self.archive_root / (capture_id + ".txt")
+                path = self._local_path(state)
+                path.parent.mkdir(parents=True, exist_ok=True)
                 if path.exists() or path.is_symlink():
                     if (capture_id not in self._archives or path.is_symlink()
                             or not path.is_file() or path.stat().st_size != state["bytes"]):
@@ -301,14 +326,16 @@ class TopCapture:
                 # Anonymous staging is never exposed through the archive API.
                 with tempfile.TemporaryFile(dir=self.archive_root) as staging:
                     self._command(serial, "pull", capture_id, output=staging)
-                    size = staging.tell()
+                    # A child's writes need not advance the parent's stream position.
+                    # Measure bytes on disk, including any buffered test/wrapper writes.
+                    staging.flush()
+                    size = os.fstat(staging.fileno()).st_size
                     if size > MAX_ARCHIVE_BYTES:
                         raise AdbError("Top 原始归档超过 1GB（1000000000 字节）", 413)
                     after = self._current(serial, capture_id)
                     if (after["running"] or after["remote_cleaned"] or size != state["bytes"]
                             or size != after["bytes"]):
                         raise AdbError("设备归档长度或状态变化，未发布本地文件", 502)
-                    staging.flush()
                     os.fsync(staging.fileno())
                     staging.seek(0)
                     # Hard-link publication is atomic and never overwrites a success.
@@ -352,6 +379,13 @@ class TopCapture:
         with self._lock:
             return self._archive_path_locked(capture_id)
 
+    @staticmethod
+    def archive_filename(path):
+        if re.fullmatch(r"Top[0-9]{14}\.txt", path.name):
+            return path.name
+        # Preserve legacy files in place but expose a readable name.
+        return "Top" + time.strftime("%Y%m%d%H%M%S", time.localtime(path.stat().st_mtime)) + ".txt"
+
     def _archive_path_locked(self, capture_id=None):
         capture_id = self._state["id"] if capture_id is None else capture_id
         if capture_id is not None:
@@ -360,7 +394,8 @@ class TopCapture:
             raise AdbError("Top 采集尚未结束，请停止后拉取", 409)
         path = self._archives.get(capture_id)
         if (path is None or path.is_symlink() or not path.is_file()
-                or path.resolve().parent != self.archive_root
+                or path.parent.is_symlink()
+                or path.resolve().parent not in (self.archive_root, self.archive_root / capture_id)
                 or not 0 < path.stat().st_size <= MAX_ARCHIVE_BYTES):
             raise AdbError("没有可用的本地 Top 归档，请先显式拉取", 404)
         return path
@@ -383,7 +418,7 @@ class TopCapture:
             self._state.update(importing=True, status="importing", error=self._capture_error)
         try:
             with path.open("rb") as stream:
-                result = self.store.import_files([(path.name, stream)], title)
+                result = self.store.import_files([(self.archive_filename(path), stream)], title)
             with self._lock:
                 self._state.update(session_id=result["id"], duplicate=result["duplicate"],
                                    status="imported", error=self._capture_error)

@@ -13,7 +13,7 @@ import sys
 from macos_compat import MACOS_MIN_VERSION, verify_macos_binaries
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 
 def run(*args):

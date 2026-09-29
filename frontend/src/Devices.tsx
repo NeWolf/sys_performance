@@ -46,6 +46,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   const guard = useEditGuard()
   const { error } = mutation
   const [notice, setNotice] = useState('')
+  const [feedbackSource, setFeedbackSource] = useState<'sysmonitor' | 'top'>('sysmonitor')
   const [status, setStatus] = useState<Status | null>(null)
   const running = useRef(false)
   const polling = useRef<Promise<void> | null>(null)
@@ -162,6 +163,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     if (action === 'delete-logs' && !window.confirm(`将永久删除车机 ${serial} 上 /log/sys/perf/ 中的 perf.log 和 perf.1.log 至 perf.4.log，无法恢复。若正在采集，会先关闭共享采集开关并停止测试进程，停止失败则不删除。尚未拉取的日志将丢失，请先备份；本地已导入的数据和备份不受影响。确认删除？`)) return
     await mutation.run(async (signal) => {
       running.current = true
+      setFeedbackSource('sysmonitor')
       setBusy(action)
       setNotice('')
       setPollError('')
@@ -208,6 +210,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     if (action === 'import' && !guard.confirm('导入 Top 日志后将切换分析会话并放弃未保存配置，是否继续？')) return
     await mutation.run(async (signal) => {
       running.current = true
+      setFeedbackSource('top')
       setBusy(`top-${action}`)
       setNotice('')
       try {
@@ -218,12 +221,14 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
           if (!signal.aborted) { setTopStatus(next); setTopPollError('') }
         } else if (action === 'archive') {
           const response = await apiResponse(`/api/top/archive?${new URLSearchParams({ capture_id: captureId! })}`, { signal })
+          const filename = response.headers.get('Content-Disposition')?.match(/filename="?(Top\d{14}\.txt)"?(?:;|$)/)?.[1]
+          if (!filename) throw new Error('归档文件名无效，请更新程序后重试下载。')
           const blob = await response.blob()
           if (signal.aborted) return
           const url = URL.createObjectURL(blob)
           const link = document.createElement('a')
           link.href = url
-          link.download = 'top_raw.txt'
+          link.download = filename
           document.body.append(link)
           link.click()
           link.remove()
@@ -305,9 +310,11 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       <button className="danger" disabled={locked || !connected} onClick={() => void perform('delete-logs')}>删除车机性能日志</button>
     </div>
     <p className="muted">未部署时自动部署，已部署直接开始采集；连接后每 5 秒自动刷新状态。始终写入文件；不自动提权重启、不自动删除设备日志；手动删除需确认，并先停止采集。采集属性为设备全局属性；异步模式仅对新启动实例保证生效。拉取日志会自动先停止尚未结束的采集，停止失败则不拉取。历史日志会一并拉取，关闭页面或断连不会停止采集。</p>
-    {busy && <p role="status">{busyMessage}</p>}
-    {error && <p className="error" role="alert">{error}</p>}
-    {notice && <p className="device-notice" role="status">{notice}</p>}
+    {feedbackSource === 'sysmonitor' && <>
+      {busy && <p role="status">{busyMessage}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="device-notice" role="status">{notice}</p>}
+    </>}
     {current && <div className="device-status"><p>采集程序：{current.deployed ? '已部署' : '未部署（开始采集时自动部署）'} · 测试进程：{current.pids.length ? current.pids.join(', ') : '未运行'} · 权限：{current.privilege}</p>
       <p>采集开关：{current.properties.test || '默认关闭'} · 间隔：{current.properties.interval || '1'} 秒 · 文件：{current.properties.tofile || '1'} · logcat：{current.properties.tologcat || '1'} · 异步属性：{current.properties.async || '0'}</p>
       <details><summary>设备日志文件</summary><pre>{current.files || '暂无日志文件'}</pre></details></div>}
@@ -338,6 +345,11 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
         <p className="muted">仅使用已经拉取的本地归档，无需设备在线；导入失败可在这里重试。</p>
       </details>
       <p className="muted">Top 参数与 SysMonitor 互不影响；每 2 秒尝试刷新所选设备状态。断连、关闭页面或退出本地服务不影响设备采集，重连后可查询、停止和拉取。单个原始文件最多 1GB（1,000,000,000 字节），达到上限前停止并保留完整样本。拉取日志并分析会先安全停止尚未结束的采集，停止失败则不拉取；拉取成功后保留本地归档并导入分析，成功后切换会话，不删除设备日志。</p>
+      {feedbackSource === 'top' && <>
+        {busy && <p role="status">{busyMessage}</p>}
+        {error && <p className="error" role="alert">{error}</p>}
+        {notice && <p className="device-notice" role="status">{notice}</p>}
+      </>}
       {topPollError && <p className="error" role="alert">Top 状态刷新失败：{topPollError}，正在重试。</p>}
       {!topStatus && !topPollError && <p role="status">{serial ? '正在查询 Top 状态…' : '请选择设备以查询 Top 任务。'}</p>}
       {topStatus && <div className="device-status" role="status">

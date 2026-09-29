@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -391,11 +392,129 @@ class TopCaptureTests(unittest.TestCase):
         self.assertEqual(restarted.status("device-1")["archive"], state["archive"])
         self.assertEqual(restarted.archive_path().read_bytes(), RAW)
 
+    def test_timestamp_archive_names_and_same_second_isolation(self):
+        started = 1790663405
+        filename = "Top" + time.strftime("%Y%m%d%H%M%S", time.localtime(started)) + ".txt"
+        paths = []
+        for serial in ("device-1", "device-2"):
+            identity = self.top.start(serial, count=1)["id"]
+            self.device.finish(serial)
+            self.device.jobs[serial] += [str(started), str(started + 1), str(started + 2)]
+            self.top.pull(serial, identity)
+            path = self.top.archive_path(identity)
+            self.assertEqual(path, self.top.archive_root / identity / filename)
+            self.assertEqual(path.read_bytes(), RAW)
+            self.assertEqual(self.top.archive_filename(path), filename)
+            self.top.import_capture(identity)
+            self.assertEqual(self.store.import_files.call_args.args[0][0][0], filename)
+            recovered = self.controller()
+            self.assertTrue(recovered.status(serial)["archive"])
+            self.assertEqual(recovered.archive_path(identity), path)
+            paths.append(path)
+        self.assertNotEqual(*paths)
+
+    def test_legacy_archive_recovered_without_rename(self):
+        identity = self.finished()
+        self.top.archive_root.mkdir()
+        path = self.top.archive_root / (identity + ".txt")
+        path.write_bytes(RAW)
+        modified = 1790663405
+        os.utime(path, (modified, modified))
+        recovered = self.controller()
+        self.assertTrue(recovered.status("device-1")["archive"])
+        self.assertEqual(recovered.archive_path(identity), path)
+        name = "Top" + time.strftime("%Y%m%d%H%M%S", time.localtime(modified)) + ".txt"
+        self.assertEqual(recovered.archive_filename(path), name)
+        recovered.import_capture(identity)
+        self.assertEqual(self.store.import_files.call_args.args[0][0][0], name)
+        self.assertEqual(path.read_bytes(), RAW)
+
+    def test_legacy_task_fallback_filename_stays_stable_after_restart(self):
+        identity = self.finished()
+        with patch("perf_top_capture.time.time", return_value=1790663405):
+            self.top.pull("device-1", identity)
+        path = self.top.archive_path(identity)
+        self.assertRegex(path.name, r"^Top[0-9]{14}\.txt$")
+        recovered = self.controller()
+        with patch("perf_top_capture.time.time", return_value=1790763405):
+            self.assertTrue(recovered.status("device-1")["archive"])
+            recovered.pull("device-1", identity)
+        self.assertEqual(recovered.archive_path(identity), path)
+
+    def test_timestamp_archive_rejects_directory_and_file_symlinks(self):
+        identity = self.finished()
+        directory = self.top.archive_root / identity
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.top.archive_root.mkdir()
+        directory.symlink_to(outside, target_is_directory=True)
+        self.error(409, self.top.pull, "device-1", identity)
+        self.assertEqual(list(outside.iterdir()), [])
+        # Use another task to test a symlink at the timestamp filename.
+        self.device.jobs["device-1"][0] = "d" * 32
+        directory = self.top.archive_root / ("d" * 32)
+        directory.mkdir()
+        original = outside / "original.txt"
+        original.write_bytes(RAW)
+        (directory / "Top20260929143005.txt").symlink_to(original)
+        self.error(409, self.top.pull, "device-1", "d" * 32)
+        self.error(404, self.top.archive_path)
+        self.assertEqual(original.read_bytes(), RAW)
+
+    def test_timestamp_archive_rejects_conflicting_local_targets(self):
+        identity = self.finished()
+        directory = self.top.archive_root / identity
+        directory.mkdir(parents=True)
+        first = directory / "Top20260929143005.txt"
+        first.write_bytes(b"user data")
+        self.error(409, self.top.pull, "device-1", identity)
+        self.assertEqual(first.read_bytes(), b"user data")
+        second = directory / "Top20260929143006.txt"
+        second.write_bytes(RAW)
+        self.error(409, self.top.pull, "device-1", identity)
+        self.error(404, self.top.archive_path)
+        self.assertEqual(second.read_bytes(), RAW)
+
+    def test_pull_subprocess_output_uses_file_size_not_parent_position(self):
+        staging_path = self.root / "subprocess-staging.bin"
+        payload_path = self.root / "device-raw.bin"
+        payload = RAW * 65536
+        payload_path.write_bytes(payload)
+        original = self.device.action
+        writer = AdbController(self.root / "writer", executable=sys.executable)
+        script = "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())"
+        for independent_position in (False, True):
+            with self.subTest(independent_position=independent_position):
+                identity = self.finished()
+                self.device.jobs["device-1"][5] = str(len(payload))
+
+                def pull(serial, args, output=None):
+                    if args[0] != "pull":
+                        return original(serial, args, output)
+                    if independent_position:
+                        # Model a child writer whose position is not shared with
+                        # the parent's stream, without requiring a Windows host.
+                        with staging_path.open("r+b") as child_output:
+                            writer.run("-c", script, str(payload_path), output=child_output)
+                        self.assertEqual(output.tell(), 0)
+                    else:
+                        writer.run("-c", script, str(payload_path), output=output)
+                    self.assertEqual(os.fstat(output.fileno()).st_size, len(payload))
+                    return ""
+
+                self.device.action = pull
+                with patch("perf_top_capture.tempfile.TemporaryFile",
+                           side_effect=lambda **kwargs: staging_path.open("w+b")):
+                    state = self.top.pull("device-1", identity)
+                self.assertTrue(state["archive"])
+                self.assertEqual(self.top.archive_path().read_bytes(), payload)
+                self.store.import_files.assert_not_called()
+
     def test_failed_pull_never_publishes_and_can_retry(self):
         identity = self.finished()
         self.device.fail_pull = True
         self.error(502, self.top.pull, "device-1", identity)
-        self.assertFalse((self.top.archive_root / (identity + ".txt")).exists())
+        self.assertEqual(list(self.top.archive_root.rglob("*.txt")), [])
         self.device.fail_pull = False
         self.device.payload = RAW[:-1]
         self.error(502, self.top.pull, "device-1", identity)
@@ -492,7 +611,7 @@ class TopCaptureTests(unittest.TestCase):
             return result
         self.device.action = switch
         self.assertRaises(AdbError, self.top.pull, "device-1", identity)
-        self.assertFalse((self.top.archive_root / (identity + ".txt")).exists())
+        self.assertEqual(list(self.top.archive_root.rglob("*.txt")), [])
 
     def test_import_survives_same_device_task_switch(self):
         identity = self.pulled()["id"]
@@ -584,7 +703,11 @@ class TopCaptureTests(unittest.TestCase):
             cleared = client.post("/api/top/clear", json=task)
             self.assertEqual(cleared.status_code, 200, cleared.text)
             self.assertTrue(cleared.json()["remote_cleaned"])
-            self.assertEqual(client.get(pulled.json()["archive"]).content, RAW)
+            downloaded = client.get(pulled.json()["archive"])
+            self.assertEqual(downloaded.content, RAW)
+            filename = self.top.archive_path(identity).name
+            self.assertRegex(filename, r"^Top[0-9]{14}\.txt$")
+            self.assertEqual(downloaded.headers["content-disposition"], f'attachment; filename="{filename}"')
             imported = client.post("/api/top/import", json={"confirm": True, "capture_id": identity})
             self.assertEqual(imported.status_code, 200, imported.text)
             self.assertTrue(client.post("/api/top/import", json={"confirm": True}).json()["duplicate"])

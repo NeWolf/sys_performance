@@ -260,7 +260,7 @@ def create_app(database, port=8765, development=False, frontend=None):
     def top_archive(capture_id: Optional[str] = Query(None, pattern=r"^[0-9a-f]{32}$")):
         try:
             path = top.archive_path(capture_id)
-            return FileResponse(path, media_type="text/plain", filename="top_raw.txt")
+            return FileResponse(path, media_type="text/plain", filename=top.archive_filename(path))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
