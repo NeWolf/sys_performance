@@ -32,7 +32,7 @@ class AdmissionApiTests(unittest.TestCase):
         self.top_factory = self.patches.enter_context(patch.object(perf_api, "TopCapture", side_effect=lambda *a: Mock()))
         self.reader = self.patches.enter_context(patch.object(jobs, "read_template", return_value="mock template"))
         self.builder = self.patches.enter_context(patch.object(jobs, "build_admission", side_effect=self.build))
-        self.publisher = self.patches.enter_context(patch.object(jobs, "publish_markdown", return_value={"pageId": "MockPage"}))
+        self.publisher = self.patches.enter_context(patch.object(jobs, "publish_markdown", return_value={"pageId": "MockPage", "verified": True}))
         self.app, self.client = self.open()
 
     def build(self, store, session, template, directory, scenes, factor):
@@ -97,11 +97,18 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"{BASE}/{D}/publish", json=PUBLISH).json()["state"], "publishing")
         value = self.wait("published")
         self.assertEqual(value["link"], "https://joyspace.jd.com/pages/MockPage")
-        self.assertEqual(self.client.post(f"{BASE}/{D}/publish", json=PUBLISH).json(), value)
         self.assertEqual(self.reader.call_count, 1)
         self.assertEqual(self.builder.call_count, 1)
         self.assertEqual(self.publisher.call_count, 1)
-        self.assert_error(self.client.post(f"{BASE}/{D}/publish", json=dict(PUBLISH, placement="child", parent_page="Other")), 409, False)
+        # The same data may be published again, to another location if wanted.
+        republish = self.client.post(f"{BASE}/{D}/publish",
+                                     json=dict(PUBLISH, placement="child", parent_page="https://joyspace.jd.com/pages/Other"))
+        self.assertEqual(republish.status_code, 200, republish.text)
+        self.assertEqual(republish.json()["state"], "publishing")
+        self.wait("published")
+        self.assertEqual(self.publisher.call_args.args[2:], ("child", "Other"))
+        self.assertEqual(self.builder.call_count, 1)
+        self.assertEqual(self.publisher.call_count, 2)
         self.assert_error(self.client.get(BASE.replace(S, "d" * 32) + f"/{D}"), 404, False)
 
     def test_auth_all_routes_before_lazy_initialization(self):
@@ -119,7 +126,7 @@ class AdmissionApiTests(unittest.TestCase):
         invalid = [("draft_id", x) for x in (D.upper(), D + "\n", "x", 123)]
         invalid += [("title", x) for x in ("", " ", "x\x00", "x" * 201, 123, None)]
         invalid += [("factor", x) for x in (True, False, "1.5", 0, -1, [], {})]
-        invalid += [("scenes", x) for x in (None, [], {"01": "unknown"}, {"-0": "unknown"}, {"+1": "unknown"}, {"1.0": "unknown"}, {" 1": "unknown"}, {"１": "unknown"}, {"-1": "unknown"}, {"0": True}, {"0": "auto"}, {"1": "unknown", "01": "foreground"})]
+        invalid += [("scenes", x) for x in ([], {"01": "unknown"}, {"-0": "unknown"}, {"+1": "unknown"}, {"1.0": "unknown"}, {" 1": "unknown"}, {"１": "unknown"}, {"-1": "unknown"}, {"0": True}, {"0": "auto"}, {"1": "unknown", "01": "foreground"})]
         invalid += [("extra", "SECRET")]
         for key, value in invalid:
             with self.subTest(key=key, value=value):
@@ -134,6 +141,12 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.wait()
         self.assertEqual(self.builder.call_args.args[5], 2)
+
+    def test_create_without_scenes_passes_none_to_generator(self):
+        response = self.client.post(BASE, json={"draft_id": D, "title": "自动场景"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.wait()
+        self.assertEqual(self.builder.call_args.args[4:6], (None, None))
 
     def test_publish_validation_and_paths(self):
         for field, values in {"confirmed": [False, 1, 0, "true", None], "placement": ["", "auto", 1], "parent_page": [1, True], "extra": ["SECRET"]}.items():
@@ -180,11 +193,12 @@ class AdmissionApiTests(unittest.TestCase):
         app, client = self.open()
         self.assertEqual(client.get(f"{BASE}/{D}").json()["state"], "unknown")
         self.assertEqual(client.get(f"{BASE}/{D2}").json()["state"], "failed")
-        self.assertEqual(client.post(f"{BASE}/{D}/publish", json=PUBLISH).json()["state"], "unknown")
         self.assertEqual(len(client.get(BASE).json()["drafts"]), 2)
-        self.assert_error(client.post(BASE, json=dict(CREATE, draft_id="d" * 32)), 409)
+        # Unknown or failed drafts no longer freeze the session: generating again is allowed.
+        self.assertEqual(client.post(BASE, json=dict(CREATE, draft_id="d" * 32)).json()["state"], "generating")
+        self.wait(draft="d" * 32, client=client)
         self.assertEqual(client.get(f"{BASE}/{D}/preview").status_code, 200)
-        self.assertEqual(self.builder.call_count, 2)
+        self.assertEqual(self.builder.call_count, 3)
         self.publisher.assert_not_called()
 
     def test_queue_full_is_definitely_not_accepted(self):
@@ -215,7 +229,7 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertIn("publish_request", manager._records[D2])
         self.publisher.assert_not_called()
 
-    def test_published_restart_does_not_repeat_remote_work(self):
+    def test_published_restart_reuses_artifacts_and_allows_republish(self):
         self.ready()
         self.client.post(f"{BASE}/{D}/publish", json=PUBLISH)
         published = self.wait("published")
@@ -223,8 +237,11 @@ class AdmissionApiTests(unittest.TestCase):
         app, client = self.open()
         self.assertEqual(client.get(f"{BASE}/{D}").json(), published)
         self.assertEqual(client.post(BASE, json=CREATE).json(), published)
-        self.assertEqual(client.post(f"{BASE}/{D}/publish", json=PUBLISH).json(), published)
+        # A restart alone never republishes; only an explicit new request does.
         self.assertEqual(self.publisher.call_count, 1)
+        self.assertEqual(client.post(f"{BASE}/{D}/publish", json=PUBLISH).json()["state"], "publishing")
+        self.wait("published", client=client)
+        self.assertEqual(self.publisher.call_count, 2)
         self.assertEqual(self.reader.call_count, 1)
 
     def test_close_waits_for_worker_then_releases_journal(self):

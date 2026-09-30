@@ -13,8 +13,10 @@ import re
 import sqlite3
 import threading
 
-from perf_admission import build_admission, _preview as render_report
-from perf_joyspace import PUBLISH_UNKNOWN, _page_id, publish_markdown, read_template, report_snapshot
+import perf_slate
+from perf_admission import build_admission
+from perf_joyspace import (JoySpaceError, PUBLISH_RECOVERED, PUBLISH_UNKNOWN, _page_id,
+                           publish_slate, read_template, report_snapshot)
 
 
 # Shared across every manager in this interpreter, including different roots.
@@ -46,13 +48,35 @@ def _text(value):
 
 
 class _Preview(HTMLParser):
-    TAGS = frozenset("p table thead tbody tr th td strong em b i br h1 h2 h3 h4 ul ol li pre code hr".split())
+    # The preview must reproduce the template's own layout, so the structural
+    # tags and the few presentational attributes the renderer emits are kept.
+    TAGS = frozenset("p div span table colgroup col thead tbody tr th td strong em b i"
+                     " br h1 h2 h3 h4 ul ol li pre code hr".split())
+    VOID = frozenset("br hr col".split())
     BLOCK = frozenset("script style iframe object embed svg math template".split())
+    SPANS = frozenset("colspan rowspan".split())
+    # Only inert values pass, and each pattern excludes quotes and angle brackets.
+    CLASS = re.compile(r"[A-Za-z][A-Za-z0-9 _-]{0,63}")
+    SPAN = re.compile(r"[1-9][0-9]{0,3}")
+    WIDTH = re.compile(r"width:\d{1,4}px")
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.blocked = []
+
+    @classmethod
+    def _attrs(cls, tag, attrs):
+        kept = ""
+        for name, value in attrs or ():
+            name, value = str(name).lower(), "" if value is None else str(value)
+            if name == "class" and cls.CLASS.fullmatch(value):
+                kept += f' class="{value}"'
+            elif name in cls.SPANS and cls.SPAN.fullmatch(value):
+                kept += f' {name}="{value}"'
+            elif name == "style" and tag == "col" and cls.WIDTH.fullmatch(value):
+                kept += f' style="{value}"'
+        return kept
 
     def handle_starttag(self, tag, attrs):
         if self.blocked:
@@ -62,13 +86,13 @@ class _Preview(HTMLParser):
         if tag in self.BLOCK:
             self.blocked.append(tag)
         elif tag in self.TAGS:
-            self.parts.append("<" + tag + ">")
+            self.parts.append("<" + tag + self._attrs(tag, attrs) + ">")
 
     def handle_endtag(self, tag):
         if self.blocked:
             if tag == self.blocked[-1]:
                 self.blocked.pop()
-        elif tag in self.TAGS and tag not in {"br", "hr"}:
+        elif tag in self.TAGS and tag not in self.VOID:
             self.parts.append("</" + tag + ">")
 
     def handle_data(self, data):
@@ -85,14 +109,8 @@ def _preview(source):
     parser = _Preview()
     parser.feed(source)
     parser.close()
-    return ('<!doctype html><html><head><meta charset="utf-8">'
-            '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-            'script-src \'none\'; img-src \'none\'; style-src \'unsafe-inline\'; '
-            'base-uri \'none\'; form-action \'none\'">'
-            '<style>body{font:14px sans-serif;overflow-wrap:anywhere}'
-            'table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px}'
-            '</style></head><body>'
-            + "".join(parser.parts) + '</body></html>')
+    # The same stylesheet the renderer ships, so the preview matches the page.
+    return perf_slate.wrap_preview("".join(parser.parts))
 
 
 def _sync_directory(path):
@@ -205,11 +223,6 @@ class AdmissionJobs:
             raise AdmissionJobError("草稿不存在。", 404)
         return record
 
-    def _unblocked(self, session_id):
-        if any(r["session_id"] == session_id and r["state"] in {"unknown", "publishing"}
-               for r in self._records.values()):
-            raise AdmissionJobError("本会话存在发布中或结果未知的草稿；禁止新生成和其它发布。", 409)
-
     def list(self, session_id):
         session_id = _id(session_id)
         with self._mutex:
@@ -223,21 +236,23 @@ class AdmissionJobs:
             self._open()
             return self._meta(self._find(session_id, draft_id))
 
-    def create(self, session_id, draft_id, title, scenes, factor):
+    def create(self, session_id, draft_id, title, scenes=None, factor=None):
         session_id, draft_id = _id(session_id), _id(draft_id)
         if not isinstance(title, str) or not title.strip() or len(title) > 200 or "\x00" in title:
             raise AdmissionJobError("标题不能为空、含NUL或超过200字符。")
-        if (not isinstance(scenes, dict) or any(type(k) is not int for k in scenes)
-                or any(not isinstance(v, str) or v not in {"background", "foreground", "unknown"}
-                       for v in scenes.values())):
-            raise AdmissionJobError("场景必须是整数段号到background/foreground/unknown的映射。")
+        if scenes is not None and (not isinstance(scenes, dict) or any(type(k) is not int for k in scenes)
+                                   or any(not isinstance(v, str)
+                                          or v not in {"background", "foreground", "unknown"}
+                                          for v in scenes.values())):
+            raise AdmissionJobError("场景可省略；给出时必须是整数段号到background/foreground/unknown的映射。")
         try:
             valid = factor is None or (type(factor) in (int, float) and math.isfinite(factor) and factor > 0)
         except (OverflowError, ValueError):
             valid = False
         if not valid:
             raise AdmissionJobError("factor必须是正有限数值或None。")
-        config = {"title": title, "scenes": [[k, v] for k, v in sorted(scenes.items())], "factor": factor}
+        config = {"title": title, "factor": factor,
+                  "scenes": None if scenes is None else [[k, v] for k, v in sorted(scenes.items())]}
         with self._mutex:
             self._open(write=True)
             existing = self._records.get(draft_id)
@@ -245,7 +260,8 @@ class AdmissionJobs:
                 if existing["session_id"] != session_id or existing["config"] != config:
                     raise AdmissionJobError("草稿ID已被不同会话或配置使用。", 409)
                 return self._meta(existing)
-            self._unblocked(session_id)
+            # The same measurement session may be generated any number of times;
+            # only an identical draft_id is deduplicated, for request idempotency.
             record = dict(draft_id=draft_id, session_id=session_id, title=title,
                           config=config, state="generating", warnings=[])
             return self._enqueue(record, self._generate)
@@ -301,13 +317,15 @@ class AdmissionJobs:
         try:
             directory = self._directory(record)
             directory.mkdir(exist_ok=True)
+            scenes = record["config"]["scenes"]
             result = build_admission(self._store, record["session_id"], read_template(), directory,
-                                     dict(record["config"]["scenes"]), record["config"]["factor"])
-            markdown, record["source_sha256"] = report_snapshot(directory / "report.md")
-            record["preview"] = _preview(render_report(markdown))
+                                     None if scenes is None else dict(scenes),
+                                     record["config"]["factor"])
+            blocks, record["source_sha256"] = report_snapshot(directory / "report.json")
+            record["preview"] = _preview(perf_slate.to_html(blocks))
             record["warnings"] = [_text(w) for w in result["warnings"]]
             # Flush every generated artifact before committing the ready state.
-            if not (directory / "report.md").is_file():
+            if not (directory / "report.json").is_file():
                 raise ValueError("missing report")
             for path in directory.iterdir():
                 if path.is_symlink() or not path.is_file():
@@ -319,18 +337,18 @@ class AdmissionJobs:
             _sync_directory(self._root)
             record["state"] = "ready"
         except BaseException:
-            record.update(state="failed", error="草稿生成失败，请检查会话、场景配置及模板；此草稿不可重试。")
+            record.update(state="failed", error="草稿生成失败，请检查会话、关注进程场景标注及模板；此草稿不可重试。")
         self._finish(record)
 
-    def _checked_markdown(self, record):
+    def _checked_slate(self, record):
         try:
-            path = self._directory(record) / "report.md"
+            path = self._directory(record) / "report.json"
             if path.is_symlink():
                 raise ValueError("unsafe report")
-            markdown, digest = report_snapshot(path)
+            blocks, digest = report_snapshot(path)
             if digest != record.get("source_sha256"):
                 raise ValueError("changed or legacy report")
-            return markdown
+            return blocks
         except Exception:
             raise AdmissionJobError("草稿内容已变化或版本过旧，请重新生成并完整预览后再发布。", 409) from None
 
@@ -341,7 +359,8 @@ class AdmissionJobs:
             record = self._find(session_id, draft_id)
             if "preview" not in record:
                 raise AdmissionJobError("草稿预览尚不可用。", 409)
-            return _preview(render_report(self._checked_markdown(record)))
+            # Re-render from the file so the preview always shows what would ship.
+            return _preview(perf_slate.to_html(self._checked_slate(record)))
 
     def publish(self, session_id, draft_id, placement, parent_page, confirmed):
         session_id, draft_id = _id(session_id), _id(draft_id)
@@ -362,15 +381,20 @@ class AdmissionJobs:
         with self._mutex:
             self._open(write=True)
             record = self._find(session_id, draft_id)
-            if "publish_request" in record:
-                if record["publish_request"] != request:
-                    raise AdmissionJobError("该草稿已锁定发布位置，不能再次发布。", 409)
-                return self._meta(record)
-            self._unblocked(session_id)
-            if record["state"] != "ready":
-                raise AdmissionJobError("仅可发布已就绪且从未发布的草稿。", 409)
-            self._checked_markdown(record)
+            if record["state"] == "publishing":
+                # Concurrency protection only: never send two remote requests for
+                # the same draft at once. An identical retry stays idempotent.
+                if record.get("publish_request") == request:
+                    return self._meta(record)
+                raise AdmissionJobError("该草稿正在发布中，请等待本次结果后再发布。", 409)
+            if record["state"] not in {"ready", "published", "unknown"}:
+                raise AdmissionJobError("仅可发布已生成完成的草稿。", 409)
+            self._checked_slate(record)
             record = deepcopy(record)
+            # A repeat publish creates another JoySpace page; drop the stale
+            # result so the new attempt cannot be mistaken for the old one.
+            record.pop("link", None)
+            record.pop("error", None)
             record.update(state="publishing", publish_request=request)
             return self._enqueue(record, self._publish)
 
@@ -381,14 +405,29 @@ class AdmissionJobs:
                 if self._broken:
                     raise AdmissionJobError("journal unavailable", 503)
             request = record["publish_request"]
-            self._checked_markdown(record)
-            result = publish_markdown(self._directory(record) / "report.md", record["title"],
-                                      request["placement"], request["parent_page"],
-                                      expected_sha256=record["source_sha256"])
+            self._checked_slate(record)
+            result = publish_slate(self._directory(record) / "report.json", record["title"],
+                                   request["placement"], request["parent_page"],
+                                   expected_sha256=record["source_sha256"])
             page = result["pageId"]
             if not isinstance(page, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", page):
                 raise ValueError("invalid result")
-            record.update(state="published", link="https://joyspace.jd.com/pages/" + page)
+            link = "https://joyspace.jd.com/pages/" + page
+            if result.get("verified") is True:
+                record.update(state="published", link=link)
+            elif result.get("verified") is False:
+                # A lookup found the page but nobody checked its body: hand the link
+                # over for manual review instead of claiming the publish succeeded.
+                record.update(state="unknown", link=link, error=PUBLISH_RECOVERED)
+            else:
+                raise ValueError("invalid result")
+        except JoySpaceError as exc:
+            # Only the lookup's own wording is forwarded, so an unrelated remote
+            # message can never reach the UI; anything else stays generic.
+            detail = str(exc)
+            record.update(state="unknown",
+                          error=detail if detail.startswith(PUBLISH_UNKNOWN) and len(detail) <= 2000
+                          else PUBLISH_UNKNOWN)
         except BaseException:
             record.update(state="unknown", error=PUBLISH_UNKNOWN)
         self._finish(record)

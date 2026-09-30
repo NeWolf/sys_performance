@@ -848,4 +848,4 @@ if (isMainModule()) {
   });
 }
 
-export { resolveAuth };
+export { resolveAuth, requestJoySpaceJson, resolveTargetLocation, requireTenantConfig };

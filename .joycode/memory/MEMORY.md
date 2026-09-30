@@ -5,3 +5,5 @@
 - [系统与进程内存应保留跨来源数值对比](feedback_memory_comparison.md) — 用户要求补算系统剩余内存，系统及进程内存跨来源均展示差值，进程保留排行
 
 - [离线报告表格优先均衡比例并允许名称换行](feedback_report_table_balance.md) — 用户纠正进程名称与PID过宽的布局，要求美观且允许进程名称换行
+
+- [准入报告允许重复生成与重复发布](feedback_admission_repeat.md) — 同一份性能数据不限制生成/发布次数，只保留同草稿并发与幂等保护

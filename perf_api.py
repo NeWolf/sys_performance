@@ -205,7 +205,7 @@ class AdmissionCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     draft_id: str = Field(pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
     title: str = Field(min_length=1, max_length=200)
-    scenes: dict[int, Literal["background", "foreground", "unknown"]]
+    scenes: Optional[dict[int, Literal["background", "foreground", "unknown"]]] = None
     factor: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="before")
@@ -218,6 +218,10 @@ class AdmissionCreateRequest(BaseModel):
         if isinstance(title, str) and (not title.strip() or "\x00" in title):
             raise ValueError("标题无效")
         scenes = values.get("scenes")
+        if scenes is None:
+            # Scenes are optional: 前台/后台 come from the session's 关注进程 groups.
+            values.pop("scenes", None)
+            return values
         if not isinstance(scenes, dict) or any(
             not isinstance(key, str) or not re.fullmatch(r"0|[1-9][0-9]*", key)
             for key in scenes

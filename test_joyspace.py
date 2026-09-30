@@ -1,4 +1,5 @@
 """Offline JoySpace regression: no authentication, network or real publishing."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -64,7 +65,8 @@ class JoySpaceBridgeTests(unittest.TestCase):
                                       "link": "https://evil", "auth": "secret", "images": ["local/path"]}) as invoke:
                 result = joy.publish_markdown(self.markdown, "a ; $(echo test)", placement,
                                               None if placement == "personal" else "parent123")
-                self.assertEqual(result, {"pageId": "new123", "link": "https://joyspace.jd.com/pages/new123"})
+                self.assertEqual(result, {"pageId": "new123", "link": "https://joyspace.jd.com/pages/new123",
+                                          "verified": True})
                 args = invoke.call_args.args[1]
                 self.assertIn("--image-free", args)
                 self.assertEqual(args[args.index("--source-sha256") + 1], joy.report_sha256(self.markdown))
@@ -103,8 +105,78 @@ class JoySpaceBridgeTests(unittest.TestCase):
                         {"sourceSha256": "0" * 64}, {"imageFree": False}, {"imageFree": 1}):
             with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
                     patch.object(joy, "_invoke", return_value={**valid, **changes}), \
+                    patch.object(joy, "find_published", return_value=[]) as lookup, \
                     self.assertRaisesRegex(joy.JoySpaceError, "结果未知"):
-                joy.publish_markdown(self.markdown, "report")
+                try:
+                    joy.publish_markdown(self.markdown, "report")
+                finally:
+                    # A lost confirmation is checked by reading, never by republishing.
+                    lookup.assert_called_once_with("report")
+
+    def test_find_published_keeps_only_self_consistent_markdown_matches(self):
+        pages = [{"id": "keep1", "title": " report ", "page_type": 13,
+                  "link": "https://joyspace.jd.com/pages/keep1", "created_at": "2026-09-30T10:00:00Z"},
+                 {"id": "keep2", "title": "report", "page_type": 13,
+                  "link": "https://joyspace.jd.com/pages/keep2", "created_at": "not-a-time"},
+                 {"id": "x1", "title": "report", "page_type": 1,
+                  "link": "https://joyspace.jd.com/pages/x1", "created_at": None},
+                 {"id": "x2", "title": "report draft", "page_type": 13,
+                  "link": "https://joyspace.jd.com/pages/x2"},
+                 {"id": "x3", "title": "report", "page_type": 13, "link": "https://evil/pages/x3"},
+                 {"id": "x4", "title": "report", "page_type": 13,
+                  "link": "https://joyspace.jd.com/pages/other4"},
+                 "junk"]
+        with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
+                patch.object(joy, "_invoke", return_value=pages) as invoke:
+            self.assertEqual(joy.find_published("report"),
+                             [{"pageId": "keep1", "link": "https://joyspace.jd.com/pages/keep1",
+                               "createdAt": "2026-09-30T10:00:00Z"},
+                              {"pageId": "keep2", "link": "https://joyspace.jd.com/pages/keep2",
+                               "createdAt": None}])
+            args = invoke.call_args.args[1]
+            self.assertEqual(args[-4:], ["--limit", "100", "--grep", "report"])
+            self.assertIn("--json", args)
+            self.assertIs(invoke.call_args.kwargs["shape"], list)
+
+    def test_find_published_validates_before_subprocess(self):
+        with patch.object(joy, "_check_runtime") as check:
+            for args, kwargs in ((("",), {}), ((" ",), {}), (("x" * 201,), {}), (("a\x00b",), {}),
+                                 ((None,), {}), (("report",), {"limit": 0}), (("report",), {"limit": 201}),
+                                 (("report",), {"limit": True}), (("report",), {"limit": "5"})):
+                with self.subTest(args=args, kwargs=kwargs), self.assertRaises(joy.JoySpaceError):
+                    joy.find_published(*args, **kwargs)
+            check.assert_not_called()
+
+    def test_recovery_reports_only_what_a_lookup_proves(self):
+        one = [{"pageId": "p1", "link": "https://joyspace.jd.com/pages/p1", "createdAt": None}]
+        two = one + [{"pageId": "p2", "link": "https://joyspace.jd.com/pages/p2", "createdAt": None}]
+        with patch.object(joy, "find_published", return_value=one):
+            self.assertEqual(joy._recover("report"),
+                             {"pageId": "p1", "link": "https://joyspace.jd.com/pages/p1",
+                              "createdAt": None, "verified": False, "message": joy.PUBLISH_RECOVERED})
+        with patch.object(joy, "find_published", return_value=[]), \
+                self.assertRaisesRegex(joy.JoySpaceError, "未发现同名页面"):
+            joy._recover("report")
+        with patch.object(joy, "find_published", return_value=two) as lookup, \
+                self.assertRaises(joy.JoySpaceError) as raised:
+            joy._recover("report")
+        self.assertIn("发现 2 个同名页面", str(raised.exception))
+        self.assertIn("https://joyspace.jd.com/pages/p2", str(raised.exception))
+        with patch.object(joy, "find_published", side_effect=joy.JoySpaceError("secret detail")), \
+                self.assertRaises(joy.JoySpaceError) as raised:
+            joy._recover("report")
+        self.assertEqual(str(raised.exception), joy.PUBLISH_UNKNOWN)
+        lookup.assert_called_once()
+
+    def test_recovered_link_is_returned_but_never_marked_verified(self):
+        with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
+                patch.object(joy, "_invoke", side_effect=joy.JoySpaceError(joy.PUBLISH_UNKNOWN)), \
+                patch.object(joy, "find_published", return_value=[
+                    {"pageId": "p1", "link": "https://joyspace.jd.com/pages/p1", "createdAt": None}]):
+            result = joy.publish_markdown(self.markdown, "report")
+        self.assertEqual(result["link"], "https://joyspace.jd.com/pages/p1")
+        self.assertIs(result["verified"], False)
+        self.assertIn("未经内容校验", result["message"])
 
     def test_errors_never_leak_stdout_stderr_and_do_not_retry(self):
         outcomes = [subprocess.CompletedProcess([], 1, "secret-stdout", "secret-stderr"),
@@ -239,7 +311,7 @@ globalThis.fetch = async (url, options) => {
     assert.equal(payload.title, 'report');
     assert.equal(payload.page_type, 13);
     assert.equal(payload.contentType, 'markdown');
-    assert.deepEqual(payload.content, [{value: '# report\nCPU 12.5%'}]);
+    assert.deepEqual(payload.content, [{value: EXPECTED_MARKDOWN}]);
     data = {id: 'formal123'};
   } else if (url.endsWith('/v3/pages/formal123/basic?sendRecent=0')) {
     data = {title: 'report'};
@@ -255,39 +327,43 @@ process.argv = [process.execPath, SCRIPT_PATH, '--file', REPORT_PATH, '--title',
                 '--image-free', '--source-sha256', EXPECTED_HASH];
 await import(SCRIPT_URL);
 '''
-        for scenario in ("success", "changed", "image"):
-            report.write_text("# report\nCPU 12.5%", encoding="utf-8")
-            digest = joy.report_sha256(report)
-            if scenario == "changed":
-                report.write_text("changed", encoding="utf-8")
-            elif scenario == "image":
-                report.write_text("![x](x.png)", encoding="utf-8")
-            source = (code.replace("EXPECTED_CALLS", "3" if scenario == "success" else "0")
-                      .replace("SCRIPT_PATH", json.dumps(str(script)))
-                      .replace("SCRIPT_URL", json.dumps(script.as_uri()))
-                      .replace("REPORT_PATH", json.dumps(str(report)))
-                      .replace("EXPECTED_HASH", json.dumps(digest)))
-            env = joy._environment(probe=True)
-            env.update(HOME=str(folder), USERPROFILE=str(folder))
-            if scenario == "success":
-                env["ME_TOKEN"] = "offline-mock-token"
-            result = subprocess.run([node, "--input-type=module", "-e", source], shell=False,
-                                    capture_output=True, text=True, timeout=20, cwd=folder, env=env)
-            with self.subTest(scenario=scenario):
+        for newline in ("\n", "\r\n"):
+            for scenario in ("success", "changed", "image"):
+                markdown = f"# report{newline}CPU 12.5%"
+                # Write exact bytes so both newline formats are tested on every OS.
+                report.write_bytes(markdown.encode("utf-8"))
+                digest = hashlib.sha256(report.read_bytes()).hexdigest()
+                if scenario == "changed":
+                    report.write_text("changed", encoding="utf-8")
+                elif scenario == "image":
+                    report.write_text("![x](x.png)", encoding="utf-8")
+                source = (code.replace("EXPECTED_CALLS", "3" if scenario == "success" else "0")
+                          .replace("EXPECTED_MARKDOWN", json.dumps(markdown))
+                          .replace("SCRIPT_PATH", json.dumps(str(script)))
+                          .replace("SCRIPT_URL", json.dumps(script.as_uri()))
+                          .replace("REPORT_PATH", json.dumps(str(report)))
+                          .replace("EXPECTED_HASH", json.dumps(digest)))
+                env = joy._environment(probe=True)
+                env.update(HOME=str(folder), USERPROFILE=str(folder))
                 if scenario == "success":
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    data = json.loads(result.stdout)
-                    self.assertTrue(data["verified"])
-                    self.assertTrue(data["imageFree"])
-                    self.assertEqual(data["pageId"], "formal123")
-                    self.assertEqual(data["sourceSha256"], digest)
-                    self.assertEqual(data["images"], {"skipped": True})
-                else:
-                    self.assertEqual(result.returncode, 1, result.stderr)
-                    self.assertEqual(result.stdout, "")
-                    expected = "Report changed after review" if scenario == "changed" else "Image-free report required"
-                    self.assertIn(expected, result.stderr)
-                    self.assertNotIn("AssertionError", result.stderr)
+                    env["ME_TOKEN"] = "offline-mock-token"
+                result = subprocess.run([node, "--input-type=module", "-e", source], shell=False,
+                                        capture_output=True, text=True, timeout=20, cwd=folder, env=env)
+                with self.subTest(newline=repr(newline), scenario=scenario):
+                    if scenario == "success":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        data = json.loads(result.stdout)
+                        self.assertTrue(data["verified"])
+                        self.assertTrue(data["imageFree"])
+                        self.assertEqual(data["pageId"], "formal123")
+                        self.assertEqual(data["sourceSha256"], digest)
+                        self.assertEqual(data["images"], {"skipped": True})
+                    else:
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        expected = "Report changed after review" if scenario == "changed" else "Image-free report required"
+                        self.assertIn(expected, result.stderr)
+                        self.assertNotIn("AssertionError", result.stderr)
 
     def test_offline_image_preprocessing(self):
         node = shutil.which("node")

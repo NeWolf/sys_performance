@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import perf_admission_jobs as jobs
-from perf_joyspace import JoySpaceError, PUBLISH_UNKNOWN
+from perf_joyspace import JoySpaceError, PUBLISH_RECOVERED, PUBLISH_UNKNOWN
 
 S = "a" * 32
 D = "b" * 32
@@ -27,7 +27,7 @@ class AdmissionJobsTests(unittest.TestCase):
         self.gates = []
         self.reader = patch.object(jobs, "read_template", return_value="template").start()
         self.builder = patch.object(jobs, "build_admission", side_effect=self.build).start()
-        self.publisher = patch.object(jobs, "publish_markdown", return_value={"pageId": "Page123", "link": "ignored"}).start()
+        self.publisher = patch.object(jobs, "publish_markdown", return_value={"pageId": "Page123", "link": "ignored", "verified": True}).start()
         self.addCleanup(patch.stopall)
         self.addCleanup(self.shutdown)
         self.manager = self.open()
@@ -178,7 +178,7 @@ class AdmissionJobsTests(unittest.TestCase):
         def remote(*args, **kwargs):
             entered.set()
             gate.wait(5)
-            return {"pageId": "Verified"}
+            return {"pageId": "Verified", "verified": True}
         self.publisher.side_effect = remote
         # Dropping the request result does not cancel the independent worker.
         self.publish()
@@ -190,10 +190,29 @@ class AdmissionJobsTests(unittest.TestCase):
         gate.set()
         result = self.wait(state="published")
         self.assertEqual(result["link"], "https://joyspace.jd.com/pages/Verified")
-        self.assertEqual(self.publish()["state"], "published")
-        self.assertEqual(self.publisher.call_count, 1)
+        # Publishing the same draft again is deliberate, not a duplicate click.
+        self.assertEqual(self.publish()["state"], "publishing")
+        self.wait(state="published")
+        self.assertEqual(self.publisher.call_count, 2)
 
-    def test_unknown_blocks_session_but_not_other_sessions(self):
+    def test_same_session_allows_repeated_generation_and_publishing(self):
+        self.create()
+        self.wait()
+        self.publish()
+        self.wait(state="published")
+        # The same measurement data may back another draft and another page.
+        self.create(D2)
+        self.wait(D2)
+        self.publish(D2)
+        self.wait(D2, "published")
+        result = self.manager.publish(S, D, "child", "https://joyspace.jd.com/pages/Other", True)
+        self.assertEqual(result["state"], "publishing")
+        self.wait(state="published")
+        self.assertEqual(self.publisher.call_args.args[2:], ("child", "Other"))
+        self.assertEqual(self.builder.call_count, 2)
+        self.assertEqual(self.publisher.call_count, 3)
+
+    def test_unknown_does_not_block_other_drafts_or_republishing(self):
         self.create()
         self.create(D2)
         self.wait()
@@ -201,26 +220,33 @@ class AdmissionJobsTests(unittest.TestCase):
         self.publisher.side_effect = JoySpaceError(PUBLISH_UNKNOWN)
         self.publish()
         self.wait(state="unknown")
-        self.error(409, self.create, "d" * 32)
-        self.error(409, self.publish, D2)
-        self.assertEqual(self.publish()["state"], "unknown")
+        # An unknown result no longer freezes the session: new drafts, other
+        # drafts and the unknown draft itself all stay publishable.
+        self.assertEqual(self.create("d" * 32)["state"], "generating")
+        self.wait("d" * 32)
+        self.assertEqual(self.publish(D2)["state"], "publishing")
+        self.wait(D2, "unknown")
+        self.assertEqual(self.publish()["state"], "publishing")
+        self.wait(state="unknown")
+        # An identical draft_id and configuration is still idempotent.
         self.assertEqual(self.create()["state"], "unknown")
         self.assertEqual(self.create("e" * 32, "f" * 32)["state"], "generating")
-        self.assertEqual(self.publisher.call_count, 1)
+        self.assertEqual(self.publisher.call_count, 3)
 
-    def test_publishing_blocks_other_drafts(self):
+    def test_publishing_only_blocks_the_same_draft(self):
         self.create()
         self.create(D2)
         self.wait()
         self.wait(D2)
         gate = self.gate()
-        self.publisher.side_effect = lambda *a, **kw: (gate.wait(5), {"pageId": "P"})[1]
+        self.publisher.side_effect = lambda *a, **kw: (gate.wait(5), {"pageId": "P", "verified": True})[1]
         self.publish()
-        self.error(409, self.create, "d" * 32)
-        self.error(409, self.publish, D2)
+        # Concurrency protection covers only the draft being published.
+        self.error(409, self.manager.publish, S, D, "child", "Other", True)
+        self.assertEqual(self.create("d" * 32)["state"], "generating")
+        self.assertEqual(self.publish(D2)["state"], "publishing")
         gate.set()
         self.wait(state="published")
-        self.publish(D2)
         self.wait(D2, "published")
 
     def test_restart_recovery_and_retention(self):
@@ -239,9 +265,9 @@ class AdmissionJobsTests(unittest.TestCase):
         self.assertEqual(manager.get(S, D)["state"], "unknown")
         self.assertEqual(manager.get(S, D2)["state"], "failed")
         self.assertEqual(len(manager.list(S)["drafts"]), 2)
-        self.assertEqual(self.publish(manager=manager)["state"], "unknown")
-        self.error(409, self.create, "d" * 32, S, manager)
+        # Recovery never resends by itself, but no longer freezes the session.
         self.publisher.assert_not_called()
+        self.assertEqual(self.create("d" * 32, S, manager)["state"], "generating")
         self.assertIn("safe", manager.preview(S, D))
         self.assertTrue((self.root / D / "report.md").exists())
 
@@ -255,15 +281,16 @@ class AdmissionJobsTests(unittest.TestCase):
         self.wait(state="published", manager=manager)
         manager.close()
         manager = self.open()
-        self.assertEqual(self.publish(manager=manager)["state"], "published")
+        self.assertEqual(self.publish(manager=manager)["state"], "publishing")
+        self.wait(state="published", manager=manager)
         self.assertEqual(self.builder.call_count, 1)
-        self.assertEqual(self.publisher.call_count, 1)
+        self.assertEqual(self.publisher.call_count, 2)
 
     def test_close_waits_and_releases_lock(self):
         self.create()
         self.wait()
         entered, gate = self.gate(), self.gate()
-        self.publisher.side_effect = lambda *a, **kw: (entered.set(), gate.wait(5), {"pageId": "P"})[2]
+        self.publisher.side_effect = lambda *a, **kw: (entered.set(), gate.wait(5), {"pageId": "P", "verified": True})[2]
         self.publish()
         self.assertTrue(entered.wait(3))
         thread = threading.Thread(target=self.manager.close)
@@ -285,7 +312,7 @@ class AdmissionJobsTests(unittest.TestCase):
                 self.error(400, self.manager.publish, S, invalid, "personal", None, True)
         for title in(None, "", " ", "x" * 201, "x\x00"):
             self.error(400, self.manager.create, S, D, title, {}, None)
-        for scenes in (None, [], {"1": "unknown"}, {True: "unknown"}, {1: "auto"}, {1: []}):
+        for scenes in ([], {"1": "unknown"}, {True: "unknown"}, {1: "auto"}, {1: []}):
             self.error(400, self.manager.create, S, D, "t", scenes, None)
         for factor in (True, 0, -1, float("nan"), float("inf"), "1", 10 ** 1000):
             self.error(400, self.manager.create, S, D, "t", {}, factor)
@@ -314,7 +341,8 @@ class AdmissionJobsTests(unittest.TestCase):
 
     def test_all_remote_errors_and_malformed_results_are_unknown(self):
         for index, failure in enumerate((TimeoutError("SECRET"), OSError("SECRET"),
-                JoySpaceError("SECRET"), KeyboardInterrupt(), {"pageId": "https://evil"}, {})):
+                JoySpaceError("SECRET"), KeyboardInterrupt(), {"pageId": "https://evil"}, {},
+                {"pageId": "Page123"})):
             manager = self.open(self.root / str(index))
             self.create(manager=manager)
             self.wait(manager=manager)
@@ -327,9 +355,38 @@ class AdmissionJobsTests(unittest.TestCase):
             result = self.wait(state="unknown", manager=manager)
             self.assertEqual(result["error"], PUBLISH_UNKNOWN)
             self.assertNotIn("SECRET", str(result))
+            self.assertNotIn("link", result)
             calls = self.publisher.call_count
-            self.publish(manager=manager)
-            self.assertEqual(self.publisher.call_count, calls)
+            # An unknown result may be retried by hand; it is never resent automatically.
+            self.assertEqual(self.publish(manager=manager)["state"], "publishing")
+            self.assertEqual(self.wait(state="unknown", manager=manager)["error"], PUBLISH_UNKNOWN)
+            self.assertEqual(self.publisher.call_count, calls + 1)
+
+    def test_unverified_lookup_keeps_the_candidate_link_for_manual_review(self):
+        self.create()
+        self.wait()
+        self.publisher.side_effect = None
+        self.publisher.return_value = {"pageId": "Found1", "verified": False,
+                                       "message": PUBLISH_RECOVERED}
+        self.publish()
+        result = self.wait(state="unknown")
+        # The draft is not published, but the candidate link is handed over as-is.
+        self.assertEqual(result["link"], "https://joyspace.jd.com/pages/Found1")
+        self.assertEqual(result["error"], PUBLISH_RECOVERED)
+        # A later manual publish drops the stale candidate before the new attempt.
+        self.publisher.return_value = {"pageId": "Real1", "verified": True}
+        self.publish()
+        self.assertEqual(self.wait(state="published")["link"], "https://joyspace.jd.com/pages/Real1")
+
+    def test_duplicate_candidates_are_reported_without_a_link(self):
+        self.create()
+        self.wait()
+        detail = PUBLISH_UNKNOWN + "已查询最近文档，发现 2 个同名页面：a、b。"
+        self.publisher.side_effect = JoySpaceError(detail)
+        self.publish()
+        result = self.wait(state="unknown")
+        self.assertEqual(result["error"], detail)
+        self.assertNotIn("link", result)
 
     def test_preview_is_sanitized_and_metadata_isolated(self):
         original = self.build
@@ -376,14 +433,14 @@ class AdmissionJobsTests(unittest.TestCase):
         self.wait()
         def remote(*args, **kwargs):
             self.manager._db.execute("PRAGMA query_only=ON")
-            return {"pageId": "AlreadyCreated"}
+            return {"pageId": "AlreadyCreated", "verified": True}
         self.publisher.side_effect = remote
         self.publish()
         self.wait(state="unknown")
         self.manager.close()
         manager = self.open()
         self.assertEqual(manager.get(S, D)["state"], "unknown")
-        self.publish(manager=manager)
+        # Restart never resends by itself; a manual retry stays under the caller's control.
         self.assertEqual(self.publisher.call_count, 1)
 
     def test_remote_observes_committed_publishing_record(self):
@@ -396,7 +453,7 @@ class AdmissionJobsTests(unittest.TestCase):
                 self.assertEqual(json.loads(row[0])["state"], "publishing")
             finally:
                 db.close()
-            return {"pageId": "P"}
+            return {"pageId": "P", "verified": True}
         self.publisher.side_effect = remote
         self.publish()
         self.wait(state="published")
@@ -489,10 +546,16 @@ class AdmissionJobsTests(unittest.TestCase):
         gate.set()
         self.wait()
         self.assertEqual(self.builder.call_args.args[-2:], ({1: "unknown"}, 1.5))
-        self.builder.side_effect = ValueError("scenes必须恰好覆盖所有segment")
+        self.builder.side_effect = ValueError("scenes包含未观测的segment，不允许额外段")
         self.manager.create(S, D2, "报告", {}, None)
         self.wait(D2, "failed")
         self.assertEqual(self.builder.call_args.args[-2], {})
+
+    def test_scenes_omitted_reaches_generator_as_none(self):
+        self.manager.create(S, D, "报告")
+        self.wait()
+        self.assertEqual(self.builder.call_args.args[-2:], (None, None))
+        self.assertEqual(self.manager.get(S, D)["state"], "ready")
 
 
 if __name__ == "__main__":

@@ -98,10 +98,9 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
   const draft = drafts.find((item) => item.draft_id === selected)
   const active = drafts.some((item) => item.state === 'generating' || item.state === 'publishing')
   const busy = requesting || active
-  const blocked = storageBlocked || recovery.some((item) => {
-    const info = drafts.find((entry) => entry.draft_id === item.draft_id)
-    return !info || ((item.unknown || item.attempted) && info.state !== 'published')
-  }) || active || drafts.some((item) => item.state === 'unknown')
+  // The same session may be generated and published repeatedly. Only in-flight
+  // work and an unusable recovery journal still gate writes.
+  const blocked = storageBlocked || active
   const attempted = recovery.find((item) => item.draft_id === selected)?.attempted
   const unknown = draft?.state !== 'published' && (draft?.state === 'unknown' || recovery.find((item) => item.draft_id === selected)?.unknown)
   const canClose = !requesting && (!active || !!error)
@@ -202,14 +201,11 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
     window.addEventListener('storage', onStorage)
     return () => window.removeEventListener('storage', onStorage)
   }, [storageKey])
-  function assertWrite(ownId?: string, revision?: number) {
+  function assertWrite(revision?: number) {
     syncRecovery()
-    const locked = journal.current.some((item) => {
-      if (item.draft_id === ownId) return item.unknown
-      const info = drafts.find((entry) => entry.draft_id === item.draft_id)
-      return !info || ((item.attempted || item.unknown) && info.state !== 'published')
-    })
-    if (recoveryFault.current || !listedRef.current || locked || active || drafts.some((item) => item.state === 'unknown') || (revision !== undefined && revision !== storageRevision.current)) throw new Error('恢复记录或安全门禁已变化，请刷新草稿列表后重新预览并确认；本次不会发送 POST。')
+    // Repeat generation and publishing are allowed; only a broken recovery
+    // journal, a stale draft list, or in-flight work may block a write.
+    if (recoveryFault.current || !listedRef.current || active || (revision !== undefined && revision !== storageRevision.current)) throw new Error('恢复记录或安全门禁已变化，请刷新草稿列表后重新预览并确认；本次不会发送 POST。')
     // localStorage read/merge/write is not an atomic cross-tab transaction.
   }
   async function run(action: (signal: AbortSignal) => Promise<void>, write = false) {
@@ -292,9 +288,11 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
     event.preventDefault()
     if (busy || guard.busy || blocked || !listed) return
     const number = factor.trim() === '' ? null : Number(factor)
-    if (!title.trim() || [...title].length > 200 || title.includes('\0') || segments.some((item) => !scenes[item.segment]) || (number !== null && (!Number.isFinite(number) || number <= 0))) {
-      setError('请填写不含空字符且不超过200字符的标题、明确选择每个时间段的场景；系数只能留空或填写正有限数。'); return
+    if (!title.trim() || [...title].length > 200 || title.includes('\0') || (number !== null && (!Number.isFinite(number) || number <= 0))) {
+      setError('请填写不含空字符且不超过200字符的标题；系数只能留空或填写正有限数。'); return
     }
+    // Scenes are optional: unselected segments follow the 关注进程 scene labels.
+    const chosen = Object.fromEntries(Object.entries(scenes).filter(([, value]) => value))
     void run(async (signal) => {
       assertWrite()
       const revision = storageRevision.current
@@ -302,7 +300,7 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
       remember(draftId, {}, true) // Persist before POST so a refresh cannot lose an ambiguous request.
       setSelected(draftId); resetPublish(); setDirty(false)
       try {
-        const result = await admissionPost(path, { draft_id: draftId, title: title.trim(), scenes, factor: number }, signal, () => assertWrite(draftId, revision))
+        const result = await admissionPost(path, { draft_id: draftId, title: title.trim(), factor: number, ...(Object.keys(chosen).length ? { scenes: chosen } : {}) }, signal, () => assertWrite(revision))
         signal.throwIfAborted(); accept(result, draftId)
       } catch (failure) {
         signal.throwIfAborted()
@@ -332,18 +330,19 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
     })
   }
   const parentValid = /^[A-Za-z0-9_-]{1,128}$/.test(parent.trim()) || !!safeLink(parent.trim())
-  const canPublish = draft?.state === 'ready' && !blocked && listed && !error && !attempted && !unknown && !busy && !!preview && previewLoaded && !!placement && (placement === 'personal' || parentValid) && confirmed
+  const republish = !!draft && draft.state !== 'ready'
+  const canPublish = !!draft && ['ready', 'published', 'unknown'].includes(draft.state) && !blocked && listed && !error && !busy && !!preview && previewLoaded && !!placement && (placement === 'personal' || parentValid) && confirmed
   function publish() {
     if (!canPublish || !draft || guard.busy) return
     const draftId = draft.draft_id
-    if (!window.confirm(`确认发布“${draft.title}”？将外发完整模板、指定章节统计与趋势 PNG，其他章节需人工填写。不会修改原模板。位置：${placement === 'personal' ? '个人空间' : `${placement === 'child' ? '目标页面的子页' : '目标页面的同级页'} · ${parent.trim()}`}。断开请求不代表撤回。`)) return
+    if (!window.confirm(`确认发布“${draft.title}”？将外发完整模板、指定章节统计与趋势 PNG，其他章节需人工填写。不会修改原模板。位置：${placement === 'personal' ? '个人空间' : `${placement === 'child' ? '目标页面的子页' : '目标页面的同级页'} · ${parent.trim()}`}。${republish ? '该草稿此前已发布或结果未知，本次将在 JoySpace 新建一个页面，不会覆盖或删除之前的页面。' : ''}断开请求不代表撤回。`)) return
     void run(async (signal) => {
       assertWrite()
       const revision = storageRevision.current
       remember(draftId, { attempted: true }, true)
       setConfirmed(false); setPlacement(''); setParent('')
       try {
-        const result = await admissionPost(`${path}/${draftId}/publish`, { placement, parent_page: placement === 'personal' ? null : parent.trim(), confirmed: true }, signal, () => assertWrite(draftId, revision))
+        const result = await admissionPost(`${path}/${draftId}/publish`, { placement, parent_page: placement === 'personal' ? null : parent.trim(), confirmed: true }, signal, () => assertWrite(revision))
         signal.throwIfAborted(); accept(result, draftId)
       } catch (failure) {
         signal.throwIfAborted()
@@ -370,18 +369,18 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
           <fieldset disabled={busy} className="config-fields">
             <div className="form-grid">
               <label>报告标题<input required value={title} onChange={(event) => { setTitle([...event.target.value].slice(0, 200).join('')); setDirty(true) }} /><small>最多200字符。</small></label>
-              <label>单核 KDMIPS 系数（可选）<input inputMode="decimal" value={factor} onChange={(event) => { setFactor(event.target.value); setDirty(true) }} placeholder="留空表示 K 不填" /><small>必须为正有限数，无默认值。</small></label>
+              <label>单核 KDMIPS 系数（可选）<input inputMode="decimal" value={factor} onChange={(event) => { setFactor(event.target.value); setDirty(true) }} placeholder="留空沿用离线报告默认 28.75" /><small>必须为正有限数。留空则与离线报告使用同一默认系数，K 列不会留空。</small></label>
             </div>
             <div className="admission-table-scroll" tabIndex={0} role="region" aria-label="时间段场景配置">
-              <table><thead><tr><th>时间段</th><th>起止时间</th><th>记录数</th><th>场景（必选）</th></tr></thead><tbody>
+              <table><thead><tr><th>时间段</th><th>起止时间</th><th>记录数</th><th>场景（可选，默认按关注进程标注）</th></tr></thead><tbody>
                 {segments.map((item) => <tr key={item.segment}><td>{item.segment}</td><td>{formatTime(item.start)} → {formatTime(item.end)}</td><td>{item.records}</td><td>
-                  <select required aria-label={`时间段 ${item.segment} 的场景`} value={scenes[item.segment] || ''} onChange={(event) => { setScenes({ ...scenes, [item.segment]: event.target.value as Scene | '' }); setDirty(true) }}>
-                    <option value="" disabled>请选择场景</option><option value="background">后台稳态</option><option value="foreground">前台交互</option><option value="unknown">未知 / 未分类</option>
+                  <select aria-label={`时间段 ${item.segment} 的场景`} value={scenes[item.segment] || ''} onChange={(event) => { setScenes({ ...scenes, [item.segment]: event.target.value as Scene | '' }); setDirty(true) }}>
+                    <option value="">自动：按关注进程标注</option><option value="background">后台稳态</option><option value="foreground">前台交互</option><option value="unknown">未知 / 未分类</option>
                   </select>
                 </td></tr>)}
               </tbody></table>
             </div>
-            <div className="actions config-actions"><button className="primary" type="submit" disabled={blocked || !listed || !segments.length}>仅生成本地草稿</button><span>{dirty ? '配置尚未生成' : '每次打开须重新选择场景'}</span></div>
+            <div className="actions config-actions"><button className="primary" type="submit" disabled={blocked || !listed || !segments.length}>仅生成本地草稿</button><span>{dirty ? '配置尚未生成' : '未选择场景的时间段按关注进程的前台/后台标注统计'}</span></div>
           </fieldset>
         </form>
         <section className="admission-section" aria-label="已建草稿">
@@ -396,30 +395,31 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
           })}</select></label>}
           {selected && <><p className="admission-id">草稿编号：{selected}</p><button disabled={requesting} onClick={() => { void run((signal) => query(selected, signal)) }}>查询该草稿状态</button></>}
           {storageBlocked && <p className="banner error" role="alert">本地恢复日志读取、校验或保存失败，或已被删除。本窗口已关闭生成和发布门禁；内存记录保留，仍可刷新列表、查询状态和查看预览，不会自动重发。</p>}
-          {blocked && !storageBlocked && <p className="banner info">存在进行中或待确认草稿，暂不允许生成新草稿。请查询原草稿，避免绕过未确认的发布结果。</p>}
+          {blocked && !storageBlocked && <p className="banner info">有草稿正在本地生成或发布中，请等待本次任务结束后再生成或发布。同一份数据可以多次生成与多次发布。</p>}
           {!listed && !storageBlocked && <p className="muted">写操作需刷新草稿列表后再确认；其他标签页更改恢复日志会清除预览和发布确认。</p>}
           {error && <p className="banner error" role="alert">{error}</p>}
           {draft && <p role="status">当前状态：<strong>{states[draft.state]}</strong> · {draft.title}</p>}
           {draft?.error && <p className="banner error" role="alert">{draft.error}</p>}
           {!!draft?.warnings.length && <ul className="banner info">{draft.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
-          {unknown && <p className="banner error admission-unknown" role="alert"><strong>发布结果未知，禁止重发该草稿。</strong> 请到 JoySpace 人工确认是否已创建页面，再查询原草稿状态。不要通过新草稿重复发布。关闭窗口不会撤回。</p>}
-          {attempted && !unknown && draft?.state !== 'published' && <p className="banner info">该草稿已尝试发布，仅允许查询结果，不会再次发送发布请求。</p>}
+          {unknown && <p className="banner error admission-unknown" role="alert"><strong>发布结果未知。</strong> 请先到 JoySpace 人工确认是否已创建页面，再决定是否再次发布；再次发布会新建页面，可能产生重复页面。关闭窗口不会撤回。</p>}
+          {draft?.state === 'unknown' && !!safeLink(draft.link) && <p className="banner info">查询到同名页面，但正文未经校验：<a href={safeLink(draft.link)} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">打开待人工确认的 JoySpace 页面</a>。确认无误后无需再次发布。</p>}
+          {attempted && !unknown && draft?.state !== 'published' && <p className="banner info">该草稿已尝试发布，请先查询结果；确认后可再次发布，不会自动重发。</p>}
           {draft?.state === 'published' && (safeLink(draft.link) ? <p><a href={safeLink(draft.link)} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">打开已发布的 JoySpace 页面</a></p> : <p className="banner error">已发布，但返回链接不符合安全格式，请到 JoySpace 人工确认。</p>)}
         </section>
         {draft && ['ready', 'published', 'unknown', 'failed'].includes(draft.state) && <section className="admission-section" aria-label="本地安全预览与发布">
           <div className="actions config-actions"><h3>本地安全预览</h3><button disabled={busy} onClick={loadPreview}>{preview ? '重新加载预览' : '加载本地预览'}</button></div>
           <p className="muted">预览不授予脚本、同源或导航权限。宽表可在预览内横向滚动；发布确认须等预览加载完成。</p>
           {preview && <div className="admission-preview-scroll"><iframe key={preview} className="admission-preview" title={`${draft.title} · 本地安全预览`} sandbox="" referrerPolicy="no-referrer" src={preview} onLoad={() => { if (previewRef.current === preview) setPreviewLoaded(true) }} /></div>}
-          {draft.state === 'ready' && !attempted && !unknown && <fieldset className="config-fields" disabled={busy || !previewLoaded}>
+          {['ready', 'published', 'unknown'].includes(draft.state) && <fieldset className="config-fields" disabled={busy || !previewLoaded}>
             <div className="form-grid">
               <label>发布位置（每次显式选择）<select value={placement} onChange={(event) => { setPlacement(event.target.value as Placement | ''); setParent(''); setConfirmed(false) }}>
                 <option value="" disabled>请选择发布位置</option><option value="personal">个人空间</option><option value="child">指定页面的子页</option><option value="sibling">指定页面的同级页</option>
               </select></label>
               {placement && placement !== 'personal' && <label>目标 JoySpace 页面链接或 ID<input required value={parent} onChange={(event) => { setParent(event.target.value); setConfirmed(false) }} placeholder="https://joyspace.jd.com/pages/页面ID" /><small>页面 ID 最长128字符；仅支持固定域页面链接（可带末尾斜杠）或页面 ID，不会默认发布为模板子页。</small>{parent && !parentValid && <small role="alert">请输入有效的 JoySpace 页面链接或 ID。</small>}</label>}
             </div>
-            <p className="banner info">发布将向 JoySpace 外发完整模板、指定章节统计及趋势 PNG，不修改原模板；其余章节需人工填写。</p>
+            <p className="banner info">发布将向 JoySpace 外发完整模板、指定章节统计及趋势 PNG，不修改原模板；其余章节需人工填写。{republish && '该草稿已发布过或结果未知，再次发布会新建页面，不会覆盖之前的页面。'}</p>
             <label className="admission-confirm"><input type="checkbox" checked={confirmed} disabled={!placement || (placement !== 'personal' && !parentValid)} onChange={(event) => setConfirmed(event.target.checked)} />我已查看本地预览，并确认上述外发内容与发布位置。</label>
-            <button className="primary" disabled={!canPublish} onClick={publish}>确认发布到 JoySpace</button>
+            <button className="primary" disabled={!canPublish} onClick={publish}>{republish ? '再次发布到 JoySpace' : '确认发布到 JoySpace'}</button>
           </fieldset>}
         </section>}
         {requesting && <p role="status">正在处理请求，请勿关闭或切换会话…</p>}
