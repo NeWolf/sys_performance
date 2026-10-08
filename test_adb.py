@@ -1,3 +1,5 @@
+import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -45,8 +47,9 @@ class FakeAdb(AdbController):
         if script.startswith("setprop "):
             _, key, value = script.split()
             self.props[key.rsplit(".", 1)[1]] = value
-        if script.startswith("for p in /proc"):
-            return " ".join(self.processes)
+        if 'echo sysmonitor-process-scan-v1' in script:
+            return "\n".join([f"lrwxrwxrwx 1 0 0 0 /proc/{pid}/exe -> /data/local/tmp/sysmonitor_test"
+                              for pid in self.processes] + ["sysmonitor-process-scan-v1"])
         if script.startswith("nohup ") and not self.fail_start:
             self.processes = ["123"]
         if "kill -TERM" in script and not self.keep_running:
@@ -92,6 +95,75 @@ class AdbTests(unittest.TestCase):
         self.assertEqual(error.exception.status, 409)
         self.adb.lock.release()
         self.adb.status("unit")
+
+    @patch("perf_adb.time.sleep")
+    def test_capture_timing_start_stop_pull_and_restart(self, _sleep):
+        with patch("perf_adb.time.time", return_value=1700000000), \
+                patch("perf_adb.time.monotonic", return_value=100):
+            result = self.adb.start("unit", 2)
+        self.assertEqual(result["started_at"], 1700000000)
+        self.assertEqual(result["elapsed_seconds"], 0)
+        with patch("perf_adb.time.monotonic", return_value=145):
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 45)
+            self.adb.pull("unit", self.store)
+        with patch("perf_adb.time.monotonic", return_value=200):
+            stopped = self.adb.status("unit")
+            self.assertEqual(stopped["elapsed_seconds"], 45)
+            self.assertIsNotNone(stopped["ended_at"])
+            with patch("perf_adb.time.time", return_value=1700000100):
+                restarted = self.adb.start("unit", 2)
+            self.assertEqual(restarted["started_at"], 1700000100)
+            self.assertEqual(restarted["elapsed_seconds"], 0)
+
+    def test_capture_observation_pid_change_and_disabled_switch(self):
+        self.adb.processes = ["2", "1"]
+        self.adb.props["test"] = "1"
+        with patch("perf_adb.time.monotonic", return_value=100):
+            first = self.adb.status("unit")
+        self.assertIsNone(first["started_at"])
+        self.assertIsNotNone(first["observed_at"])
+        self.adb.processes.reverse()
+        with patch("perf_adb.time.monotonic", return_value=130):
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 30)
+            self.adb.processes = ["3"]
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 0)
+        self.adb.props["test"] = "0"
+        with patch("perf_adb.time.monotonic", return_value=140):
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 10)
+        with patch("perf_adb.time.monotonic", return_value=180):
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 10)
+            self.adb.props["test"] = "1"
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 0)
+
+    def test_capture_timing_failure_preserves_record(self):
+        self.adb.processes = ["123"]
+        self.adb.props["test"] = "1"
+        with patch("perf_adb.time.monotonic", return_value=100):
+            self.adb.status("unit")
+        before = self.adb.capture_times["unit"].copy()
+        for method in ("pids", "properties", "is_deployed"):
+            with patch.object(self.adb, method, side_effect=AdbError("unconfirmed", 504)):
+                with self.assertRaises(AdbError):
+                    self.adb.status("unit")
+            self.assertEqual(self.adb.capture_times["unit"], before)
+        with patch("perf_adb.time.monotonic", return_value=150):
+            self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 50)
+
+    def test_capture_timing_expiry_is_not_extended_by_polling(self):
+        with patch("perf_adb.time.monotonic", return_value=100):
+            self.adb._capture_timing("unit", ["1"], True, (1700000000, 100))
+            self.adb._capture_timing("other", ["1"], True)
+            self.adb._capture_timing("other", [], False)
+        with patch("perf_adb.time.monotonic", return_value=86499):
+            self.assertEqual(self.adb._capture_timing("unit", ["1"], True)["elapsed_seconds"], 86399)
+            self.assertIn("other", self.adb.capture_times)
+        with patch("perf_adb.time.monotonic", return_value=86501):
+            result = self.adb._capture_timing("unit", ["1"], True)
+            self.assertIsNone(result["started_at"])
+            self.assertEqual(result["elapsed_seconds"], 0)
+            self.assertNotIn("other", self.adb.capture_times)
+            self.assertIsNone(self.adb._capture_timing("other", [], False)["elapsed_seconds"])
+        self.assertEqual(self.adb.calls, [])  # Retention never issues device commands.
 
     @patch("perf_adb.time.sleep")
     def test_start_stop_and_pull(self, _sleep):
@@ -264,12 +336,95 @@ class AdbTests(unittest.TestCase):
             self.assertEqual(error.exception.status, 409)
         self.assertFalse(any("rm -f" in str(c) for c in self.adb.calls))
 
+    def test_process_batch_requires_exact_executable(self):
+        rows = [
+            "lrwxrwxrwx 1 root root 0 /proc/12/exe -> /data/local/tmp/sysmonitor_test",
+            "lrwxrwxrwx 1 root root 0 /proc/13/exe -> /system/bin/sysmonitor",
+            "lrwxrwxrwx 1 root root 0 /proc/14/exe -> /data/local/tmp/sysmonitor_test.other",
+            "lrwxrwxrwx 1 root root 0 /proc/15/exe -> /data/local/tmp/sysmonitor_test (deleted)",
+            "sysmonitor-process-scan-v1",
+        ]
+        with patch.object(self.adb, "shell", return_value="\n".join(rows)) as shell:
+            self.assertEqual(self.adb.pids("unit", True), ["12"])
+        self.assertEqual(shell.call_count, 1)
+        self.assertTrue(shell.call_args.args[2])
+        self.assertNotIn("readlink", shell.call_args.args[1])
+
+    def test_process_batch_retry_and_timeout_never_use_slow_scan(self):
+        for value in ("", "unexpected output", AdbError("process disappeared", 502)):
+            with self.subTest(value=value), patch.object(self.adb, "shell", side_effect=[
+                    value, "lrwx 1 0 0 0 /proc/12/exe -> /data/local/tmp/sysmonitor_test\nsysmonitor-process-scan-v1"
+            ]) as shell:
+                self.assertEqual(self.adb.pids("unit", False), ["12"])
+                self.assertEqual(shell.call_count, 2)
+                self.assertTrue(all("readlink" not in call.args[1] for call in shell.call_args_list))
+        with patch.object(self.adb, "shell", side_effect=AdbError("timeout", 504)) as shell:
+            with self.assertRaisesRegex(AdbError, "批量查询 SysMonitor 进程") as error:
+                self.adb.pids("unit", False)
+            self.assertEqual(error.exception.status, 504)
+            self.assertEqual(shell.call_count, 1)
+        for invalid in ("", "bad\nsysmonitor-process-scan-v1", AdbError("permission denied", 502)):
+            with self.subTest(invalid=invalid), patch.object(self.adb, "shell", side_effect=[invalid, invalid]):
+                with self.assertRaisesRegex(AdbError, "无法确认 SysMonitor 进程状态"):
+                    self.adb.pids("unit", False)
+        with patch.object(self.adb, "shell", return_value="sysmonitor-process-scan-v1"):
+            self.assertEqual(self.adb.pids("unit", False), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell fixture")
+    def test_process_batch_script_on_real_symlinks(self):
+        proc = Path(self.temp.name) / "proc"
+        binary_root = Path(self.temp.name) / "executables"
+        for pid, target in ((12, "/data/local/tmp/sysmonitor_test"), (13, "/system/bin/sysmonitor"),
+                            (14, "/data/local/tmp/sysmonitor_test.other"), (15, "/missing")):
+            folder = proc / str(pid)
+            folder.mkdir(parents=True)
+            executable = binary_root / target.lstrip("/")
+            if pid != 15:
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.touch()
+            (folder / "exe").symlink_to(executable)
+        (proc / "self").symlink_to(proc / "12")
+        calls = []
+
+        def shell(_serial, script, _root):
+            calls.append(script)
+            local = script.replace("/proc/", shlex.quote(str(proc)) + "/")
+            result = subprocess.run(["sh", "-c", local], capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.replace(str(proc) + "/", "/proc/").replace(str(binary_root), "").strip()
+
+        with patch.object(self.adb, "shell", side_effect=shell):
+            self.assertEqual(self.adb.pids("unit", True), ["12"])
+        self.assertEqual(len(calls), 1)
+
+    def test_status_timeout_identifies_step_and_releases_lock(self):
+        for method, expected in (("root_mode", "查询 adbd 权限"),
+                                 ("snapshot", "读取性能日志目录"),
+                                 ("properties", "读取采集属性 test"),
+                                 ("is_deployed", "检查 SysMonitor 部署状态")):
+            with self.subTest(method=method), patch.object(self.adb, "shell", side_effect=AdbError("timeout", 504)):
+                with self.assertRaisesRegex(AdbError, expected) as error:
+                    if method == "root_mode":
+                        self.adb.status("unit")
+                    elif method == "properties":
+                        self.adb.properties("unit")
+                    else:
+                        getattr(self.adb, method)("unit", True)
+                self.assertEqual(error.exception.status, 504)
+                self.assertFalse(self.adb.lock.locked())
+        with patch.object(self.adb, "shell", side_effect=["2000", AdbError("timeout", 504)]):
+            with self.assertRaisesRegex(AdbError, "查询 su 0 权限"):
+                self.adb.status("unit")
+        self.assertFalse(self.adb.lock.locked())
+
     def test_subprocess_timeout_missing_and_arguments(self):
         adb = AdbController(self.temp.name, executable="adb")
         with patch("perf_adb.subprocess.run", side_effect=subprocess.TimeoutExpired("adb", 1)):
             with self.assertRaises(AdbError) as error:
                 adb.devices()
         self.assertEqual(error.exception.status, 504)
+        self.assertIn("查询设备列表", str(error.exception))
+        self.assertIn("10 秒", str(error.exception))
         with patch("perf_adb.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"0\r\n", b"")) as run:
             self.assertEqual(adb.shell("unit", "id -u", True), "0")
         command = run.call_args.args[0]

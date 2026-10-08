@@ -1071,6 +1071,68 @@ class DeviceScriptTests(unittest.TestCase):
         for name in ("ready", "sample", "header", "state.new"):
             self.assertFalse((self.job / name).exists(), name)
 
+    def test_byte_reads_work_without_head_c(self):
+        self.orphan()
+        self.command("head", 'case "$1" in -c) echo "head: unsupported -c" >&2; exit 1;; esac; exec /usr/bin/head "$@"')
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(status.stdout.splitlines()[0], self.identity)
+        self.assertEqual(status.stdout.splitlines()[1], "error")
+        pulled = self.shell("pull", self.identity)
+        self.assertEqual(pulled.returncode, 0, pulled.stderr)
+        self.assertEqual(pulled.stdout.encode(), RAW)
+        self.assertEqual(self.shell("clear", self.identity).returncode, 0)
+
+    def test_fallback_byte_reader_preserves_block_boundaries(self):
+        self.command("head", 'exit 1')
+        payload = bytes(range(256)) * 513
+        self.fixture.write_bytes(payload)
+        functions = self.source.split("MODE=$1\n", 1)[0]
+        for limit in (0, 33, 65535, 65536, 65537, 131079, len(payload) + 10):
+            with self.subTest(limit=limit):
+                result = subprocess.run(
+                    ["sh", "-c", functions + '\nread_bytes "$1" "$2"',
+                     "reader", str(limit), str(self.fixture)],
+                    env=self.env, capture_output=True, timeout=4)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, payload[:limit])
+
+    def test_current_accepts_only_optional_lf(self):
+        self.orphan()
+        for ending in (b"", b"\n"):
+            with self.subTest(ending=ending):
+                (self.root / "current").write_bytes(self.identity.encode() + ending)
+                result = self.shell("status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[0], self.identity)
+
+    def test_current_read_failure_is_not_reported_as_invalid_identity(self):
+        self.orphan()
+        self.command("head", 'echo "read failed" >&2; exit 1')
+        self.command("dd", 'echo "read failed" >&2; exit 1')
+        before = (self.job / "raw.txt").read_bytes()
+        status = self.shell("status")
+        self.assertNotEqual(status.returncode, 0)
+        self.assertIn("Cannot read current capture identity", status.stderr)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), before)
+        self.assertFalse((self.job / "done").exists())
+
+    def test_invalid_current_never_stops_or_changes_task(self):
+        self.orphan()
+        before = (self.job / "raw.txt").read_bytes()
+        for identity in (b"", b"../outside", b"d" * 31, b"d" * 33,
+                         b"d" * 32 + b"\r\n", b"d" * 32 + b"\nextra"):
+            (self.root / "current").write_bytes(identity)
+            for mode, args in (("status", ()), ("stop", (self.identity,)),
+                               ("pull", (self.identity,)), ("clear", (self.identity,))):
+                with self.subTest(identity=identity, mode=mode):
+                    result = self.shell(mode, *args)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Invalid current capture identity", result.stderr)
+                    self.assertEqual((self.job / "raw.txt").read_bytes(), before)
+                    self.assertFalse((self.job / "stop").exists())
+                    self.assertFalse((self.job / "done").exists())
+
     def test_worker_rejects_forged_inheritance_and_missing_lock(self):
         self.orphan()
         lock = self.job / "worker.lock"
@@ -1158,6 +1220,75 @@ class DeviceScriptTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[1], "error")
         self.assertEqual(result.stdout.splitlines()[6], "interrupted")
         self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
+
+    def test_control_lock_rejects_unsafe_file_before_task_access(self):
+        self.orphan()
+        original = (self.job / "raw.txt").read_bytes()
+        # A directory used as a lock must fail before reading invalid current.
+        (self.root / "current").write_bytes(b"invalid")
+        (self.root / "control.lock").mkdir()
+        for mode, args in (("status", ()), ("stop", (self.identity,)),
+                           ("pull", (self.identity,)), ("clear", (self.identity,))):
+            with self.subTest(mode=mode):
+                result = self.shell(mode, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Unsafe control lock", result.stderr)
+                self.assertNotIn("Invalid current capture identity", result.stderr)
+                self.assertEqual((self.job / "raw.txt").read_bytes(), original)
+                self.assertFalse((self.job / "stop").exists())
+                self.assertFalse((self.job / "done").exists())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses mode permissions")
+    def test_control_lock_permission_failure_never_continues(self):
+        self.orphan()
+        original = (self.job / "raw.txt").read_bytes()
+        lock = self.root / "control.lock"
+        lock.write_bytes(b"preserve lock inode and contents")
+        lock.chmod(0o400)
+        for mode, args in (("status", ()), ("stop", (self.identity,)),
+                           ("pull", (self.identity,)), ("clear", (self.identity,))):
+            with self.subTest(mode=mode):
+                result = self.shell(mode, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("control lock permission denied", result.stderr)
+                self.assertIn("state unconfirmed", result.stderr)
+                self.assertEqual((self.job / "raw.txt").read_bytes(), original)
+                self.assertFalse((self.job / "stop").exists())
+                self.assertFalse((self.job / "done").exists())
+        lock.chmod(0o600)
+        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+        self.assertEqual(lock.read_bytes(), b"preserve lock inode and contents")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses mode permissions")
+    def test_unreadable_capture_metadata_never_reports_idle_or_changes_logs(self):
+        self.orphan()
+        original = (self.job / "raw.txt").read_bytes()
+        script_content = self.script.read_text()
+        for path, permissions, message in (
+            (self.root / "current", 0o000, "current pointer permission denied"),
+            (self.root, 0o600, "capture directory permission denied"),
+        ):
+            previous = path.stat().st_mode & 0o777
+            try:
+                path.chmod(permissions)
+                for mode, args in (("status", ()), ("stop", (self.identity,)),
+                                   ("pull", (self.identity,)), ("clear", (self.identity,))):
+                    with self.subTest(path=path.name, mode=mode):
+                        # Feed the script directly: the fixture stores it inside
+                        # ROOT, whose search permission is intentionally removed.
+                        result = subprocess.run(
+                            ["sh", "-c", script_content, "control.sh", mode, *args],
+                            env=self.env, capture_output=True, text=True, timeout=4,
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(message, result.stderr)
+                        self.assertIn("state unconfirmed", result.stderr)
+                        self.assertNotIn("idle", result.stdout)
+            finally:
+                path.chmod(previous)
+            self.assertEqual((self.job / "raw.txt").read_bytes(), original)
+            self.assertFalse((self.job / "stop").exists())
+            self.assertFalse((self.job / "done").exists())
 
     def test_live_lifetime_lock_and_control_lock_block_recovery(self):
         import fcntl

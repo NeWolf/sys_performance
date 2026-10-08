@@ -29,6 +29,8 @@ class AdbController:
         self.executable = executable or os.environ.get("SYSMONITOR_ADB") or shutil.which("adb")
         self.binary = Path(__file__).parent / "frontend/src/sysmonitor_test/sysmonitor"
         self.lock = threading.Lock()
+        # Local service lifetime only; PID observations are not process birth times.
+        self.capture_times = {}
 
     def run(self, *args, timeout=10, output=None):
         if not self.executable:
@@ -38,7 +40,8 @@ class AdbController:
                                     stdout=output if output is not None else subprocess.PIPE,
                                     stderr=subprocess.PIPE, timeout=timeout, shell=False)
         except subprocess.TimeoutExpired as exc:
-            raise AdbError("ADB 操作超时；设备操作可能已生效，请刷新状态后重试", 504) from exc
+            step = "（查询设备列表）" if args == ("devices", "-l") else ""
+            raise AdbError(f"ADB 操作超时{step}（{timeout} 秒）；设备操作可能已生效，请刷新状态后重试", 504) from exc
         except OSError as exc:
             raise AdbError("无法执行 ADB，请检查安装及本机文件权限", 503) from exc
         if result.returncode:
@@ -75,28 +78,59 @@ class AdbController:
         return self.run("-s", serial, "shell", "-T", command,
                         timeout=40 if output is not None else 10, output=output)
 
+    def _shell_step(self, serial, script, root=False, *, step):
+        try:
+            return self.shell(serial, script, root)
+        except AdbError as exc:
+            raise AdbError(f"{step}：{exc}", exc.status) from exc
+
     def root_mode(self, serial):
-        if self.shell(serial, "id -u") == "0":
+        if self._shell_step(serial, "id -u", step="查询 adbd 权限") == "0":
             return False
-        if self.shell(serial, "id -u", True) != "0":
+        if self._shell_step(serial, "id -u", True, step="查询 su 0 权限") != "0":
             raise AdbError("需要 root adbd 或支持 su 0 的设备；不会自动执行 adb root", 403)
         return True
 
     def pids(self, serial, root):
-        script = ('for p in /proc/[0-9]*/exe; do '
-                  f'if [ "$(readlink "$p")" = "{REMOTE_BIN}" ]; then '
-                  'v=${p#/proc/}; echo "${v%/exe}"; fi; done')
-        values = self.shell(serial, script, root).split()
-        if any(not value.isdecimal() for value in values):
-            raise AdbError("设备进程查询返回无效结果", 502)
-        return values
+        # Kernel threads have exe symlinks with no readable target. Passing
+        # them to Android ls fails the entire query. Filter with shell builtins
+        # and never fall back to spawning readlink once per device process.
+        marker = "sysmonitor-process-scan-v1"
+        script = ('[ -f /proc/self/exe ] || exit 1; '
+                  'set --; for p in /proc/[0-9]*/exe; do '
+                  '[ ! -f "$p" ] || set -- "$@" "$p"; done; '
+                  'if [ "$#" -gt 0 ]; then LC_ALL=C ls -ldn "$@" || exit 1; fi; '
+                  f'echo {marker}')
+        for attempt in range(2):
+            try:
+                listing = self._shell_step(serial, script, root,
+                                           step="批量查询 SysMonitor 进程")
+                lines = listing.splitlines()
+                if not lines or lines[-1] != marker:
+                    raise AdbError("设备进程查询返回无效结果：缺少完成标记", 502)
+                rows = [re.fullmatch(r".*\s/proc/([0-9]+)/exe -> (.+)", line)
+                        for line in lines[:-1]]
+                if not all(rows):
+                    raise AdbError("设备进程查询返回无效结果：不兼容的文件列表", 502)
+                return [row.group(1) for row in rows if row.group(2) == REMOTE_BIN]
+            except AdbError as exc:
+                # A process may exit between the builtin check and ls. Retry
+                # once; permission/format failures must never mean no process.
+                if exc.status != 502:
+                    raise
+                if attempt:
+                    raise AdbError(f"无法确认 SysMonitor 进程状态，未使用逐进程慢扫描：{exc}",
+                                   exc.status) from exc
 
     def properties(self, serial):
-        return {key: self.shell(serial, "getprop persist.sm.perf." + key) for key in PROPERTIES}
+        return {key: self._shell_step(serial, "getprop persist.sm.perf." + key,
+                                      step="读取采集属性 " + key) for key in PROPERTIES}
 
     def setprop(self, serial, key, value, root):
-        self.shell(serial, "setprop persist.sm.perf." + key + " " + shlex.quote(value), root)
-        if self.shell(serial, "getprop persist.sm.perf." + key) != value:
+        self._shell_step(serial, "setprop persist.sm.perf." + key + " " + shlex.quote(value), root,
+                         step="设置采集属性 " + key)
+        if self._shell_step(serial, "getprop persist.sm.perf." + key,
+                            step="确认采集属性 " + key) != value:
             raise AdbError("属性设置未生效：" + key, 502)
 
     def status(self, serial):
@@ -105,13 +139,41 @@ class AdbController:
             return self.snapshot(serial, root)
 
     def is_deployed(self, serial, root):
-        return self.shell(serial, f'if [ -f {REMOTE_BIN} ] && [ -x {REMOTE_BIN} ]; then echo yes; fi', root) == "yes"
+        return self._shell_step(serial, f'if [ -f {REMOTE_BIN} ] && [ -x {REMOTE_BIN} ]; then echo yes; fi',
+                                root, step="检查 SysMonitor 部署状态") == "yes"
+
+    def _capture_timing(self, serial, pids, enabled, started=None):
+        """Update only after confirmed state; never use this cache to stop a PID."""
+        now, tick = time.time(), time.monotonic()
+        # Expire by record age, not last poll; polling must not extend retention.
+        self.capture_times = {key: value for key, value in self.capture_times.items()
+                              if tick - value["created_tick"] < 86400}
+        record = self.capture_times.get(serial)
+        identity = tuple(sorted(set(pids)))
+        active = bool(identity) and enabled
+        if active and (started is not None or record is None
+                       or record["pids"] != identity or record["ended_at"] is not None):
+            wall, begin = started if started is not None else (now, tick)
+            record = {"pids": identity, "started_at": wall if started is not None else None,
+                      "observed_at": now, "begin_tick": begin, "created_tick": tick,
+                      "ended_at": None, "elapsed_seconds": 0}
+            self.capture_times[serial] = record
+        if record is not None and record["ended_at"] is None:
+            record["elapsed_seconds"] = max(0, int(tick - record["begin_tick"]))
+            if not active:
+                record["ended_at"] = now
+        fields = ("started_at", "observed_at", "ended_at", "elapsed_seconds")
+        return {key: record[key] if record is not None else None for key in fields}
 
     def snapshot(self, serial, root):
-        files = self.shell(serial, f'if [ -d {PERF_DIR} ]; then ls -ln {PERF_DIR}; fi', root)
-        return {"serial": serial, "pids": self.pids(serial, root),
-                "properties": self.properties(serial), "files": files,
-                "privilege": "su 0" if root else "root adbd", "deployed": self.is_deployed(serial, root)}
+        files = self._shell_step(serial, f'if [ -d {PERF_DIR} ]; then ls -ln {PERF_DIR}; fi',
+                                 root, step="读取性能日志目录")
+        pids = self.pids(serial, root)
+        properties = self.properties(serial)
+        deployed = self.is_deployed(serial, root)
+        timing = self._capture_timing(serial, pids, properties["test"] == "1")
+        return {"serial": serial, "pids": pids, "properties": properties, "files": files,
+                "privilege": "su 0" if root else "root adbd", "deployed": deployed, **timing}
 
     def start(self, serial, interval, tologcat=False, async_write=False):
         with self.device(serial):
@@ -134,15 +196,19 @@ class AdbController:
                 for key, value in (("interval", str(interval)), ("tofile", "1"),
                                    ("tologcat", str(int(tologcat))), ("async", str(int(async_write))), ("test", "1")):
                     self.setprop(serial, key, value, root)
+                started = (time.time(), time.monotonic())
                 self.shell(serial, f"nohup {REMOTE_BIN} >/data/local/tmp/sysmonitor_test.stderr 2>&1 </dev/null &", root)
                 time.sleep(2)
-                if not self.pids(serial, root):
+                pids = self.pids(serial, root)
+                if not pids:
                     raise AdbError("程序启动失败，请检查设备 /data/local/tmp/sysmonitor_test.stderr 与动态库兼容性", 502)
+                self._capture_timing(serial, pids, True, started)
                 return self.snapshot(serial, root)
             except AdbError as exc:
                 # Disable collection after partial start; never report a rollback we cannot confirm.
                 try:
                     self.setprop(serial, "test", "0", root)
+                    self._capture_timing(serial, [], False)
                 except AdbError:
                     raise AdbError(str(exc) + "；关闭采集也失败，请立即检查设备状态", 502) from exc
                 raise AdbError(str(exc) + "；采集开关已关闭，其余配置可能已修改，请刷新状态", exc.status) from exc
@@ -161,6 +227,7 @@ class AdbController:
             self.shell(serial, f'[ "$(readlink /proc/{pid}/exe)" != "{REMOTE_BIN}" ] || kill -TERM {pid}', root)
         for _ in range(10):
             if not self.pids(serial, root):
+                self._capture_timing(serial, [], False)
                 return
             time.sleep(0.2)
         raise AdbError("采集开关已关闭，但测试进程尚未退出；未强制杀进程，请刷新状态", 409)

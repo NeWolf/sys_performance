@@ -10,9 +10,30 @@ valid_id() {
     [ ${#1} -eq 32 ] || return 1
     case "$1" in *[!0-9a-f]*) return 1;; esac
 }
+# Probe the option, not just the command: some Android head versions lack -c.
+# Select before reading so a failed stream is never retried/duplicated.
+read_bytes() (
+    LIMIT=$1; FILE=$2
+    if head -c 0 /dev/null >/dev/null 2>&1; then
+        head -c "$LIMIT" "$FILE"
+    else
+        # Keep large archives efficient while never emitting beyond LIMIT.
+        BLOCKS=$((LIMIT / 65536)); REST=$((LIMIT % 65536))
+        if [ "$BLOCKS" -gt 0 ]; then
+            dd if="$FILE" bs=65536 count="$BLOCKS" 2>/dev/null || exit 1
+        fi
+        if [ "$REST" -gt 0 ]; then
+            dd if="$FILE" bs=1 skip="$((BLOCKS * 65536))" count="$REST" 2>/dev/null || exit 1
+        fi
+    fi
+)
 current() {
-    [ ! -L "$ROOT/current" ] || fail 'Unsafe current pointer'
-    ID=$(head -c 33 "$ROOT/current" 2>/dev/null)
+    [ -f "$ROOT/current" ] && [ ! -L "$ROOT/current" ] || fail 'Unsafe current pointer'
+    [ -r "$ROOT/current" ] || fail 'Top current pointer permission denied; use the original capture user; state unconfirmed'
+    SIZE=$(wc -c < "$ROOT/current") || fail 'Cannot read current capture identity'
+    # Accept the original no-newline format and one optional LF, not a prefix.
+    { [ "$SIZE" -eq 32 ] || [ "$SIZE" -eq 33 ]; } || fail 'Invalid current capture identity'
+    ID=$(read_bytes 33 "$ROOT/current") || fail 'Cannot read current capture identity'
     valid_id "$ID" || fail 'Invalid current capture identity'
     DIR=$ROOT/$ID
     [ -d "$DIR" ] && [ ! -L "$DIR" ] || fail 'Unsafe task directory'
@@ -37,7 +58,14 @@ finish() {
 }
 control_lock() {
     [ ! -L "$ROOT/control.lock" ] || fail 'Unsafe control lock'
-    exec 0> "$ROOT/control.lock"
+    if [ -e "$ROOT/control.lock" ]; then
+        [ -f "$ROOT/control.lock" ] || fail 'Unsafe control lock'
+        [ -w "$ROOT/control.lock" ] || fail 'Top control lock permission denied; use the original capture user; state unconfirmed'
+    fi
+    # Check creation/open in a subshell: redirection failure on exec may kill
+    # the shell outright. Never truncate or replace an existing lock inode.
+    ( : >> "$ROOT/control.lock" ) || fail 'Cannot open Top control lock; check capture user and permissions; state unconfirmed'
+    exec 0>> "$ROOT/control.lock" || fail 'Cannot open Top control lock; state unconfirmed'
     flock -n 0 || fail 'Another device operation is active; retry'
 }
 load_state() {
@@ -67,7 +95,7 @@ load_state() {
 confirmed_terminal() {
     case "$STATUS" in stopped|completed|error) ;; *) return 1;; esac
     [ ! -L "$DIR/done" ] && [ -f "$DIR/done" ] &&
-        [ "$(head -c 34 "$DIR/done")" = "$ID" ]
+        [ "$(read_bytes 34 "$DIR/done")" = "$ID" ]
 }
 legacy_quiet() (
     # No PID is ever signalled. Hidden/inaccessible proc entries cannot prove
@@ -265,18 +293,22 @@ recover() (
 MODE=$1
 shift
 [ ! -L "$ROOT" ] || fail 'Unsafe capture root'
+if [ -e "$ROOT" ]; then
+    [ -d "$ROOT" ] && [ -r "$ROOT" ] && [ -x "$ROOT" ] ||
+        fail 'Top capture directory permission denied or invalid; use the original capture user; state unconfirmed'
+fi
 case "$MODE" in
 start)
     for cmd in nohup setsid timeout flock truncate awk head wc cat mv date sleep top readlink tr ls; do
         command -v "$cmd" >/dev/null 2>&1 || fail "Unsupported device: missing $cmd"
     done
+    head -c 0 /dev/null >/dev/null 2>&1 ||
+        command -v dd >/dev/null 2>&1 || fail 'Unsupported device: head -c or dd required'
     mkdir -p "$ROOT" || fail 'Cannot create capture root'
     # The lock is held for launch only, not during collection.
     # Android mksh may close descriptors above 2 on exec. Use stdin for the
     # launch lock; the detached worker replaces stdin with /dev/null.
-    [ ! -L "$ROOT/control.lock" ] || fail 'Unsafe control lock'
-    exec 0> "$ROOT/control.lock"
-    flock -n 0 || fail 'Another device operation is active'
+    control_lock
     exec sh "$0" launch "$@"
     ;;
 launch)
@@ -414,7 +446,7 @@ status)
     if ! confirmed_terminal; then
         recover || UNCONFIRMED=1
     fi
-    head -c 2048 "$DIR/state"
+    read_bytes 2048 "$DIR/state" || fail 'Cannot read capture state'
     date +%s
     [ ! -f "$DIR/cleaned" ] || echo cleaned
     [ -z "$UNCONFIRMED" ] || echo unconfirmed
@@ -422,9 +454,7 @@ status)
 clear)
     EXPECTED=$1
     valid_id "$EXPECTED" || fail 'Invalid capture identity'
-    [ ! -L "$ROOT/control.lock" ] || fail 'Unsafe control lock'
-    exec 0> "$ROOT/control.lock"
-    flock -n 0 || fail 'Another device operation is active'
+    control_lock
     current
     [ "$ID" = "$EXPECTED" ] || fail 'Capture identity changed'
     # Preflight every task before touching any log. Metadata and controller
@@ -437,7 +467,7 @@ clear)
             [ ! -L "$TASK/$FILE" ] || fail 'Unsafe task file'
             [ ! -e "$TASK/$FILE" ] || [ -f "$TASK/$FILE" ] || fail 'Unsafe task file'
         done
-        [ -f "$TASK/done" ] && [ "$(head -c 34 "$TASK/done")" = "$TASK_ID" ] || fail 'Capture is not stopped'
+        [ -f "$TASK/done" ] && [ "$(read_bytes 34 "$TASK/done")" = "$TASK_ID" ] || fail 'Capture is not stopped'
         # done precedes terminal state: require both to avoid racing finish().
         [ "$(head -n 1 "$TASK/state")" = "$TASK_ID" ] || fail 'Invalid task state'
         TERMINAL=$(head -n 2 "$TASK/state" | tail -n 1)
@@ -467,11 +497,11 @@ stop|pull)
         load_state
         confirmed_terminal || fail 'Capture is not confirmed stopped; retry status'
         [ ! -L "$DIR/done" ] && [ -f "$DIR/done" ] &&
-            [ "$(head -c 34 "$DIR/done")" = "$ID" ] || fail 'Capture is not stopped'
+            [ "$(read_bytes 34 "$DIR/done")" = "$ID" ] || fail 'Capture is not stopped'
         [ ! -L "$DIR/raw.txt" ] || fail 'Unsafe archive'
         SIZE=$(wc -c < "$DIR/raw.txt")
         [ "$SIZE" -le "$MAX_BYTES" ] || fail 'Archive exceeds 1000000000 bytes'
-        head -c "$((MAX_BYTES + 1))" "$DIR/raw.txt"
+        read_bytes "$((MAX_BYTES + 1))" "$DIR/raw.txt" || fail 'Cannot read capture archive'
     fi
     ;;
 *) fail 'Unknown operation';;

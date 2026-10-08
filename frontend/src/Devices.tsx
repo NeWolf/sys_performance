@@ -3,7 +3,10 @@ import { api, apiResponse, errorMessage } from './api'
 import { useEditGuard, useMutation } from './Editing'
 
 type Device = { serial: string; state: string; model: string }
-type Status = { serial: string; pids: string[]; properties: Record<string, string>; files: string; privilege: string; deployed: boolean }
+type Status = {
+  serial: string; pids: string[]; properties: Record<string, string>; files: string; privilege: string; deployed: boolean
+  started_at: number | null; observed_at: number | null; ended_at: number | null; elapsed_seconds: number | null
+}
 type PullResult = { id: string; duplicate: boolean; archive: string; files: string[] }
 type TopStatus = {
   id: string | null; status: string; running: boolean; stopping: boolean; importing: boolean
@@ -317,6 +320,9 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     </>}
     {current && <div className="device-status"><p>采集程序：{current.deployed ? '已部署' : '未部署（开始采集时自动部署）'} · 测试进程：{current.pids.length ? current.pids.join(', ') : '未运行'} · 权限：{current.privilege}</p>
       <p>采集开关：{current.properties.test || '默认关闭'} · 间隔：{current.properties.interval || '1'} 秒 · 文件：{current.properties.tofile || '1'} · logcat：{current.properties.tologcat || '1'} · 异步属性：{current.properties.async || '0'}</p>
+      <p>开始采集时间：{current.started_at != null ? new Date(current.started_at * 1000).toLocaleString('zh-CN', { hour12: false }) : '未记录'} · {current.started_at == null && current.observed_at != null ? '观测时长' : '采集时长'}：{formatCaptureDuration(current.elapsed_seconds)}{current.ended_at != null ? '（已停止计时）' : ''}</p>
+      {current.started_at == null && current.observed_at != null && <p className="muted">首次观测时间：{new Date(current.observed_at * 1000).toLocaleString('zh-CN', { hour12: false })}；无法确认真实开始时间，仅统计观测后的时长。</p>}
+      <p className="muted">按本地时间及设备 PID 记录，每 5 秒随状态刷新；采集开关关闭或进程退出后停止计时。记录仅在本地服务运行期间保留，超过 24 小时在下次确认状态时清除；不会停止设备采集或删除日志。</p>
       <details><summary>设备日志文件</summary><pre>{current.files || '暂无日志文件'}</pre></details></div>}
     <section aria-label="独立 Top 采集">
       <div className="section-heading"><div><h2>Top 采集</h2><p className="muted">自动推送脚本到设备独立运行，无需 sysmonitor 或 root；使用上方所选 ADB 设备。</p></div></div>
