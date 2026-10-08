@@ -25,9 +25,12 @@ class AdmissionJobsTests(unittest.TestCase):
         self.store = object()
         self.managers = []
         self.gates = []
-        self.reader = patch.object(jobs, "read_template", return_value="template").start()
+        self.template = [{"type": "p", "children": [{"text": "template"}]}]
+        self.blocks = [{"type": "p", "children": [{"text": "safe report"}]}]
+        self.report_json = json.dumps(self.blocks)
+        self.reader = patch.object(jobs, "read_template", return_value=self.template).start()
         self.builder = patch.object(jobs, "build_admission", side_effect=self.build).start()
-        self.publisher = patch.object(jobs, "publish_markdown", return_value={"pageId": "Page123", "link": "ignored", "verified": True}).start()
+        self.publisher = patch.object(jobs, "publish_slate", return_value={"pageId": "Page123", "link": "ignored", "verified": True}).start()
         self.addCleanup(patch.stopall)
         self.addCleanup(self.shutdown)
         self.manager = self.open()
@@ -50,9 +53,9 @@ class AdmissionJobsTests(unittest.TestCase):
 
     def build(self, store, session, template, directory, scenes, factor):
         self.assertIs(store, self.store)
-        self.assertEqual(template, "template")
-        directory.joinpath("report.md").write_text("safe report", encoding="utf-8")
-        return {"markdown": "safe report", "html": "<p>untrusted alternate preview</p>", "warnings": ["统计提示"]}
+        self.assertEqual(template, self.template)
+        directory.joinpath("report.json").write_text(self.report_json, encoding="utf-8")
+        return {"blocks": self.blocks, "html": "<p>untrusted alternate preview</p>", "warnings": ["统计提示"]}
 
     def create(self, draft=D, session=S, manager=None):
         return (manager or self.manager).create(session, draft, "报告", {1: "unknown"}, None)
@@ -86,7 +89,7 @@ class AdmissionJobsTests(unittest.TestCase):
 
                 def tracked_open(path, *args, **kwargs):
                     stream = original_open(path, *args, **kwargs)
-                    if path.resolve() == (self.root / draft / "report.md").resolve():
+                    if path.resolve() == (self.root / draft / "report.json").resolve():
                         streams.append(stream)
                     return stream
 
@@ -102,7 +105,7 @@ class AdmissionJobsTests(unittest.TestCase):
                     self.create(draft)
                     value = self.wait(draft, state="failed" if fail_sync else "ready")
                 self.assertEqual(synced, [True])
-                self.assertEqual((self.root / draft / "report.md").read_text(encoding="utf-8"), "safe report")
+                self.assertEqual(json.loads((self.root / draft / "report.json").read_text(encoding="utf-8")), self.blocks)
                 if fail_sync:
                     self.assertIn("草稿生成失败", value["error"])
                     self.error(409, self.publish, draft)
@@ -114,12 +117,17 @@ class AdmissionJobsTests(unittest.TestCase):
         preview = self.manager.preview(S, D)
         self.assertIn("safe report", preview)
         self.assertNotIn("untrusted alternate preview", preview)
-        path = self.root / D / "report.md"
-        for content in ("changed", "![image](remote)", " "):
-            path.write_text(content, encoding="utf-8")
-            self.error(409, self.manager.preview, S, D)
-            self.error(409, self.publish)
-        path.write_text("safe report", encoding="utf-8")
+        path = self.root / D / "report.json"
+        for content in (
+            json.dumps([{"type": "p", "children": [{"text": "changed"}]}]),
+            json.dumps([{"type": "image", "children": [{"text": ""}]}]),
+            "not JSON", "[]", " ",
+        ):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.error(409, self.manager.preview, S, D)
+                self.error(409, self.publish)
+        path.write_text(self.report_json, encoding="utf-8")
         with self.manager._mutex:
             record = dict(self.manager._records[D])
             record.pop("source_sha256")
@@ -137,12 +145,15 @@ class AdmissionJobsTests(unittest.TestCase):
         digest = self.manager._records[D]["source_sha256"]
         self.publish()
         self.wait(state="published")
+        self.assertEqual(self.publisher.call_args.args,
+                         ((self.root / D / "report.json").resolve(), "报告", "personal", None))
         self.assertEqual(self.publisher.call_args.kwargs, {"expected_sha256": digest})
         self.create(D2)
         self.wait(D2)
         record = dict(self.manager._records[D2], state="publishing",
                       publish_request={"placement": "personal", "parent_page": None})
-        (self.root / D2 / "report.md").write_text("changed in queue", encoding="utf-8")
+        (self.root / D2 / "report.json").write_text(
+            json.dumps([{"type": "p", "children": [{"text": "changed in queue"}]}]), encoding="utf-8")
         self.publisher.reset_mock()
         self.manager._publish(record)
         self.assertEqual(self.manager.get(S, D2)["state"], "unknown")
@@ -269,7 +280,7 @@ class AdmissionJobsTests(unittest.TestCase):
         self.publisher.assert_not_called()
         self.assertEqual(self.create("d" * 32, S, manager)["state"], "generating")
         self.assertIn("safe", manager.preview(S, D))
-        self.assertTrue((self.root / D / "report.md").exists())
+        self.assertTrue((self.root / D / "report.json").exists())
 
     def test_ready_and_published_survive_restart(self):
         self.create()
@@ -397,9 +408,11 @@ class AdmissionJobsTests(unittest.TestCase):
                             '<p>https://example.invalid/report?a=1&amp;b=2</p>'
                             '<img src="file:///private/a"><a href="javascript:bad()">text</a>'
                             '<svg onload="bad()"></svg><iframe src="https://evil"></iframe>')
-            args[3].joinpath("report.md").write_text(
-                'safe /Users/private/a\n/system/bin/surfaceflinger /vendor/bin/hw/service\n'
-                'https://example.invalid/report?a=1&b=2', encoding="utf-8")
+            texts = ['safe /Users/private/a', '/system/bin/surfaceflinger /vendor/bin/hw/service',
+                     'https://example.invalid/report?a=1&b=2']
+            args[3].joinpath("report.json").write_text(json.dumps([
+                {"type": "p", "children": [{"text": text}]} for text in texts
+            ]), encoding="utf-8")
             data["warnings"] = ["文件 /Users/private/a"]
             return data
         self.builder.side_effect = build
@@ -539,7 +552,7 @@ class AdmissionJobsTests(unittest.TestCase):
 
     def test_input_snapshot_and_generator_coverage_validation(self):
         gate = self.gate()
-        self.reader.side_effect = lambda: (gate.wait(5), "template")[1]
+        self.reader.side_effect = lambda: (gate.wait(5), self.template)[1]
         scenes = {1: "unknown"}
         self.manager.create(S, D, "报告", scenes, 1.5)
         scenes[1] = "foreground"

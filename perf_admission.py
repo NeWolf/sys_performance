@@ -38,7 +38,7 @@ def _rank(values, percent):
 
 
 def _fmt(value):
-    return format(value, ".6f").rstrip("0").rstrip(".") if _valid(value) else ""
+    return format(value, ".2f") if _valid(value) else ""
 
 
 def _windows(store, session_id, segments, scenes):
@@ -92,9 +92,11 @@ def _statistics(processes, schema, scene, windows, factor, plain=()):
     cpu, memory = _values(points, "cpu1c"), _values(points, "rss_kb", 1024)
     p95, peak = _rank(cpu, 95), max(cpu) if cpu else None
     k = lambda value: value / 100 * factor if value is not None and factor is not None else None
-    # 内存峰 / IO读 / IO写 留空：rd_kb / wr_kb 不是可靠速率。
-    return [_fmt(v) for v in (p95, k(p95), peak, k(peak),
-                             max(memory) if memory else None, None, None)]
+    # Match the focus-process table: physical IO peak in MB/cycle, not MB/s.
+    reads, writes = _values(points, "rd_kb", 1024), _values(points, "wr_kb", 1024)
+    return [p95, k(p95), peak, k(peak),
+            max(memory) if memory else None,
+            max(reads) if reads else None, max(writes) if writes else None]
 
 
 def _write(path, content):
@@ -113,8 +115,8 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     关注进程 groups (scene 前台/后台 plus their millisecond range) and filled into
     section 5.2. An explicit scenes mapping still overrides a whole segment.
     Segments without any 前台/后台 label are not discarded: their full cycles are
-    filed into the column group required by the Excel 前台需求/后台需求 flags
-    (D=Y → 前台top-app, else E=Y → 后台常驻服务), matching the offline report.
+    filed independently into each column group whose Excel requirement is Y
+    (D=Y → 前台top-app, E=Y → 后台常驻服务); dual-Y rows fill both sides.
     Columns 4 and 5 transcribe those same Excel flags verbatim.
     Invalid templates, scenes or factors raise ValueError before output.
     K列采用与离线报告同一个默认系数（KDMIPS_PER_CORE），显式factor可覆盖；
@@ -153,10 +155,13 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     warnings = [
         "CPU采用单核口径，可超过100%；P95/P99按全量有效样本最近秩重算，不平均各段分位数。",
         "缺失指标留空，不以零、整机CPU或其他字段代填；内存按1024换算，进程使用RSS。",
-        "IO读/写MB/S留空：rd_kb/wr_kb不是可靠速率，不能直接换算。",
+        "IO读/写填物理IO周期增量峰值（rd_kb/wr_kb÷1024，MB/周期），与关注进程一致；"
+        "模板IO列虽标为MB/S，实测并非速率，与标准MB/s单位不同，不做红绿阈值判定。",
         "场景取自关注进程分组的前台/后台标注及其时间范围，CPU活跃不代表前后台；"
         "已标注段内未被时间范围覆盖的区间不进入前后台统计，前后台重叠区间双向剔除。",
         "第4、5列前台需求/后台需求按Excel准入清单原样填入，不做推断；模板中已人工填写的单元格保持原样。",
+        "进程有有效实测时，需求非Y的一侧填-；无有效实测保持空白，适用侧缺失指标仍留空。",
+        "实测值按各侧对应标准比较：超标红色、低于标准绿色、等于标准或无数值标准保持默认色。",
         "峰值原因与准入结论保留人工判断，不自动推断。",
     ]
     warnings.append("场景来源：" + "；".join(sources) if sources else
@@ -164,8 +169,8 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     if unlabelled:
         warnings.append(
             "未标注场景的段（" + "、".join(f"segment {s}" for s in sorted(unlabelled)) +
-            "）按Excel需求列归档：前台需求Y计入前台top-app列，否则后台需求Y计入后台常驻服务列，"
-            "两者皆为N则留空；该段取整段全部周期，与离线报告“当前实测”同一算法。")
+            "）按Excel需求列归档：后台需求Y计入后台常驻服务列，前台需求Y计入前台top-app列，"
+            "双Y时同一段实测分别填入两侧；该段取整段全部周期，与离线报告“当前实测”同一算法。")
     both = sorted({s for s, _, _ in windows["background"]} & {s for s, _, _ in windows["foreground"]})
     if both:
         warnings.append("前后台标注共存的段：" + "、".join(f"segment {s}" for s in both) +
@@ -194,14 +199,29 @@ def build_admission(store, session_id, template: list, output_dir: Path,
                             (perf_slate.BG_NEED_COLUMN, "E")):
             if not perf_slate.text_of(cells[column]).strip():
                 perf_slate.write_row(row, [source.get(key, "")], column)
-        # Same applicable-standard rule as the offline report's budget comparison.
-        target = ("foreground" if source.get("D") == "Y" else
-                  "background" if source.get("E") == "Y" else None)
-        for scene, offset in (("background", perf_slate.BACKGROUND_OFFSET),
-                              ("foreground", perf_slate.FOREGROUND_OFFSET)):
-            plain = unlabelled if scene == target else frozenset()
-            perf_slate.write_row(
-                row, _statistics(processes, schema, scene, windows, factor, plain), offset)
+        statistics = {
+            scene: _statistics(processes, schema, scene, windows, factor, unlabelled)
+            for scene in ("background", "foreground")
+        }
+        has_data = any(value is not None for values in statistics.values() for value in values)
+        for scene, offset, requirement, columns in (
+                ("background", perf_slate.BACKGROUND_OFFSET, "E", "FGHIJKL"),
+                ("foreground", perf_slate.FOREGROUND_OFFSET, "D", "MNOPQRS")):
+            applicable = source.get(requirement) == "Y"
+            values = statistics[scene] if applicable else [None] * len(perf_slate.METRICS)
+            texts = [_fmt(value) for value in values] if applicable or not has_data else ["-"] * len(values)
+            colors = []
+            for value, key in zip(values, columns):
+                limit = source.get(key)
+                color = None
+                # IO budgets are MB/s, but measured peaks are MB/cycle.
+                if key not in "KLRS" and _valid(value) and _valid(limit):
+                    if value > limit:
+                        color = perf_slate.HIGH_COLOR
+                    elif value < limit:
+                        color = perf_slate.LOW_COLOR
+                colors.append(color)
+            perf_slate.write_row(row, texts, offset, colors=colors)
     covered = sum(any(p["p_records"] for p in group) for group in matched)
     warnings.append(f"可靠匹配采集覆盖：{covered}/49；歧义候选不参与，截断WebView始终留空。")
     missing = [r["name"] for r, group in zip(data["required"], matched) if not any(p["p_records"] for p in group)]

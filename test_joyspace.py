@@ -16,8 +16,9 @@ class JoySpaceBridgeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.folder = Path(tempfile.mkdtemp(prefix="jdperf-joyspace-test-"))
-        cls.markdown = cls.folder / "report.md"
-        cls.markdown.write_text("# report", encoding="utf-8")
+        cls.report = cls.folder / "report.json"
+        cls.blocks = [{"type": "p", "children": [{"text":"report"}]}]
+        cls.report.write_text(json.dumps(cls.blocks), encoding="utf-8")
 
     def test_strict_page_targets(self):
         for value in ("abc_123-xyz", "https://joyspace.jd.com/pages/abc_123-xyz/"):
@@ -49,11 +50,28 @@ class JoySpaceBridgeTests(unittest.TestCase):
             self.assertEqual(skill.name, "joyspace-kit")
             which.assert_called_once_with("node")
 
-    def test_read_returns_only_markdown(self):
+    def test_read_returns_only_slate(self):
+        response = {"raw": {"content": {"content": self.blocks}}, "auth": "secret"}
         with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
-                patch.object(joy, "_invoke", return_value={"content": "# template", "auth": "secret"}) as invoke:
-            self.assertEqual(joy.read_template(), "# template")
-            self.assertEqual(invoke.call_args.args[1][-2:], ["--url", joy.TEMPLATE_URL])
+                patch.object(joy, "_invoke", return_value=response) as invoke:
+            self.assertEqual(joy.read_template(), self.blocks)
+            self.assertEqual(invoke.call_args.args[1][-3:], ["--url", joy.TEMPLATE_URL, "--raw"])
+            invoke.assert_called_once()
+
+    def test_read_falls_back_on_invalid_or_unavailable_template(self):
+        valid = {"raw": {"content": {"content": self.blocks}}}
+        for first in ({"content": "old markdown"}, {"raw": {"content": {"content": []}}},
+                      joy.JoySpaceError("unavailable")):
+            with self.subTest(first=first), \
+                    patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
+                    patch.object(joy, "_invoke", side_effect=[first, valid]) as invoke:
+                self.assertEqual(joy.read_template(), self.blocks)
+                self.assertEqual([call.args[1][-2] for call in invoke.call_args_list], list(joy.TEMPLATE_URLS))
+        with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
+                patch.object(joy, "_invoke", return_value={}) as invoke:
+            with self.assertRaises(joy.JoySpaceError):
+                joy.read_template()
+            self.assertEqual(invoke.call_count, len(joy.TEMPLATE_URLS))
 
     def test_publish_mapping_and_allowlisted_result(self):
         for placement in ("personal", "child", "sibling"):
@@ -61,15 +79,17 @@ class JoySpaceBridgeTests(unittest.TestCase):
                     patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
                     patch.object(joy, "_invoke", return_value={"verified": True, "pageId": "new123",
                                       "title": "a ; $(echo test)", "imageFree": True,
-                                      "sourceSha256": joy.report_sha256(self.markdown),
+                                      "sourceSha256": joy.report_sha256(self.report),
                                       "link": "https://evil", "auth": "secret", "images": ["local/path"]}) as invoke:
-                result = joy.publish_markdown(self.markdown, "a ; $(echo test)", placement,
+                result = joy.publish_slate(self.report, "a ; $(echo test)", placement,
                                               None if placement == "personal" else "parent123")
                 self.assertEqual(result, {"pageId": "new123", "link": "https://joyspace.jd.com/pages/new123",
                                           "verified": True})
                 args = invoke.call_args.args[1]
+                self.assertEqual(args[0], str(self.folder / joy.SLATE_SCRIPT))
+                self.assertEqual(args[args.index("--file") + 1], str(self.report.resolve()))
                 self.assertIn("--image-free", args)
-                self.assertEqual(args[args.index("--source-sha256") + 1], joy.report_sha256(self.markdown))
+                self.assertEqual(args[args.index("--source-sha256") + 1], joy.report_sha256(self.report))
                 if placement == "child":
                     self.assertEqual(args[-2:], ["--parent-page-id", "parent123"])
                 if placement == "sibling":
@@ -77,30 +97,36 @@ class JoySpaceBridgeTests(unittest.TestCase):
 
     def test_validation_before_subprocess(self):
         with patch.object(joy, "_check_runtime") as check:
-            for args in ((self.markdown, "x", "bad"), (self.markdown, "", "personal"),
-                         (self.markdown, "x", "child", "https://evil/pages/a"),
+            for args in ((self.report, "x", "bad"), (self.report, "", "personal"),
+                         (self.report, "x", "child", "https://evil/pages/a"),
                          (self.folder, "x", "personal")):
                 with self.assertRaises(joy.JoySpaceError):
-                    joy.publish_markdown(*args)
+                    joy.publish_slate(*args)
             check.assert_not_called()
 
     def test_invalid_body_or_hash_never_starts_runtime(self):
-        path = self.folder / "invalid.md"
+        path = self.folder / "invalid.json"
+        invalid_trees = [None, {}, [], [{"text": 1}],
+                         [{"type": "p", "children": []}],
+                         [{"type": "p", "children": [{"text": "x", "url": "https://evil"}]}]]
+        for kind in ("image", "file", "embed", "iframe", "unknown"):
+            node = {"type": kind, "children": [{"text": "x"}]}
+            invalid_trees.extend(([node], [{"type": "p", "children": [node]}]))
+        contents = [b'', b' \r\n', b'\xff', b'not-json']
+        contents.extend(json.dumps(tree).encode("utf-8") for tree in invalid_trees)
         with patch.object(joy, "_check_runtime") as check, patch.object(joy, "_invoke") as invoke:
-            for content in (b'', b' \r\n', b'\xff', b'![x](a.png)',
-                            b'<IMG src="x">', b'<svg/>', b'<picture>', b'<image/>',
-                            b'![undefined]', b'`![x](a.png)`', br'\![x](a.png)'):
+            for content in contents:
                 path.write_bytes(content)
                 with self.subTest(content=content), self.assertRaises(joy.JoySpaceError):
-                    joy.publish_markdown(path, "report")
+                    joy.publish_slate(path, "report")
             with self.assertRaisesRegex(joy.JoySpaceError, "内容已变化"):
-                joy.publish_markdown(self.markdown, "report", expected_sha256="0" * 64)
+                joy.publish_slate(self.report, "report", expected_sha256="0" * 64)
             check.assert_not_called()
             invoke.assert_not_called()
 
     def test_unverified_or_unsafe_id_is_unknown(self):
         valid = {"pageId": "abc", "verified": True, "imageFree": True,
-                 "title": "report", "sourceSha256": joy.report_sha256(self.markdown)}
+                 "title": "report", "sourceSha256": joy.report_sha256(self.report)}
         for changes in ({"verified": False}, {"pageId": "../evil"}, {"title": "other"},
                         {"sourceSha256": "0" * 64}, {"imageFree": False}, {"imageFree": 1}):
             with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
@@ -108,12 +134,12 @@ class JoySpaceBridgeTests(unittest.TestCase):
                     patch.object(joy, "find_published", return_value=[]) as lookup, \
                     self.assertRaisesRegex(joy.JoySpaceError, "结果未知"):
                 try:
-                    joy.publish_markdown(self.markdown, "report")
+                    joy.publish_slate(self.report, "report")
                 finally:
                     # A lost confirmation is checked by reading, never by republishing.
                     lookup.assert_called_once_with("report")
 
-    def test_find_published_keeps_only_self_consistent_markdown_matches(self):
+    def test_find_published_keeps_only_self_consistent_report_matches(self):
         pages = [{"id": "keep1", "title": " report ", "page_type": 13,
                   "link": "https://joyspace.jd.com/pages/keep1", "created_at": "2026-09-30T10:00:00Z"},
                  {"id": "keep2", "title": "report", "page_type": 13,
@@ -173,7 +199,7 @@ class JoySpaceBridgeTests(unittest.TestCase):
                 patch.object(joy, "_invoke", side_effect=joy.JoySpaceError(joy.PUBLISH_UNKNOWN)), \
                 patch.object(joy, "find_published", return_value=[
                     {"pageId": "p1", "link": "https://joyspace.jd.com/pages/p1", "createdAt": None}]):
-            result = joy.publish_markdown(self.markdown, "report")
+            result = joy.publish_slate(self.report, "report")
         self.assertEqual(result["link"], "https://joyspace.jd.com/pages/p1")
         self.assertIs(result["verified"], False)
         self.assertIn("未经内容校验", result["message"])

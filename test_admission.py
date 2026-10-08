@@ -90,11 +90,11 @@ def process_rows(blocks):
             if any(perf_slate.text_of(c).strip() for c in r["children"])]
 
 
-def p(ts, name=None, pid=1, cpu1c=10, rss_kb=1024):
+def p(ts, name=None, pid=1, cpu1c=10, rss_kb=1024, rd_kb=102400, wr_kb=204800):
     values = dict.fromkeys(SCHEMAS["P"].split(), 0)
     values.update(ts=ts, pid=pid, name=name or REQUIRED_PROCESSES[0]["name"],
                   cpu=99, cpu1c=cpu1c, rss_kb=rss_kb, state="S", nthr=1, pol="N",
-                  rd_kb=102400, wr_kb=204800)
+                  rd_kb=rd_kb, wr_kb=wr_kb)
     return "P," + ",".join(str(values[k]) for k in SCHEMAS["P"].split()) + "\n"
 
 
@@ -159,10 +159,10 @@ class AdmissionTests(unittest.TestCase):
         blocks = result["blocks"]
         self.assert_preserved(before, blocks)
         rows, total = self.rows(blocks)
-        self.assertEqual(rows[0][5:12], ["50", "10", "50", "10", "1", "", ""])
-        self.assertEqual(rows[0][12:19], ["200", "40", "200", "40", "1", "", ""])
+        self.assertEqual(rows[0][5:12], ["50.00", "10.00", "50.00", "10.00", "1.00", "100.00", "200.00"])
+        self.assertEqual(rows[0][12:19], ["-"] * 7)
         self.assertTrue(all(row[5:] == [""] * 14 for row in rows[1:]))
-        self.assertEqual(total, [["CPU(%)", "80", "80"], ["内存(GB)", "4", "4"]])
+        self.assertEqual(total, [["CPU(%)", "80.00", "80.00"], ["内存(GB)", "4.00", "4.00"]])
         self.assertEqual(json.loads((self.output / "report.json").read_text()), blocks)
         self.assertEqual([item.name for item in self.output.iterdir()], ["report.json"])
         self.assertEqual(len(rows), 49)
@@ -215,8 +215,8 @@ class AdmissionTests(unittest.TestCase):
                                      {0: "background", 1: "background"}, None)
         builder.assert_called_once_with(self.store, sid, include_full_system=True)
         rows, totals = self.rows(result["blocks"])
-        self.assertEqual(rows[0][5:10], ["1050", "301.875", "99999", "28749.7125", "1099"])
-        self.assertEqual(totals[0][1:], ["8", "8"])
+        self.assertEqual(rows[0][5:10], ["1050.00", "301.88", "99999.00", "28749.71", "1099.00"])
+        self.assertEqual(totals[0][1:], ["8.00", "8.00"])
 
     def test_missing_ambiguous_truncated_and_pid_merge(self):
         webview = REQUIRED_PROCESSES[-1]["name"]
@@ -227,11 +227,11 @@ class AdmissionTests(unittest.TestCase):
         text += p(5, name=webview + "e") + p(6, name="mediaserver", cpu1c=40)
         result = self.build(text)
         rows, totals = self.rows(result["blocks"])
-        self.assertEqual(rows[0][5:12], ["10", "2.875", "10", "2.875", "2", "", ""])
+        self.assertEqual(rows[0][5:12], ["10.00", "2.88", "10.00", "2.88", "2.00", "200.00", "400.00"])
         names = [r["name"] for r in REQUIRED_PROCESSES]
         self.assertEqual(rows[names.index("/system/bin/audioserver")][5:], [""] * 14)
         self.assertEqual(rows[-1][5:], [""] * 14)
-        self.assertEqual(rows[names.index("/system/bin/mediaserver")][5], "40")
+        self.assertEqual(rows[names.index("/system/bin/mediaserver")][5], "40.00")
         self.assertEqual([row[1:] for row in totals], [["", ""], ["", ""]])
         self.assertEqual(len(list(self.output.glob("*.png"))), 0)
         self.assertTrue(any("IO" in warning for warning in result["warnings"]))
@@ -253,18 +253,19 @@ class AdmissionTests(unittest.TestCase):
         text = s(1) + p(1, cpu1c=80)
         default = self.build(text)
         rows, _ = self.rows(default["blocks"])
-        expected = format(80 / 100 * KDMIPS_PER_CORE, ".6f").rstrip("0").rstrip(".")
-        self.assertEqual(rows[0][5:9], ["80", expected, "80", expected])
+        expected = format(80 / 100 * KDMIPS_PER_CORE, ".2f")
+        self.assertEqual(rows[0][5:9], ["80.00", expected, "80.00", expected])
         self.assertTrue(any(f"CPU/100×{KDMIPS_PER_CORE}" in w and "沿用离线报告默认系数" in w
                             for w in default["warnings"]))
         self.assertFalse(any("K列留空" in w for w in default["warnings"]))
         explicit = self.build(text, factor=20)
-        self.assertEqual(self.rows(explicit["blocks"])[0][0][5:9], ["80", "16", "80", "16"])
+        self.assertEqual(self.rows(explicit["blocks"])[0][0][5:9], ["80.00", "16.00", "80.00", "16.00"])
         self.assertTrue(any("CPU/100×20" in w and "来自本次请求" in w for w in explicit["warnings"]))
 
     def test_scenes_optional_and_derived_from_groups(self):
-        name = REQUIRED_PROCESSES[0]["name"]
-        sid = self.load(s(1) + p(1, cpu1c=50) + s(2) + p(2, cpu1c=200, rss_kb=2048))
+        name = REQUIRED_PROCESSES[2]["name"]
+        sid = self.load(s(1) + p(1, name=name, cpu1c=50, rd_kb=1024, wr_kb=2048) +
+                        s(2) + p(2, name=name, cpu1c=200, rss_kb=2048))
         members = [dict(pid=1, name=name)]
         group = dict(name="前台组", segment=0, members=members, scene="前台", start=1, end=1)
         self.store.save_group(sid, group)
@@ -272,24 +273,146 @@ class AdmissionTests(unittest.TestCase):
         self.store.save_group(sid, dict(group, name="未标注组", scene="未标注", start=None, end=None))
         result = build_admission(self.store, sid, template(), self.output)
         rows, _ = self.rows(result["blocks"])
-        self.assertEqual(rows[0][5:12], ["200", "57.5", "200", "57.5", "2", "", ""])
-        self.assertEqual(rows[0][12:19], ["50", "14.375", "50", "14.375", "1", "", ""])
+        self.assertEqual(rows[2][5:12], ["200.00", "57.50", "200.00", "57.50", "2.00", "100.00", "200.00"])
+        self.assertEqual(rows[2][12:19], ["50.00", "14.38", "50.00", "14.38", "1.00", "1.00", "2.00"])
         self.assertTrue(any("关注进程" in w and "前台组" in w and "后台组" in w for w in result["warnings"]))
         self.assertFalse(any("未标注组" in w for w in result["warnings"]))
         # An explicit scene still overrides every group window of that segment.
         override = build_admission(self.store, sid, template(), self.output, {0: "unknown"}, None)
-        self.assertEqual(self.rows(override["blocks"])[0][0][5:], [""] * 14)
+        self.assertEqual(self.rows(override["blocks"])[0][2][5:], [""] * 14)
 
     def test_without_groups_rows_follow_excel_requirement(self):
         result = build_admission(self.store, self.load(s(1) + p(1)), template(), self.output)
         rows, totals = self.rows(result["blocks"])
-        # Excel 行 7 的后台需求为 Y,未标注场景的段整段计入后台列,前台列留空。
-        self.assertEqual(rows[0][5:12], ["10", "2.875", "10", "2.875", "1", "", ""])
-        self.assertEqual(rows[0][12:19], [""] * 7)
+        # Excel行7仅适用后台；有实测时非适用前台侧填写短横线。
+        self.assertEqual(rows[0][5:12], ["10.00", "2.88", "10.00", "2.88", "1.00", "100.00", "200.00"])
+        self.assertEqual(rows[0][12:19], ["-"] * 7)
         self.assertEqual(rows[0][3:5], ["人工前台", "人工后台"])
         self.assertTrue(all(row[5:] == [""] * 14 for row in rows[1:]))
-        self.assertEqual(totals[0][1:], ["80", "80"])
+        self.assertEqual(totals[0][1:], ["80.00", "80.00"])
         self.assertTrue(any("未检测到前台/后台场景标注" in w for w in result["warnings"]))
+
+    def test_applicable_sides_and_scene_specific_budget_colors(self):
+        selected = [item for item in REQUIRED_PROCESSES if item["excel_row"] in (7, 9, 23)]
+        text = s(1) + "".join(p(1, name=item["name"], pid=i + 1, cpu1c=10)
+                             for i, item in enumerate(selected))
+        result = self.build(text, scenes={})
+        rows = {perf_slate.text_of(r["children"][2]): r for r in process_rows(result["blocks"])}
+        for item in selected:
+            with self.subTest(excel_row=item["excel_row"]):
+                cells = rows[item["name"]]["children"]
+                budget = EXCEL_BUDGETS[item["excel_row"]]
+                for offset, requirement, columns in ((5, "E", "FGHIJKL"), (12, "D", "MNOPQRS")):
+                    leaves = [c["children"][0]["children"][0] for c in cells[offset:offset + 7]]
+                    if budget[requirement] != "Y":
+                        self.assertEqual(leaves, [{"text": "-"}] * 7)
+                        continue
+                    self.assertEqual([v["text"] for v in leaves],
+                                     ["10.00", "2.88", "10.00", "2.88", "1.00", "100.00", "200.00"])
+                    # IO has measured text but never compares against MB/s budgets.
+                    for value, key, leaf in zip((10, 2.875, 10, 2.875, 1, 100, 200), columns, leaves):
+                        limit = budget.get(key)
+                        expected = None
+                        if key not in "KLRS" and isinstance(limit, (int, float)):
+                            expected = perf_slate.HIGH_COLOR if value > limit else perf_slate.LOW_COLOR
+                        self.assertEqual(leaf.get("fontColor"), expected)
+        for name, r in rows.items():
+            if name not in {item["name"] for item in selected}:
+                self.assertEqual([c["children"][0]["children"][0] for c in r["children"][5:]],
+                                 [{"text": ""}] * 14)
+        preview = perf_slate.wrap_preview(result["html"])
+        self.assertIn('<span class="note">10.00</span>', preview)
+        self.assertIn('<span class="budget-low">10.00</span>', preview)
+        self.assertIn('.budget-low{color:#389E0D}', preview)
+        self.assertEqual(json.loads((self.output / "report.json").read_text()), result["blocks"])
+
+    def test_equal_raw_threshold_and_missing_metrics_colors(self):
+        for cpu, expected in ((2, None), (2.0000001, perf_slate.HIGH_COLOR),
+                              (1.9999999, perf_slate.LOW_COLOR), (0, perf_slate.LOW_COLOR)):
+            with self.subTest(cpu=cpu):
+                result = self.build(s(1) + p(1, cpu1c=cpu))
+                cell = process_rows(result["blocks"])[0]["children"][5]
+                self.assertEqual(cell["children"][0]["children"][0]["text"],
+                                 "0.00" if cpu == 0 else "2.00")
+                self.assertEqual(cell["children"][0]["children"][0].get("fontColor"), expected)
+        for cpu, rss in ((None, 1024), (10, None), (None, None),
+                         (float("nan"), 1024), (10, float("nan"))):
+            with self.subTest(cpu=cpu, rss=rss):
+                sid = self.load(s(1) + p(1))
+                data = build_report_data(self.store, sid, include_full_system=True)
+                cycle = data["processes"][0]["full_cycles"][0]
+                cycle[data["full_cycle_schema"].index("cpu1c")] = cpu
+                cycle[data["full_cycle_schema"].index("rss_kb")] = rss
+                for field in ("rd_kb", "wr_kb"):
+                    cycle[data["full_cycle_schema"].index(field)] = None
+                with patch("perf_admission.build_report_data", return_value=data):
+                    result = build_admission(self.store, sid, template(), self.output,
+                                             {0: "background"}, 28.75)
+                leaves = [c["children"][0]["children"][0]
+                          for c in process_rows(result["blocks"])[0]["children"][5:]]
+                if cpu is None or cpu != cpu:
+                    self.assertEqual(leaves[:4], [{"text": ""}] * 4)
+                if rss is None or rss != rss:
+                    self.assertEqual(leaves[4], {"text": ""})
+                self.assertEqual(leaves[5:7], [{"text": ""}] * 2)
+                expected = "" if cpu is None and rss is None else "-"
+                self.assertEqual(leaves[7:], [{"text": expected}] * 7)
+
+    def test_io_peaks_use_cycles_not_rate_average_or_total(self):
+        text = (s(1) + p(1, rd_kb=1280, wr_kb=512) +
+                s(5) + p(5, rd_kb=2560, wr_kb=4096) +
+                s(30) + p(30, rd_kb=1024, wr_kb=2048))
+        result = self.build(text, scenes={})
+        cells = process_rows(result["blocks"])[0]["children"]
+        self.assertEqual([c["children"][0]["children"][0] for c in cells[10:12]],
+                         [{"text": "2.50"}, {"text": "4.00"}])
+        self.assertTrue(any("MB/周期" in w and "不做红绿" in w for w in result["warnings"]))
+        self.assertIn("2.50", result["html"])
+        self.assertEqual(json.loads((self.output / "report.json").read_text()), result["blocks"])
+
+    def test_io_windows_exclude_overlap_and_uncovered_cycles(self):
+        name = REQUIRED_PROCESSES[2]["name"]
+        text = "".join(s(ts) + p(ts, name=name, rd_kb=kb, wr_kb=kb * 2)
+                       for ts, kb in ((1, 1024), (2, 999999), (3, 2048), (4, 9999999)))
+        sid = self.load(text)
+        for scene, start, end in (("后台", 1, 2), ("前台", 2, 3)):
+            self.store.save_group(sid, dict(name=scene, scene=scene, segment=0,
+                                           members=[dict(pid=1, name=name)], start=start, end=end))
+        result = build_admission(self.store, sid, template(), self.output)
+        rows, _ = self.rows(result["blocks"])
+        self.assertEqual(rows[2][10:12], ["1.00", "2.00"])
+        self.assertEqual(rows[2][17:19], ["2.00", "4.00"])
+
+    def test_io_only_zero_invalid_and_absent_fields(self):
+        sid = self.load(s(1) + p(1))
+        original = build_report_data(self.store, sid, include_full_system=True)
+        for read, write, expected in (
+                (0, 0, ["0.00", "0.00"]),
+                (None, 1536, ["", "1.50"]),
+                (float("nan"), float("inf"), ["", ""]),
+                (True, "2048", ["", ""]),
+                ("absent", "absent", ["", ""])):
+            with self.subTest(read=read, write=write):
+                data = deepcopy(original)
+                schema = data["full_cycle_schema"]
+                cycles = data["processes"][0]["full_cycles"]
+                for field, value in (("cpu1c", None), ("rss_kb", None),
+                                     ("rd_kb", read), ("wr_kb", write)):
+                    index = schema.index(field)
+                    for cycle in cycles:
+                        if value == "absent":
+                            cycle.pop(index)
+                        else:
+                            cycle[index] = value
+                    if value == "absent":
+                        schema.pop(index)
+                with patch("perf_admission.build_report_data", return_value=data):
+                    result = build_admission(self.store, sid, template(), self.output)
+                leaves = [c["children"][0]["children"][0]
+                          for c in process_rows(result["blocks"])[0]["children"][5:]]
+                self.assertEqual(leaves[:5], [{"text": ""}] * 5)
+                self.assertEqual(leaves[5:7], [{"text": v} for v in expected])
+                self.assertEqual(leaves[7:], [{"text": "-" if any(expected) else ""}] * 7)
 
     def test_requirement_columns_filled_when_template_leaves_them_empty(self):
         source = template()
@@ -452,10 +575,7 @@ class AdmissionTests(unittest.TestCase):
                     target[field] = value
                     self.assert_rejected_before_read(source)
 
-    @unittest.expectedFailure
     def test_input_template_unchanged(self):
-        # Known production issue: build_admission writes through Layout references.
-        # Remove expectedFailure when the writer copies the input before filling it.
         source = template()
         before = deepcopy(source)
         self.build(s(1) + p(1), source=source)
@@ -474,7 +594,7 @@ class AdmissionTests(unittest.TestCase):
         with patch("perf_admission.build_report_data", return_value=data):
             result = build_admission(self.store, sid, template(), self.output, {0: "background"}, 28.75)
         rows, totals = self.rows(result["blocks"])
-        self.assertEqual(rows[0][5:12], ["", "", "", "", "1", "", ""])
+        self.assertEqual(rows[0][5:12], ["", "", "", "", "1.00", "100.00", "200.00"])
         self.assertEqual([r[1:] for r in totals], [["", ""], ["", ""]])
         self.assertFalse(list(self.output.glob("*.png")))
 

@@ -1,5 +1,6 @@
 """API contract tests: mock external I/O; retain isolated temporary journals."""
 from contextlib import ExitStack
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -30,17 +31,19 @@ class AdmissionApiTests(unittest.TestCase):
         self.store = self.patches.enter_context(patch.object(perf_api, "Store"))
         self.patches.enter_context(patch.object(perf_api, "AdbController"))
         self.top_factory = self.patches.enter_context(patch.object(perf_api, "TopCapture", side_effect=lambda *a: Mock()))
-        self.reader = self.patches.enter_context(patch.object(jobs, "read_template", return_value="mock template"))
+        self.template = [{"type": "p", "children": [{"text": "mock template"}]}]
+        self.blocks = [{"type": "p", "children": [{"text": "mock preview"}]}]
+        self.reader = self.patches.enter_context(patch.object(jobs, "read_template", return_value=self.template))
         self.builder = self.patches.enter_context(patch.object(jobs, "build_admission", side_effect=self.build))
-        self.publisher = self.patches.enter_context(patch.object(jobs, "publish_markdown", return_value={"pageId": "MockPage", "verified": True}))
+        self.publisher = self.patches.enter_context(patch.object(jobs, "publish_slate", return_value={"pageId": "MockPage", "verified": True}))
         self.app, self.client = self.open()
 
     def build(self, store, session, template, directory, scenes, factor):
         self.assertIs(store, self.store.return_value)
-        self.assertEqual(template, "mock template")
+        self.assertEqual(template, self.template)
         self.assertEqual(session, S)
-        directory.joinpath("report.md").write_text("mock preview", encoding="utf-8")
-        return {"html": "<p>mock preview</p><script>bad()</script>", "warnings": []}
+        directory.joinpath("report.json").write_text(json.dumps(self.blocks), encoding="utf-8")
+        return {"blocks": self.blocks, "html": "<p>untrusted alternate preview</p><script>bad()</script>", "warnings": []}
 
     def open(self, name="business.sqlite3", lifespan=True):
         app = perf_api.create_app(self.root / name)
@@ -92,6 +95,7 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertIn("script-src 'none'", preview.headers["content-security-policy"])
         self.assertIn("mock preview", preview.text)
         self.assertNotIn("bad()", preview.text)
+        self.assertNotIn("untrusted alternate preview", preview.text)
         self.assertEqual(preview.headers["cache-control"], "no-store")
         self.assert_error(self.client.post(BASE, json=dict(CREATE, title="other")), 409)
         self.assertEqual(self.client.post(f"{BASE}/{D}/publish", json=PUBLISH).json()["state"], "publishing")

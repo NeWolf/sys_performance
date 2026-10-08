@@ -17,6 +17,8 @@ import re
 
 HEADER_BG = "#F86560"
 NOTE_COLOR = "#F5222D"
+HIGH_COLOR = NOTE_COLOR
+LOW_COLOR = "#389E0D"
 ALT_BG = "rgb(242, 245, 250)"
 
 TYPES = {"p", "list", "table", "table-row", "table-cell"}
@@ -176,8 +178,8 @@ def set_cell_text(cell, text):
     blocks[0]["children"] = [{"text": "" if text is None else str(text)}]
 
 
-def write_row(row, values, offset=0):
-    """Write `values` into the row starting at column `offset`; None skips."""
+def write_row(row, values, offset=0, colors=None):
+    """Write values with optional per-cell font colors; None values skip cells."""
     cells = cells_of(row)
     for index, value in enumerate(values):
         if value is None:
@@ -186,6 +188,8 @@ def write_row(row, values, offset=0):
         if column >= len(cells):
             raise SlateError("表格列数不足，无法写入指标。")
         set_cell_text(cells[column], value)
+        if colors is not None and colors[index] is not None:
+            cells[column]["children"][0]["children"][0]["fontColor"] = colors[index]
 
 
 def note_blocks(warnings):
@@ -297,6 +301,8 @@ def _inline(leaves):
             lowered = color.lower()
             if lowered == NOTE_COLOR.lower():
                 chunk = f'<span class="note">{chunk}</span>'
+            elif lowered == LOW_COLOR.lower():
+                chunk = f'<span class="budget-low">{chunk}</span>'
             elif lowered in ("gray", "grey"):
                 chunk = f'<span class="muted">{chunk}</span>'
         if leaf.get("bold"):
@@ -377,6 +383,7 @@ PREVIEW_CSS = (
     ".num{margin-right:6px;color:#8c8c8c}"
     "p{margin:8px 0}"
     ".note{color:#F5222D}"
+    ".budget-low{color:#389E0D}"
     ".muted{color:#8c8c8c}"
     ".scroll{overflow-x:auto;margin:12px 0}"
     "table.tbl{border-collapse:collapse;table-layout:fixed;font-size:13px}"
