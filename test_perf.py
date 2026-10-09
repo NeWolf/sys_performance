@@ -2665,6 +2665,58 @@ assert.equal(prevented,2);assert.ok(selected.has('p1'));
         for key, process in processes.items():
             self.assertEqual(process["required_rows"], assigned.get(key, []), key)
 
+    def test_report_voice_algorithm_fallback_is_segment_local(self):
+        from perf_report import render_report
+        from perf_report_data import REQUIRED_PROCESSES
+        from perf_report_ui import required_table
+
+        primary = "com.iflytek.cutefly.speechclient.hmi"
+        fallback = "com.jd.jkc.joy.assistant:voice"
+        # Descending timestamps create separate segments, never cross-segment aliases.
+        cases = [
+            (self.p(700, name=primary, cpu1c=11), primary, "exact", "collected"),
+            (self.p(600, name=primary, cpu1c=11) + self.p(600, 2, fallback, cpu1c=99),
+             primary, "exact", "collected"),
+            (self.p(500, 2, fallback, cpu1c=99), fallback, "fallback", "collected"),
+            ("", None, None, "missing"),
+            (f"DP,300,1,100,1,{primary}\n" + self.p(300, 2, fallback),
+             primary, "exact", "dp_only"),
+            (f"DP,200,2,100,1,{fallback}\n", fallback, "fallback", "dp_only"),
+            (self.p(100, 2, fallback + ":child"), None, None, "missing"),
+        ]
+        rows = "".join(self.s(700 - segment * 100) + records
+                       for segment, (records, _, _, _) in enumerate(cases))
+        data = self.assert_report(render_report(self.store, self.load(rows)))
+        item = next(r for r in data["required"] if r["excel_row"] == 12)
+        entry = next(r for r in REQUIRED_PROCESSES if r["excel_row"] == 12)
+        self.assertEqual({key: item[key] for key in entry}, entry)
+        self.assertEqual(item["business"], "语音算法")
+        self.assertEqual(len(data["required"]), 49)
+        self.assertEqual(len(item["segments"]), len(cases))
+        self.assertEqual(item["candidates"], [])
+        lookup = {p["id"]: p for p in data["processes"]}
+        for segment, (_, name, mode, status) in enumerate(cases):
+            with self.subTest(segment=segment):
+                result = item["segments"][segment]
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["match"], mode)
+                matched = [lookup[pid] for pid in result["process_ids"]]
+                self.assertEqual([p["name"] for p in matched], [name] if name else [])
+                for process in data["processes"]:
+                    if process["segment"] == segment:
+                        self.assertEqual(process["required_rows"],
+                                         [12] if process["name"] == name else [])
+                if status == "collected":
+                    self.assertEqual(matched[0]["metrics"]["cpu1c"]["p95"],
+                                     99 if name == fallback else 11)
+                html = required_table(dict(data, required=[item]), segment)
+                self.assertIn("<strong>" + (name or primary) + "</strong>", html)
+                self.assertIn("语音算法", html)
+                self.assertIn("Excel 行 12", html)
+                self.assertIn("后台标准", html)
+                self.assertIn("前台标准", html)
+        self.assertEqual(item["matches"], [pid for s in item["segments"] for pid in s["process_ids"]])
+
     def test_member_resources_independent_exact_scope_and_nulls(self):
         rows = self.s(1000) + self.p(1000, cpu1c=50, rss_kb=10, rd_kb=2)
         rows += self.p(1000, 2, "b", cpu1c=20)
@@ -3111,6 +3163,18 @@ class ApiTests(ReportAssertions, unittest.TestCase):
     def upload(self, text=SAMPLE, title="接口测试"):
         return self.client.post("/api/import", headers=self.headers,
                                 files=[("files", ("perf.log", text.encode(), "text/plain"))], data={"title": title})
+
+    def test_app_version(self):
+        from perf_version import VERSION
+        response = self.client.get("/api/version", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"version": VERSION})
+        self.assertEqual(self.app.version, VERSION)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(self.client.get("/api/version").status_code, 403)
+        self.assertEqual(self.client.get("/api/version", headers={
+            **self.headers, "Origin": "http://evil.example",
+        }).status_code, 403)
 
     def test_compare_api_validation(self):
         a = self.upload().json()["id"]

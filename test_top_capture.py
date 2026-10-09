@@ -39,6 +39,8 @@ class Device:
 
     def shell(self, serial, command, **kwargs):
         assert self.adb.lock.locked()
+        if command == "id -u":
+            return "0"
         if command.startswith("[ ! -L"):
             return "ready"
         args = shlex.split(command)[2:]
@@ -46,6 +48,8 @@ class Device:
 
     def run(self, *args, **kwargs):
         assert self.adb.lock.locked()
+        if args[2] in ("root", "wait-for-device"):
+            return ""
         command = shlex.split(args[-1])[2]
         if kwargs.get("output") is None:
             return self.shell(args[1], command)
@@ -120,6 +124,85 @@ class TopCaptureTests(unittest.TestCase):
     def pulled(self):
         identity = self.finished()
         return self.top.pull("device-1", identity)
+
+    def test_each_device_operation_roots_once_before_task_access(self):
+        calls = Mock()
+        calls.attach_mock(self.adb.run, "run")
+        calls.attach_mock(self.adb.shell, "shell")
+
+        def check(operation):
+            calls.reset_mock()
+            result = operation()
+            first = calls.mock_calls[:3]
+            self.assertEqual([(item[0], item.args) for item in first], [
+                ("run", ("-s", "device-1", "root")),
+                ("run", ("-s", "device-1", "wait-for-device")),
+                ("shell", ("device-1", "id -u")),
+            ])
+            roots = [item for item in self.adb.run.call_args_list if item.args[2] == "root"]
+            self.assertEqual(len(roots), 1)
+            self.assertFalse(self.adb.lock.locked())
+            return result
+
+        check(lambda: self.top.status("device-1"))
+        identity = check(lambda: self.top.start("device-1"))["id"]
+        self.device.stop_delay = 2
+        check(lambda: self.top.stop("device-1", identity))
+        self.device.finish()
+        check(lambda: self.top.pull("device-1", identity))
+        check(lambda: self.top.clear("device-1", identity))
+        calls.reset_mock()
+        self.top.status()
+        calls.assert_not_called()
+
+    def test_root_failure_blocks_operations_and_preserves_cached_task(self):
+        identity = self.top.start("device-1")["id"]
+        before = list(self.device.commands)
+        for failure in (AdbError("root denied", 502), AdbError("root timeout", 504)):
+            with self.subTest(failure=str(failure)):
+                self.adb.run.side_effect = failure
+                for operation in (
+                    lambda: self.top.start("device-1"),
+                    lambda: self.top.stop("device-1", identity),
+                    lambda: self.top.pull("device-1", identity),
+                    lambda: self.top.clear("device-1", identity),
+                ):
+                    with self.assertRaisesRegex(AdbError, "自动获取 root 权限失败"):
+                        operation()
+                    self.assertFalse(self.adb.lock.locked())
+                state = self.top.status("device-1")
+                self.assertEqual(state["id"], identity)
+                self.assertTrue(state["running"])
+                self.assertFalse(state["connected"])
+                self.assertIn("采集状态未确认", state["connection_error"])
+                self.assertEqual(self.device.commands, before)
+        self.adb.run.side_effect = self.device.run
+        self.assertTrue(self.top.status("device-1")["connected"])
+
+    def test_root_reconnect_timeout_never_reads_task(self):
+        def run(*args, **kwargs):
+            if args[2] == "wait-for-device":
+                raise AdbError("reconnect timeout", 504)
+            return self.device.run(*args, **kwargs)
+
+        self.adb.run.side_effect = run
+        self.error(504, self.top.start, "device-1")
+        self.adb.shell.assert_not_called()
+        self.assertFalse(self.device.commands)
+        self.assertFalse(self.adb.lock.locked())
+        self.assertEqual([c.args[2] for c in self.adb.run.call_args_list],
+                         ["root", "wait-for-device"])
+        self.assertTrue(all(0 < c.kwargs["timeout"] <= 10
+                            for c in self.adb.run.call_args_list))
+
+    def test_root_zero_exit_without_uid_zero_is_rejected(self):
+        # Some production devices print a refusal but adb exits successfully.
+        self.adb.shell.return_value = "2000"
+        self.adb.shell.side_effect = None
+        self.error(403, self.top.start, "device-1")
+        self.adb.shell.assert_called_once_with("device-1", "id -u")
+        self.assertFalse(self.device.commands)
+        self.assertFalse(self.adb.lock.locked())
 
     def test_script_upload_normalizes_line_endings_before_hashing(self):
         normalized = self.top.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
@@ -225,6 +308,18 @@ class TopCaptureTests(unittest.TestCase):
         self.top.clear("device-1", identity)
         self.assertIsNone(self.top.status("device-1")["archive"])
         self.error(404, self.top.archive_path, identity)
+
+    def test_remote_timestamp_archive_path_and_legacy_fallback(self):
+        identity = self.top.start("device-1")["id"]
+        raw = "\n".join(self.device.jobs["device-1"] + ["1700000000", "0", "1700000045"])
+        base = f"{REMOTE_ROOT}/{identity}/"
+        self.assertEqual(self.top._decode("device-1", raw)["remote_path"], base + "raw.txt")
+        named = raw + "\narchive=Top20261009123456.txt"
+        self.assertEqual(self.top._decode("device-1", named)["remote_path"], base + "Top20261009123456.txt")
+        self.assertIsNone(self.top._decode("device-1", named + "\ncleaned")["remote_path"])
+        self.assertFalse(self.top._decode("device-1", named + "\nunconfirmed")["connected"])
+        for name in ("../escape.txt", "Top2026.txt", "Top20261009123456.txt/other"):
+            self.error(502, self.top._decode, "device-1", raw + "\narchive=" + name)
 
     def test_capture_timing_and_legacy_status(self):
         self.top.start("device-1")
@@ -906,7 +1001,11 @@ class DeviceScriptTests(unittest.TestCase):
         self.script = self.root / "control.sh"
         self.fixture = self.root / "fixture"
         self.fixture.write_bytes(TOP)
-        self.command("awk", 'case "$*" in */proc/*/stat) echo "$PPID";; *) exec /usr/bin/awk "$@";; esac')
+        import sys
+        clock = shlex.quote(sys.executable) + " -c " + shlex.quote(
+            'import time; print(int(time.clock_gettime(time.CLOCK_MONOTONIC) * 100) * 10)')
+        self.command("awk", 'case "$*" in */proc/*/stat) echo "$PPID";; '
+                     '*/proc/uptime) ' + clock + ';; *) exec /usr/bin/awk "$@";; esac')
         self.command("timeout", 'shift 3; exec "$@"')
         self.command("top", 'cat "$TOP_FIXTURE"')
         # macOS lacks truncate; use Python only in the test harness.
@@ -959,15 +1058,124 @@ class DeviceScriptTests(unittest.TestCase):
                                            '[ "$DIR/worker.lock" -ef /proc/$$/fd/0 ]',
                                            'same_stdin "$DIR/worker.lock"'))
 
-    def worker(self, limit=MAX_ARCHIVE_BYTES, target=1):
+    def worker(self, limit=MAX_ARCHIVE_BYTES, target=1, interval=1):
         (self.job / "worker.lock").touch()
         self.write_script(limit)
         result = subprocess.run(["sh", str(self.script), "worker", self.identity,
-                                 str(target), "1", ""], env=self.env,
+                                 str(target), str(interval), ""], env=self.env,
                                 capture_output=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.job / "done").read_text().strip(), self.identity)
         return (self.job / "state").read_text().splitlines()
+
+    def simulated_timing(self, sample_ms=650, append_ms=150):
+        """Deterministic device clock; top and archive writes both consume time."""
+        import sys
+        clock = self.root / "clock"
+        clock.write_text("100200")
+        starts = self.root / "sample-starts"
+        prefix = (
+            "import sys\nfrom pathlib import Path\n"
+            f"clock=Path({str(clock)!r})\n"
+            "now=int(clock.read_text())\n"
+        )
+
+        def python(code):
+            return shlex.quote(sys.executable) + " -c " + shlex.quote(prefix + code)
+
+        self.command("awk", 'case "$*" in */proc/*/stat) echo "$PPID";; '
+                     '*/proc/uptime) ' + python("print(now)") +
+                     ';; *) exec /usr/bin/awk "$@";; esac')
+        self.command("sleep", python(
+            'clock.write_text(str(now + round(float(sys.argv[1])*1000)))') + ' "$1"')
+        self.command("top", python(
+            f"with Path({str(starts)!r}).open('a') as f: f.write(str(now)+'\\n')\n"
+            f"clock.write_text(str(now+{sample_ms}))\n"
+            f"sys.stdout.buffer.write(Path({str(self.fixture)!r}).read_bytes())"))
+        self.command("cat", 'case "$1" in */header) ' + python(
+            f"clock.write_text(str(now+{append_ms}))") + ';; esac\nexec /bin/cat "$@"')
+        self.command("date", 'if [ "$1" = "+%Y-%m-%d %H:%M:%S" ]; then ' + python(
+            "from datetime import datetime, timezone\n"
+            "print(datetime.fromtimestamp(now/1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))") +
+            '; else exec /bin/date "$@"; fi')
+        return starts
+
+    def test_fixed_cadence_includes_top_and_archive_time(self):
+        from datetime import datetime
+        starts = self.simulated_timing(sample_ms=850, append_ms=50)
+        state = self.worker(target=6)
+        self.assertEqual(state[1:3], ["completed", "6"])
+        self.assertEqual(list(map(int, starts.read_text().splitlines())),
+                         [100200 + n * 1000 for n in range(6)])
+        headers = [line for line in (self.job / "raw.txt").read_text().splitlines()
+                   if line.startswith("========== Top")]
+        stamps = [datetime.strptime(line.split("时间: ")[1].split(" ===")[0],
+                                    "%Y-%m-%d %H:%M:%S") for line in headers]
+        self.assertEqual([int((stamp- stamps[0]).total_seconds()) for stamp in stamps],
+                         list(range(6)))
+        self.assertEqual(len((self.job / "raw.txt").read_bytes()), int(state[5]))
+
+    def test_fixed_cadence_retains_fractional_intervals(self):
+        starts = self.simulated_timing()
+        state = self.worker(target=4, interval=1.25)
+        self.assertEqual(state[1], "completed")
+        self.assertEqual(list(map(int, starts.read_text().splitlines())),
+                         [100200 + n * 1250 for n in range(4)])
+
+    def test_overrun_stops_without_fabricated_catchup_samples(self):
+        starts = self.simulated_timing(sample_ms=2100)
+        state = self.worker(target=3)
+        self.assertEqual(state[1:3], ["error", "1"])
+        self.assertEqual(state[6], "sampling_overrun")
+        self.assertEqual(starts.read_text().splitlines(), ["100200"])
+        self.assertEqual(len((self.job / "raw.txt").read_bytes()), int(state[5]))
+        (self.root / "current").write_text(self.identity)
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", status.stdout.strip())
+        self.assertEqual(decoded["error"], "sampling_overrun")
+        self.assertFalse(decoded["running"])
+        self.assertEqual(self.shell("pull", self.identity).stdout.encode(),
+                         (self.job / "raw.txt").read_bytes())
+
+    def test_device_uptime_clock_validation(self):
+        self.command("awk", 'case "$*" in */proc/*/stat) echo "$PPID";; '
+                     '*) exec /usr/bin/awk "$@";; esac')
+        uptime = self.proc / "uptime"
+        uptime.write_text("1234567.89 9876543.21\n")
+        self.assertEqual(self.worker()[1], "completed")
+        uptime.write_text("not-a-clock\n")
+        state = self.worker()
+        self.assertEqual(state[1:3], ["error", "0"])
+        self.assertEqual(state[6], "clock_failed")
+        (self.root / "current").write_text(self.identity)
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", status.stdout.strip())
+        self.assertEqual(decoded["error"], "clock_failed")
+
+    def test_stop_during_long_cadence_wait(self):
+        starts = self.simulated_timing()
+        self.command("sleep", 'touch ' + shlex.quote(str(self.job / "stop")))
+        state = self.worker(target=-1, interval=3600)
+        self.assertEqual(state[1:3], ["stopped", "1"])
+        self.assertEqual(state[6], "none")
+        self.assertEqual(len(starts.read_text().splitlines()), 1)
+
+    def test_real_slow_top_does_not_add_a_full_interval(self):
+        import sys
+        starts = self.root / "sample-starts"
+        code = (
+            "import time\nfrom pathlib import Path\n"
+            f"with Path({str(starts)!r}).open('a') as f: f.write(str(time.clock_gettime(time.CLOCK_MONOTONIC))+'\\n')\n"
+            "time.sleep(.4)\n"
+        )
+        self.command("top", shlex.quote(sys.executable) + " -c " + shlex.quote(code) +
+                     '; cat "$TOP_FIXTURE"')
+        self.assertEqual(self.worker(target=4)[1], "completed")
+        times = list(map(float, starts.read_text().splitlines()))
+        # Old finish-then-sleep loop takes at least 4.2 s for these three gaps.
+        self.assertAlmostEqual(times[-1] - times[0], 3, delta=.4)
 
     def clear_command(self, identity=None):
         return subprocess.run(["sh", str(self.script), "clear", identity or self.identity],
@@ -978,6 +1186,60 @@ class DeviceScriptTests(unittest.TestCase):
         (self.root / "current").write_text(self.identity)
         # Exercise the lock call contract on macOS; native flock is Android-only.
         self.command("flock", '[ "$1" = -n ] && [ "$2" = 0 ]')
+
+    def test_launch_creates_timestamp_named_archive(self):
+        self.write_script()
+        identity = "e" * 32
+        job = self.root / identity
+        self.command("timeout", 'sleep 1; exit 124')
+        self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
+        result = self.shell("launch", identity, "1", "1", "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        name = (job / "archive_name").read_text().strip()
+        self.assertRegex(name, r"^Top[0-9]{14}\.txt$")
+        self.assertTrue((job / name).is_file())
+        self.assertFalse((job / "raw.txt").exists())
+
+    def test_timestamp_archive_worker_status_pull_and_clear(self):
+        name = "Top20261009123456.txt"
+        (self.job / "archive_name").write_text(name + "\n")
+        self.worker()
+        self.assertFalse((self.job / "raw.txt").exists())
+        archive = self.job / name
+        self.assertIn(TOP, archive.read_bytes())
+        (self.root / "current").write_text(self.identity)
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("archive=" + name, status.stdout.splitlines())
+        pulled = self.shell("pull", self.identity)
+        self.assertEqual(pulled.returncode, 0, pulled.stderr)
+        self.assertEqual(pulled.stdout.encode(), archive.read_bytes())
+        cleared = self.clear_command()
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(archive.stat().st_size, 0)
+        self.assertEqual((self.job / "archive_name").read_text(), name + "\n")
+
+    def test_timestamp_archive_recovery_truncates_partial_sample(self):
+        self.orphan()
+        name = "Top20261009123456.txt"
+        (self.job / "raw.txt").rename(self.job / name)
+        (self.job / "archive_name").write_text(name + "\n")
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual((self.job / name).read_bytes(), RAW)
+        self.assertIn("archive=" + name, status.stdout.splitlines())
+
+    def test_archive_name_rejects_traversal_and_symlinks(self):
+        self.prepare_clear()
+        marker = self.job / "archive_name"
+        for name in ("../fixture", "Top2026.txt", "Top20261009123456.txt/other"):
+            marker.write_text(name + "\n")
+            self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+            self.assertNotEqual(self.clear_command().returncode, 0)
+        marker.rename(self.job / "invalid_archive_name")
+        marker.symlink_to(self.fixture)
+        self.assertNotEqual(self.clear_command().returncode, 0)
+        self.assertEqual(self.fixture.read_bytes(), TOP)
 
     def test_clear_all_finished_logs_preserves_metadata_and_other_files(self):
         self.prepare_clear()

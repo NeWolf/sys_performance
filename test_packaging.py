@@ -106,6 +106,10 @@ class DeviceResourcePackagingTests(unittest.TestCase):
             spec.loader.exec_module(build)
         return build
 
+    def test_build_uses_application_version(self):
+        from perf_version import VERSION
+        self.assertEqual(self.load_build().VERSION, VERSION)
+
     def test_device_script_bundled_next_to_controller_on_all_platforms(self):
         build = self.load_build()
         self.assertTrue((build.ROOT / "device_top_capture.sh").is_file())

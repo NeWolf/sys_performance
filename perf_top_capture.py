@@ -1,4 +1,5 @@
 """Device-owned Top jobs; explicit, bounded local archives and imports."""
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -59,6 +60,23 @@ class TopCapture:
         if not isinstance(capture_id, str) or not re.fullmatch(ID_PATTERN, capture_id):
             raise AdbError("无效的 Top 任务标识", 400)
 
+    @contextmanager
+    def _device(self, serial):
+        # Root once per public operation, under the shared device lock. Internal
+        # stop polling must not restart adbd or reset its confirmation deadline.
+        with self.adb.device(serial):
+            try:
+                self.adb.run("-s", serial, "root", timeout=10)
+                self.adb.run("-s", serial, "wait-for-device", timeout=10)
+                if self.adb.shell(serial, "id -u") != "0":
+                    raise AdbError("设备未取得 root 权限，可能不支持 adb root", 403)
+            except AdbError as exc:
+                raise AdbError(
+                    "Top 操作前自动获取 root 权限失败，采集状态未确认；"
+                    "未执行后续任务或日志操作：" + str(exc), exc.status,
+                ) from exc
+            yield
+
     def _command(self, serial, action, *args, output=None, deadline=None):
         def remaining(limit):
             if deadline is None:
@@ -108,9 +126,14 @@ class TopCapture:
         remote_cleaned = bool(fields and fields[-1] == "cleaned")
         if remote_cleaned:
             fields.pop()
+        archive_name = "raw.txt"
+        if fields and fields[-1].startswith("archive="):
+            archive_name = fields.pop()[len("archive="):]
         if len(fields) == 7:
             fields.append("")  # adb.run strips the empty hex-encoded title.
         try:
+            if archive_name != "raw.txt" and not re.fullmatch(r"Top[0-9]{14}\.txt", archive_name):
+                raise ValueError()
             if len(fields) not in {8, 9, 11}:
                 raise ValueError()
             started_at = ended_at = elapsed_seconds = None
@@ -137,7 +160,8 @@ class TopCapture:
             if count > 10_000_000 or size > MAX_ARCHIVE_BYTES:
                 raise ValueError()
             if error not in {"none", "size_limit", "top_failed_or_timeout", "sample_limit",
-                             "invalid_top", "disk_error", "detach_failed", "interrupted"}:
+                             "invalid_top", "disk_error", "detach_failed", "interrupted",
+                             "sampling_overrun", "clock_failed"}:
                 raise ValueError()
             if len(title) > 960 or not re.fullmatch(r"(?:[0-9a-f]{2})*", title):
                 raise ValueError()
@@ -154,7 +178,7 @@ class TopCapture:
                                       if unconfirmed else None),
                     started_at=started_at, ended_at=ended_at, elapsed_seconds=elapsed_seconds,
                     remote_cleaned=remote_cleaned,
-                    remote_path=None if remote_cleaned else f"{REMOTE_ROOT}/{identity}/raw.txt")
+                    remote_path=None if remote_cleaned else f"{REMOTE_ROOT}/{identity}/{archive_name}")
 
     def _local_path(self, state):
         identity = state["id"]
@@ -242,7 +266,7 @@ class TopCapture:
                 return dict(self._state)
             self._serial(serial)
             try:
-                with self.adb.device(serial):
+                with self._device(serial):
                     return self._query(serial)
             except AdbError as exc:
                 state = self._states.setdefault(serial, self._empty(serial))
@@ -265,7 +289,7 @@ class TopCapture:
             raise ValueError("会话名称最多 120 个字符")
         with self._lock:
             self._available()
-            with self.adb.device(serial):
+            with self._device(serial):
                 state = self._query(serial)
                 if state["running"]:
                     raise AdbError("设备 Top 任务尚未停止", 409)
@@ -322,7 +346,7 @@ class TopCapture:
         self._identity(capture_id)
         with self._lock:
             self._available()
-            with self.adb.device(serial):
+            with self._device(serial):
                 return self._stop_confirmed(serial, capture_id)
 
     def clear(self, serial, capture_id):
@@ -330,7 +354,7 @@ class TopCapture:
         self._identity(capture_id)
         with self._lock:
             self._available()
-            with self.adb.device(serial):
+            with self._device(serial):
                 state = self._current(serial, capture_id)
                 if state["running"] or state["stopping"]:
                     raise AdbError("请先停止 Top 采集并等待结束，再清理设备日志", 409)
@@ -342,7 +366,7 @@ class TopCapture:
         self._identity(capture_id)
         with self._lock:
             self._available()
-            with self.adb.device(serial):
+            with self._device(serial):
                 state = self._stop_confirmed(serial, capture_id)
                 if state["remote_cleaned"]:
                     raise AdbError("设备 Top 日志已清理，本地已拉取的归档不受影响", 409)

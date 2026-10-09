@@ -8,7 +8,7 @@ from perf_report_data import _progress_reporter, build_report_data
 from perf_report_ui import CSS, JS, REPORT_CSP, render_document
 
 # Bump when Python report/statistics semantics change; assets/CSP invalidate automatically.
-REPORT_CACHE_VERSION = "22:" + hashlib.sha256(
+REPORT_CACHE_VERSION = "23:" + hashlib.sha256(
     (CSS + "\0" + JS + "\0" + REPORT_CSP).encode("utf-8")).hexdigest()
 # Bounded process-wide locks also coalesce requests through separate Store instances.
 _REPORT_LOCKS = tuple(threading.Lock() for _ in range(64))

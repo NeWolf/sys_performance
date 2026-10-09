@@ -28,6 +28,7 @@ from perf_adb import AdbController, AdbError
 from perf_report import REPORT_CSP, render_report
 from perf_store import Store
 from perf_top_capture import TopCapture
+from perf_version import VERSION
 
 MAX_FILE_BYTES = 1024 * 1024 * 1024
 # 最多 5 个文件，额外预留 1 MiB multipart 表单开销。
@@ -301,7 +302,7 @@ def create_app(database, port=8765, development=False, frontend=None):
         finally:
             await run_in_threadpool(close_services)
 
-    app = FastAPI(title="sysmonitor 本地分析", docs_url=None, redoc_url=None,
+    app = FastAPI(title="sysmonitor 本地分析", version=VERSION, docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
     app.state.store = store
     app.state.adb = adb
@@ -486,6 +487,10 @@ def create_app(database, port=8765, development=False, frontend=None):
     @app.get("/api/token")
     def session_token():
         return {"token": token}
+
+    @app.get("/api/version")
+    def app_version():
+        return {"version": VERSION}
 
     @app.get("/api/compare")
     def compare(baseline: str, target: str,

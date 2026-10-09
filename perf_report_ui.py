@@ -283,7 +283,8 @@ def required_table(data, segment):
         p = lookup.get(matches[0]) if matches else None
         source = EXCEL_BUDGETS[item["excel_row"]]
         state = states.get(status.get("status"), "缺失")
-        search = ' '.join(str(v) for v in (item["name"], item["module"], item["business"], state,
+        name = p["name"] if p and status.get("match") == "fallback" else item["name"]
+        search = ' '.join(str(v) for v in (name, item["module"], item["business"], state,
                                           ', '.join(map(str, (p or {}).get("pids", [])))))
         out.append('<tbody class="focus-group" data-search="' + esc(search) + '">')
         measured = [metric(p, "cpu1c", "p95"), scaled(metric(p, "cpu1c", "p95"), 100 / 28.75),
@@ -291,7 +292,7 @@ def required_table(data, segment):
                     scaled(metric(p, "rss_kb", "max"), 1024),
                     scaled(metric(p, "rd_kb", "max"), 1024), scaled(metric(p, "wr_kb", "max"), 1024)]
         # Keep one shared identity cell; the visibility control moves it between rows.
-        identity = ('<strong>' + esc(item["name"]) + '</strong><span>' + esc(item["module"]) +
+        identity = ('<strong>' + esc(name) + '</strong><span>' + esc(item["module"]) +
                     ' · ' + esc(item["business"]) + '</span><span>前台需求 ' + esc(source.get("D")) +
                     ' / 后台需求 ' + esc(source.get("E")) + '</span><span>' + esc(state) +
                     ' · Excel 行 ' + esc(item["excel_row"]) + '</span>')

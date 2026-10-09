@@ -20,6 +20,8 @@ const topErrors: Record<string, string> = {
   size_limit: '已达到 1GB 文件上限，采集已停止',
   top_failed_or_timeout: 'Top 执行失败或超时', sample_limit: '单次样本超过限额',
   invalid_top: 'Top 输出无法识别', disk_error: '设备文件写入失败，请检查空间与权限',
+  sampling_overrun: '设备采样耗时过长，无法维持设定频率，已停止并保留完整样本',
+  clock_failed: '设备采样时钟或定时等待失败，采集已停止',
   detach_failed: '设备后台任务启动失败', interrupted: '设备任务意外中断',
 }
 const topLabels: Record<string, string> = {
@@ -61,6 +63,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   const [topTitle, setTopTitle] = useState('')
   const topPolling = useRef<Promise<void> | null>(null)
   const topActive = Boolean(topStatus?.running || topStatus?.stopping || topStatus?.importing)
+  const topCleared = Boolean(topStatus?.remote_cleaned) && !topActive
   const topCurrent = Boolean(serial && topStatus?.serial === serial)
   const topReady = topCurrent && connected && Boolean(topStatus?.connected) && !topPollError
   const validTopSettings = Number.isFinite(topInterval) && topInterval >= 1 && topInterval <= 3600
@@ -104,6 +107,9 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     return () => { controller.abort(); window.clearInterval(timer) }
   }, [serial, revision])
   const current = connected && status?.serial === serial ? status : null
+  const sysmonitorActive = Boolean(current?.pids.length && current.properties.test === '1')
+  const sysmonitorCanStart = Boolean(current) && !pollError && !sysmonitorActive
+    && Number.isInteger(interval) && interval >= 1 && interval <= 3600
   const selectedDevice = devices.data.find((device) => device.serial === serial)
   const disconnected = serial && !devices.loading && !devices.error && (!selectedDevice || selectedDevice.state !== 'device')
 
@@ -159,11 +165,12 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   }, [serial, revision])
 
   async function perform(action: 'status' | 'start' | 'stop' | 'pull' | 'delete-logs') {
-    if (!serial || !connected || disabled || running.current) return
+    if (!serial || !connected || locked || running.current) return
+    if (action === 'start' && !sysmonitorCanStart) return
     if (action === 'pull' && !guard.confirm('拉取前会先停止尚未结束的采集；成功后将切换会话并放弃未保存配置，是否继续？')) return
     if (action === 'start' && !window.confirm(`将在 ${serial} 开始采集；若未部署，将先自动部署采集程序，已部署则直接使用。使用现有 root / su 权限，持久化属性会影响系统 sysmonitor，关闭页面不会停止采集。确认继续？`)) return
     if (action === 'stop' && !window.confirm('将关闭设备共享采集开关，并终止该路径的测试进程。确认停止？')) return
-    if (action === 'delete-logs' && !window.confirm(`将永久删除车机 ${serial} 上 /log/sys/perf/ 中的 perf.log 和 perf.1.log 至 perf.4.log，无法恢复。若正在采集，会先关闭共享采集开关并停止测试进程，停止失败则不删除。尚未拉取的日志将丢失，请先备份；本地已导入的数据和备份不受影响。确认删除？`)) return
+    if (action === 'delete-logs' && !window.confirm(`将永久删除车机 ${serial} 上 /log/sys/perf/ 中的 perf.log 及所有数字编号的轮转日志（如 perf.5.log），无法恢复。若正在采集，会先关闭共享采集开关并停止测试进程，停止失败则不删除。尚未拉取的日志将丢失，请先备份；本地已导入的数据和备份不受影响。确认删除？`)) return
     await mutation.run(async (signal) => {
       running.current = true
       setFeedbackSource('sysmonitor')
@@ -307,7 +314,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     </div>
     <div className="actions device-actions">
       <button disabled={locked || !connected} onClick={() => void perform('status')}>查询状态</button>
-      <button className="primary" disabled={locked || !connected || !Number.isInteger(interval) || interval < 1 || interval > 3600} onClick={() => void perform('start')}>开始采集</button>
+      <button className="primary" disabled={locked || !sysmonitorCanStart} onClick={() => void perform('start')}>开始采集</button>
       <button disabled={locked || !connected} onClick={() => void perform('stop')}>停止采集</button>
       <button disabled={locked || !connected} onClick={() => void perform('pull')}>拉取日志并分析</button>
       <button className="danger" disabled={locked || !connected} onClick={() => void perform('delete-logs')}>删除车机性能日志</button>
@@ -359,19 +366,25 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       {topPollError && <p className="error" role="alert">Top 状态刷新失败：{topPollError}，正在重试。</p>}
       {!topStatus && !topPollError && <p role="status">{serial ? '正在查询 Top 状态…' : '请选择设备以查询 Top 任务。'}</p>}
       {topStatus && <div className="device-status" role="status">
+        {topCleared ? <>
+          <p>Top 状态：未采集 · 设备：{topStatus.serial || '—'}</p>
+          <p>设备日志已清理，点击“开始采集”可进行新的采集。</p>
+          {topStatus.archive && <p>已拉取的本地归档仍保留，可在“更多操作”中下载或导入分析。</p>}
+        </> : <>
         <p>Top 状态：{topLabels[topStatus.status] || topStatus.status} · 设备：{topStatus.serial || '—'} · 已采样：{topStatus.count} / {topStatus.target_count === -1 ? '持续' : topStatus.target_count} · 间隔：{topStatus.interval} 秒</p>
         <p>开始时间：{topStatus.started_at ? new Date(topStatus.started_at * 1000).toLocaleString('zh-CN', { hour12: false }) : topStatus.id ? '未记录（旧版任务）' : '—'} · 已采集时长：{topStatus.id ? formatCaptureDuration(topStatus.elapsed_seconds) : '—'}{(!connected || !topStatus.connected || topPollError) && topStatus.id ? '（最后已知）' : ''}</p>
         <p>{topStatus.remote_cleaned ? '设备日志已清理 · 清理前大小' : '原始文件'}：{(topStatus.bytes / 1_000_000).toFixed(2)} / {(topStatus.max_bytes / 1_000_000).toFixed(0)} MB · {topStatus.archive ? '已拉取到本地' : topStatus.remote_cleaned ? '无本地归档' : '尚未拉取到本地'}</p>
         {topStatus.warning && <p className="banner warning">{topStatus.warning}</p>}
         {topStatus.remote_path && <p>设备路径：{topStatus.remote_path}</p>}
+        </>}
         {(!connected || !topStatus.connected || topPollError) && <p className="error">当前状态未确认，仅展示最后已知数据；不代表设备采集已停止。同设备在线时仍可重试停止或拉取日志并分析，由后端确认任务身份与停止结果。{topStatus.connection_error}</p>}
-        {topStatus.error && <p className="error">{topErrors[topStatus.error] || topStatus.error}{topStatus.archive ? '；已拉取样本可下载或导入。' : !topStatus.remote_cleaned && topStatus.bytes ? '；可拉取日志并分析，自动确认停止并保留已完成样本。' :''}</p>}
+        {!topCleared && topStatus.error && <p className="error">{topErrors[topStatus.error] || topStatus.error}{topStatus.archive ? '；已拉取样本可下载或导入。' : !topStatus.remote_cleaned && topStatus.bytes ? '；可拉取日志并分析，自动确认停止并保留已完成样本。' :''}</p>}
       </div>}
     </section>
   </section>
-  {view !== 'capture' && (topActive || topPollError || topStatus?.error) && <div className="banner warning" role="status">Top 采集：{topPollError || topStatus?.error || `${topLabels[topStatus!.status] || topStatus!.status} · ${topStatus!.count} 次`}。请到数据集查看或停止任务。</div>}
+  {view !== 'capture' && (topActive || topPollError || (!topCleared && topStatus?.error)) && <div className="banner warning" role="status">Top 采集：{topPollError || topStatus?.error || `${topLabels[topStatus!.status] || topStatus!.status} · ${topStatus!.count} 次`}。请到数据集查看或停止任务。</div>}
   {view !== 'capture' && (disconnected || devices.error || pollError || error) && <div className="banner warning" role="status">设备采集提示：{disconnected ? '设备已断开连接或不可用，正在自动检测重连。' : devices.error || pollError || error} 请到数据采集查看详情。</div>}
-  {view !== 'capture' && topStatus?.warning && <div className="banner warning" role="status">{topStatus.warning}</div>}
+  {view !== 'capture' && !topCleared && topStatus?.warning && <div className="banner warning" role="status">{topStatus.warning}</div>}
   {view !== 'capture' && notice && <div className="banner success device-notice" role="status">{notice}</div>}
   {view !== 'capture' && busy && <div className="banner info" role="status">{busyMessage}</div>}
   </>

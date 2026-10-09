@@ -27,6 +27,17 @@ read_bytes() (
         fi
     fi
 )
+archive_name() {
+    ARCHIVE_NAME=raw.txt
+    [ ! -L "$1/archive_name" ] || fail 'Unsafe archive name'
+    if [ -e "$1/archive_name" ]; then
+        [ -f "$1/archive_name" ] && [ "$(wc -c < "$1/archive_name")" -le 22 ] || fail 'Invalid archive name'
+        ARCHIVE_NAME=$(read_bytes 22 "$1/archive_name") || fail 'Cannot read archive name'
+        case "$ARCHIVE_NAME" in Top[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].txt) ;;
+            *) fail 'Invalid archive name';;
+        esac
+    fi
+}
 current() {
     [ -f "$ROOT/current" ] && [ ! -L "$ROOT/current" ] || fail 'Unsafe current pointer'
     [ -r "$ROOT/current" ] || fail 'Top current pointer permission denied; use the original capture user; state unconfirmed'
@@ -45,9 +56,9 @@ state() {
 finish() {
     # A signal during append must never publish a partial sample.
     trap '' TERM INT
-    [ ! -L "$DIR/raw.txt" ] || exit 1
-    truncate -s "$BYTES" "$DIR/raw.txt" || exit 1
-    [ "$(wc -c < "$DIR/raw.txt")" -eq "$BYTES" ] || exit 1
+    [ ! -L "$DIR/$ARCHIVE_NAME" ] || exit 1
+    truncate -s "$BYTES" "$DIR/$ARCHIVE_NAME" || exit 1
+    [ "$(wc -c < "$DIR/$ARCHIVE_NAME")" -eq "$BYTES" ] || exit 1
     STATUS=$1
     ERROR=$2
     ENDED_AT=$(date +%s)
@@ -55,6 +66,13 @@ finish() {
     printf '%s\n' "$ID" > "$DIR/done" || exit 1
     state
     exit 0
+}
+# Linux uptime is independent of wall-clock corrections (10 ms resolution).
+# Never fall back to date: changing the device clock must not change cadence.
+monotonic_ms() {
+    awk 'NR == 1 && $1 ~ /^[0-9]+[.][0-9]+$/ {
+        printf "%.0f\n", $1 * 1000; valid=1; exit
+    } END { if (!valid) exit 1 }' "$PROC/uptime"
 }
 control_lock() {
     [ ! -L "$ROOT/control.lock" ] || fail 'Unsafe control lock'
@@ -91,6 +109,7 @@ load_state() {
         IFS= read -r STARTED_AT || STARTED_AT=0
         IFS= read -r ENDED_AT || ENDED_AT=0
     } < "$DIR/state"
+    archive_name "$DIR"
 }
 confirmed_terminal() {
     case "$STATUS" in stopped|completed|error) ;; *) return 1;; esac
@@ -98,6 +117,7 @@ confirmed_terminal() {
         [ "$(read_bytes 34 "$DIR/done")" = "$ID" ]
 }
 legacy_quiet() (
+    ARCHIVE_NAME=${ARCHIVE_NAME:-raw.txt}
     # No PID is ever signalled. Hidden/inaccessible proc entries cannot prove
     # absence. Older workers have no inherited lock, so inspect open files too:
     # an orphaned cat may still append after the worker itself has disappeared.
@@ -236,7 +256,7 @@ EOF
                     else
                         [ -z "$TARGET_LINK" ] && [ "$#" -ge 2 ] || return 2
                         TARGET_LINK=$LINK
-                        case "$LINK" in "$DIR/raw.txt"|"$DIR/raw.txt (deleted)"|"$DIR/sample"|"$DIR/sample (deleted)"|"$DIR/header"|"$DIR/header (deleted)") return 1;; esac
+                        case "$LINK" in "$DIR/$ARCHIVE_NAME"|"$DIR/$ARCHIVE_NAME (deleted)"|"$DIR/sample"|"$DIR/sample (deleted)"|"$DIR/header"|"$DIR/header (deleted)") return 1;; esac
                     fi
                 done <<EOF
 $LINKS
@@ -275,15 +295,15 @@ recover() (
     fi
     load_state
     confirmed_terminal && exit 0
-    for FILE in raw.txt done state.new stop; do
+    for FILE in "$ARCHIVE_NAME" done state.new stop; do
         [ ! -L "$DIR/$FILE" ] || fail 'Unsafe recovery file'
         [ ! -e "$DIR/$FILE" ] || [ -f "$DIR/$FILE" ] || fail 'Unsafe recovery file'
     done
-    [ -f "$DIR/raw.txt" ] || fail 'Missing archive; retry recovery'
-    SIZE=$(wc -c < "$DIR/raw.txt") || fail 'Cannot inspect archive; retry recovery'
+    [ -f "$DIR/$ARCHIVE_NAME" ] || fail 'Missing archive; retry recovery'
+    SIZE=$(wc -c < "$DIR/$ARCHIVE_NAME") || fail 'Cannot inspect archive; retry recovery'
     [ "$SIZE" -ge "$BYTES" ] || fail 'Archive shorter than committed bytes; retry recovery'
-    truncate -s "$BYTES" "$DIR/raw.txt" || fail 'Cannot recover archive; retry recovery'
-    [ "$(wc -c < "$DIR/raw.txt")" -eq "$BYTES" ] || fail 'Cannot verify archive; retry recovery'
+    truncate -s "$BYTES" "$DIR/$ARCHIVE_NAME" || fail 'Cannot recover archive; retry recovery'
+    [ "$(wc -c < "$DIR/$ARCHIVE_NAME")" -eq "$BYTES" ] || fail 'Cannot verify archive; retry recovery'
     STATUS=error; ERROR=interrupted
     [ ! -f "$DIR/stop" ] || { STATUS=stopped; ERROR=none; }
     ENDED_AT=$(date +%s)
@@ -334,12 +354,16 @@ launch)
     ELAPSED=$(($(date +%s) - STARTED))
     { [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; } &&
         [ "$ELAPSED" -ge 1 ] && [ "$ELAPSED" -le 2 ] || fail 'Unsupported timeout deadline'
+    monotonic_ms >/dev/null || fail 'Unsupported monotonic clock'
+    sleep 0.001 || fail 'Unsupported fractional sleep'
     # POSIX shells count 512-byte blocks, some shells use 1024: at most 8 MiB.
     (ulimit -f 8192) || fail 'Unsupported file size limit'
     COUNT=0; BYTES=0; STATUS=starting; ERROR=none
     STARTED_AT=$(date +%s); ENDED_AT=0
+    printf 'Top%s.txt\n' "$(date '+%Y%m%d%H%M%S')" > "$DIR/archive_name" || fail 'Cannot save archive name'
+    archive_name "$DIR"
     : > "$DIR/worker.lock" || fail 'Cannot create worker lock'
-    : > "$DIR/raw.txt" || fail 'Cannot create archive'
+    : > "$DIR/$ARCHIVE_NAME" || fail 'Cannot create archive'
     state
     printf '%s' "$ID" > "$ROOT/current.new" && mv "$ROOT/current.new" "$ROOT/current" || fail 'Cannot publish task'
     # Acquire before spawning: even a delayed child is covered when launch
@@ -378,6 +402,7 @@ worker)
     done
     COUNT=0; BYTES=0; STATUS=running; ERROR=none
     STARTED_AT=$(date +%s); ENDED_AT=0
+    archive_name "$DIR"
     trap '' HUP
     # Never finish from a trap: a foreground writer may still own raw.txt.
     # The shell waits for foreground children; stop only at normal boundaries.
@@ -385,9 +410,27 @@ worker)
     trap 'INTERRUPTED=1' TERM INT
     state
     : > "$DIR/ready"
+    # Keep all deadlines relative to the first sample, never to its completion.
+    PERIOD_MS=$(awk -v n="$INTERVAL" 'BEGIN { printf "%.0f\n", n * 1000 }')
+    NEXT_MS=$(monotonic_ms) || finish error clock_failed
     while :; do
         [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
         [ ! -f "$DIR/stop" ] || finish stopped none
+        while :; do
+            NOW_MS=$(monotonic_ms) || finish error clock_failed
+            [ "$NOW_MS" -ge "$NEXT_MS" ] && break
+            # Short sleeps keep cooperative stop responsive even at 3600 s.
+            WAIT=$(awk -v ms="$((NEXT_MS - NOW_MS))" 'BEGIN {
+                if (ms > 1000) ms=1000; printf "%.3f", ms / 1000
+            }')
+            sleep "$WAIT" || { [ "$INTERRUPTED" -ne 0 ] || finish error clock_failed; }
+            [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
+            [ ! -f "$DIR/stop" ] || finish stopped none
+        done
+        # A whole missed period cannot be recovered by burst/duplicate samples.
+        [ "$NOW_MS" -lt "$((NEXT_MS + PERIOD_MS))" ] || finish error sampling_overrun
+        SAMPLE_TIME=$(date '+%Y-%m-%d %H:%M:%S') || finish error clock_failed
+        NEXT_MS=$((NEXT_MS + PERIOD_MS))
         # RLIMIT_FSIZE bounds stdout+stderr even for a runaway top. timeout owns
         # its direct child (exec top), so no stale PID is ever signalled here.
         timeout -s KILL 10 sh -c 'ulimit -f 8192 || exit 1; exec top -b -n 1 -d 1' > "$DIR/sample" 2>&1
@@ -412,29 +455,19 @@ worker)
                 $res ~ /^[0-9]+([.][0-9]+)?[kKmMgGtT]?$/ { valid=1 }
             END { exit !valid }
         ' "$DIR/sample" || finish error invalid_top
-        printf '========== Top 采集 #%s 时间: %s ==========\n' "$((COUNT + 1))" "$(date '+%Y-%m-%d %H:%M:%S')" > "$DIR/header" || finish error disk_error
+        printf '========== Top 采集 #%s 时间: %s ==========\n' "$((COUNT + 1))" "$SAMPLE_TIME" > "$DIR/header" || finish error disk_error
         HEADER=$(wc -c < "$DIR/header")
         ADDED=$((HEADER + SIZE + 2))
         [ "$((BYTES + ADDED))" -le "$MAX_BYTES" ] || finish stopped size_limit
-        if ! { cat "$DIR/header" "$DIR/sample" && printf '\n\n'; } >> "$DIR/raw.txt"; then
+        if ! { cat "$DIR/header" "$DIR/sample" && printf '\n\n'; } >> "$DIR/$ARCHIVE_NAME"; then
             [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
-            truncate -s "$BYTES" "$DIR/raw.txt" || exit 1
+            truncate -s "$BYTES" "$DIR/$ARCHIVE_NAME" || exit 1
             finish error disk_error
         fi
         BYTES=$((BYTES + ADDED)); COUNT=$((COUNT + 1))
         state
         [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
         [ "$TARGET" = -1 ] || [ "$COUNT" -lt "$TARGET" ] || finish completed none
-        # Split long intervals so stop acknowledgement does not wait an hour.
-        WHOLE=${INTERVAL%%.*}
-        N=0
-        while [ "$N" -lt "$WHOLE" ]; do
-            [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
-            [ ! -f "$DIR/stop" ] || finish stopped none
-            sleep 1
-            N=$((N + 1))
-        done
-        case "$INTERVAL" in *.*) sleep "0.${INTERVAL#*.}";; esac
     done
     ;;
 status)
@@ -448,6 +481,7 @@ status)
     fi
     read_bytes 2048 "$DIR/state" || fail 'Cannot read capture state'
     date +%s
+    [ "$ARCHIVE_NAME" = raw.txt ] || printf 'archive=%s\n' "$ARCHIVE_NAME"
     [ ! -f "$DIR/cleaned" ] || echo cleaned
     [ -z "$UNCONFIRMED" ] || echo unconfirmed
     ;;
@@ -463,7 +497,8 @@ clear)
         TASK_ID=${TASK##*/}
         valid_id "$TASK_ID" || continue
         [ -d "$TASK" ] && [ ! -L "$TASK" ] || fail 'Unsafe task directory'
-        for FILE in done state cleaned raw.txt sample header; do
+        archive_name "$TASK"
+        for FILE in done state cleaned "$ARCHIVE_NAME" sample header; do
             [ ! -L "$TASK/$FILE" ] || fail 'Unsafe task file'
             [ ! -e "$TASK/$FILE" ] || [ -f "$TASK/$FILE" ] || fail 'Unsafe task file'
         done
@@ -475,7 +510,8 @@ clear)
     done
     for TASK in "$ROOT"/*; do
         valid_id "${TASK##*/}" || continue
-        for FILE in raw.txt sample header; do
+        archive_name "$TASK"
+        for FILE in "$ARCHIVE_NAME" sample header; do
             [ ! -f "$TASK/$FILE" ] || truncate -s 0 "$TASK/$FILE" || fail 'Cannot clear Top logs'
         done
         : > "$TASK/cleaned" || fail 'Cannot mark cleared Top logs'
@@ -498,10 +534,10 @@ stop|pull)
         confirmed_terminal || fail 'Capture is not confirmed stopped; retry status'
         [ ! -L "$DIR/done" ] && [ -f "$DIR/done" ] &&
             [ "$(read_bytes 34 "$DIR/done")" = "$ID" ] || fail 'Capture is not stopped'
-        [ ! -L "$DIR/raw.txt" ] || fail 'Unsafe archive'
-        SIZE=$(wc -c < "$DIR/raw.txt")
+        [ ! -L "$DIR/$ARCHIVE_NAME" ] || fail 'Unsafe archive'
+        SIZE=$(wc -c < "$DIR/$ARCHIVE_NAME")
         [ "$SIZE" -le "$MAX_BYTES" ] || fail 'Archive exceeds 1000000000 bytes'
-        read_bytes "$((MAX_BYTES + 1))" "$DIR/raw.txt" || fail 'Cannot read capture archive'
+        read_bytes "$((MAX_BYTES + 1))" "$DIR/$ARCHIVE_NAME" || fail 'Cannot read capture archive'
     fi
     ;;
 *) fail 'Unknown operation';;

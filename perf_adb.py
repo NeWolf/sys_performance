@@ -12,7 +12,7 @@ import uuid
 
 REMOTE_BIN = "/data/local/tmp/sysmonitor_test"
 PERF_DIR = "/log/sys/perf"
-LOG_NAMES = ["perf.log"] + [f"perf.{i}.log" for i in range(1, 5)]
+LOG_NAME_PATTERN = re.compile(r"perf(?:\.[0-9]+)?\.log", re.ASCII)
 PROPERTIES = ("test", "interval", "tofile", "tologcat", "async")
 MAX_FILE_BYTES = 1024 * 1024 * 1024
 
@@ -232,6 +232,13 @@ class AdbController:
             time.sleep(0.2)
         raise AdbError("采集开关已关闭，但测试进程尚未退出；未强制杀进程，请刷新状态", 409)
 
+    def _log_names(self, serial, root):
+        listing = self._shell_step(
+            serial, f'if [ -d {PERF_DIR} ]; then ls -1A {PERF_DIR}; fi',
+            root, step="枚举性能日志文件")
+        # Validate each basename before it can enter any device command.
+        return sorted(name for name in listing.splitlines() if LOG_NAME_PATTERN.fullmatch(name))
+
     def delete_logs(self, serial):
         with self.device(serial):
             root = self.root_mode(serial)
@@ -239,17 +246,18 @@ class AdbController:
             self._stop(serial, root)
             if self.properties(serial)["test"] != "0" or self.pids(serial, root):
                 raise AdbError("采集未确认停止，未删除设备日志，请刷新状态后重试", 409)
-            paths = " ".join(shlex.quote(PERF_DIR + "/" + name) for name in LOG_NAMES)
-            # Fixed allowlist only: no caller paths, globs or recursive deletion.
+            # Only validated performance-log basenames, never caller paths or directories.
             try:
-                self.shell(serial, "rm -f -- " + paths, root)
-                remaining = self.shell(
-                    serial, f'for f in {paths}; do if [ -e "$f" ] || [ -L "$f" ]; '
-                    'then echo "$f"; fi; done', root)
-                if remaining:
+                names = self._log_names(serial, root)
+                for offset in range(0, len(names), 100):
+                    paths = " ".join(shlex.quote(PERF_DIR + "/" + name)
+                                     for name in names[offset:offset + 100])
+                    self.shell(serial, "rm -f -- " + paths, root)
+                if self._log_names(serial, root):
                     raise AdbError("设备仍有未删除的性能日志，请检查权限后重试", 502)
             except AdbError as exc:
                 raise AdbError("采集已停止；日志删除未完成，可能已部分删除：" + str(exc), exc.status) from exc
+            self.capture_times.pop(serial, None)
             return self.snapshot(serial, root)
 
     def pull(self, serial, store, title=""):
@@ -262,7 +270,7 @@ class AdbController:
             folder = self.archive / uuid.uuid4().hex
             folder.mkdir(parents=True)
             paths = []
-            for name in LOG_NAMES:
+            for name in self._log_names(serial, root):
                 remote = PERF_DIR + "/" + name
                 exists = self.shell(serial, f'if [ -f {remote} ]; then echo yes; fi', root)
                 if exists != "yes":

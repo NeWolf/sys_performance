@@ -243,6 +243,11 @@ def _required(processes, segments):
                     matches, candidates, mode = candidates, [], "basename"
                 elif candidates:
                     mode = "ambiguous"
+            # Keep the spreadsheet identity; substitute only the observed process.
+            if (not matches and not candidates
+                    and target == "com.iflytek.cutefly.speechclient.hmi"
+                    and "com.jd.jkc.joy.assistant:voice" in names):
+                matches, mode = [names["com.jd.jkc.joy.assistant:voice"]], "fallback"
             status = ("collected" if any(p["p_records"] for p in matches) else
                       "dp_only" if matches else "pending_confirmation" if candidates else "missing")
             matched_ids = [p["id"] for p in matches]

@@ -14,7 +14,9 @@ from macos_compat import MACOS_MIN_VERSION, verify_macos_binaries
 from node_runtime import official_node_files, verify_skill
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "1.3.1"
+# Direct execution places packaging/, not the project root, on sys.path.
+sys.path.insert(0, str(ROOT))
+from perf_version import VERSION
 
 
 def run(*args):

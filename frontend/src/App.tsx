@@ -33,6 +33,7 @@ function Workspace() {
   const currentView = workspaceViews.find((item) => item.id === view)!
   const guard = useEditGuard()
   const [revision, setRevision] = useState(0)
+  const appVersion = useResource<{ version: string }>('/api/version')
   const sessions = useResource<Session[]>('/api/sessions', revision)
   const [compareSessions, setCompareSessions] = useState<Session[]>()
   // 列表刷新不卸载对比页面；成功返回后仍同步删除、新增的会话。
@@ -148,7 +149,7 @@ function Workspace() {
         <div className="sidebar-footer">日志留在本机<br />离线导入 / 趋势分析 / HTML 报告</div>
       </aside>
       <main>
-        <header className="topbar"><span>性能工作台 <b>/</b> {currentView.label}</span><span className="badge">本地服务 · 127.0.0.1</span></header>
+        <header className="topbar"><span>性能工作台 <b>/</b> {currentView.label}</span><div className="app-info"><span className="app-version" title={appVersion.error ? `版本读取失败：${appVersion.error}` : '当前应用版本'}>{appVersion.data ? `JDPerf v${appVersion.data.version}` : appVersion.loading ? '版本读取中…' : '版本暂不可用'}</span><span className="badge">本地服务 · 127.0.0.1</span></div></header>
         <div className="main-content">
           <div className="page-heading"><div><p className="eyebrow">ANDROID / {currentView.label}</p><h1>{currentView.label}</h1><p>{currentView.description}{active && (view === 'analysis' || view === 'report') ? ` · 当前会话：${active.name}` : ''}</p></div>
             <div className="actions">{view === 'report' && <button className="primary" disabled={!activeId || guard.busy} onClick={exportReport}>导出离线交互 HTML 报告</button>}{(view === 'analysis' || view === 'report') && <button className="danger" disabled={!activeId || guard.busy} onClick={deleteSession}>删除会话</button>}</div>

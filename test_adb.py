@@ -58,8 +58,11 @@ class FakeAdb(AdbController):
             if self.fail_delete:
                 raise AdbError("permission denied", 502)
             if not self.keep_logs:
-                self.remote_logs.clear()
-        if script.startswith("for f in "):
+                targets = {Path(path).name for path in shlex.split(script)[3:]}
+                self.remote_logs.difference_update(targets)
+        if script == 'if [ -d /log/sys/perf ]; then ls -1A /log/sys/perf; fi':
+            return "\n".join(sorted(self.remote_logs))
+        if script == 'if [ -d /log/sys/perf ]; then ls -ln /log/sys/perf; fi':
             return "\n".join(sorted(self.remote_logs))
         if script.startswith("chmod 755 ") and not self.fail_deploy:
             self.deployed = True
@@ -272,7 +275,10 @@ class AdbTests(unittest.TestCase):
     @patch("perf_adb.time.sleep")
     def test_delete_logs_stops_first_and_preserves_local_data(self, _sleep):
         imported = self.adb.pull("unit", self.store)
-        self.adb.remote_logs.update(f"perf.{i}.log" for i in range(1, 5))
+        self.adb.remote_logs.update(f"perf.{i}.log" for i in range(1, 13))
+        unrelated = {"notes.txt", "perf.bad.log", "perf.5.log.bak", "perf.1.log;id"}
+        self.adb.remote_logs.update(unrelated)
+        self.adb._capture_timing("unit", ["123"], True, (1000, 0))
         self.adb.props["test"] = "1"
         self.adb.processes = ["123"]
         self.adb.uid = "2000"
@@ -285,21 +291,42 @@ class AdbTests(unittest.TestCase):
                 self.assertEqual(self.adb.props["test"], "0")
                 self.assertEqual(self.adb.processes, [])
                 self.assertTrue(root)
-                self.assertEqual(script.split()[3:], ["/log/sys/perf/perf.log"] +
-                                 [f"/log/sys/perf/perf.{i}.log" for i in range(1, 5)])
+                self.assertEqual(set(shlex.split(script)[3:]), {"/log/sys/perf/perf.log"} |
+                                 {f"/log/sys/perf/perf.{i}.log" for i in range(1, 13)})
             return original_shell(serial, script, root, output)
 
         with patch.object(self.adb, "shell", side_effect=checked_shell):
             result = self.adb.delete_logs("unit")
         self.assertEqual(result["pids"], [])
         self.assertEqual(result["properties"]["test"], "0")
-        self.assertEqual(self.adb.remote_logs, set())
+        self.assertEqual(self.adb.remote_logs, unrelated)
+        self.assertEqual(set(result["files"].splitlines()), unrelated)
+        self.assertIsNone(result["started_at"])
+        self.assertIsNone(result["elapsed_seconds"])
         self.assertEqual((Path(imported["archive"]) / "perf.log").read_bytes(), SAMPLE)
         self.assertEqual(len(self.store.sessions()), 1)
         commands = [call[1] for call in self.adb.calls if call[0] == "unit"]
         self.assertLess(next(i for i, c in enumerate(commands) if "kill -TERM" in c),
                         next(i for i, c in enumerate(commands) if c.startswith("rm -f")))
-        self.adb.delete_logs("unit")  # Empty directory is also a successful cleanup.
+        self.adb.delete_logs("unit")  # No matching performance logs is also successful.
+
+    def test_pull_includes_higher_rotations_only(self):
+        self.adb.remote_logs = {"perf.5.log", "perf.12.log", "notes.txt", "perf.bad.log"}
+        result = self.adb.pull("unit", self.store)
+        self.assertEqual(set(result["files"]), {"perf.5.log", "perf.12.log"})
+
+    def test_delete_detects_new_rotation_after_deletion(self):
+        original_shell = self.adb.shell
+
+        def shell(serial, script, root=False, output=None):
+            result = original_shell(serial, script, root, output)
+            if script.startswith("rm -f -- "):
+                self.adb.remote_logs.add("perf.99.log")
+            return result
+
+        with patch.object(self.adb, "shell", side_effect=shell):
+            with self.assertRaisesRegex(AdbError, "设备仍有未删除的性能日志"):
+                self.adb.delete_logs("unit")
 
     @patch("perf_adb.time.sleep")
     def test_delete_logs_aborts_on_stop_failure(self, _sleep):
@@ -452,6 +479,7 @@ class AdbTests(unittest.TestCase):
             self.assertEqual(response.json()["properties"]["test"], "0")
             self.assertEqual(self.adb.remote_logs, set())
             self.adb.fail_delete = True
+            self.adb.remote_logs.add("perf.5.log")
             response = client.post(url, headers=headers, json=body)
             self.assertEqual(response.status_code, 502)
             self.assertIn("可能已部分删除", response.json()["detail"])
