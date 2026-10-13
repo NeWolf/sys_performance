@@ -451,12 +451,13 @@ class AdbTests(unittest.TestCase):
                 adb.devices()
         self.assertEqual(error.exception.status, 504)
         self.assertIn("查询设备列表", str(error.exception))
-        self.assertIn("10 秒", str(error.exception))
+        self.assertIn("30 秒", str(error.exception))
         with patch("perf_adb.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"0\r\n", b"")) as run:
             self.assertEqual(adb.shell("unit", "id -u", True), "0")
         command = run.call_args.args[0]
         self.assertEqual(command[:5], ["adb", "-s", "unit", "shell", "-T"])
         self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
         adb.executable = None
         with self.assertRaises(AdbError) as error:
             adb.devices()

@@ -202,7 +202,7 @@ class TopCaptureTests(unittest.TestCase):
         self.assertFalse(self.adb.lock.locked())
         self.assertEqual([c.args[2] for c in self.adb.run.call_args_list],
                          ["root", "wait-for-device"])
-        self.assertTrue(all(0 < c.kwargs["timeout"] <= 10
+        self.assertTrue(all(c.kwargs["timeout"] == 30
                             for c in self.adb.run.call_args_list))
 
     def test_root_zero_exit_without_uid_zero_is_rejected(self):
@@ -524,7 +524,8 @@ class TopCaptureTests(unittest.TestCase):
         self.assertTrue(self.adb.run.call_args_list)
         for call in self.adb.run.call_args_list:
             self.assertGreater(call.kwargs["timeout"], 0)
-            self.assertLessEqual(call.kwargs["timeout"], 10)
+            limit = 30 if call.args[2] in {"root", "wait-for-device"} else 10
+            self.assertLessEqual(call.kwargs["timeout"], limit)
 
     def test_explicit_pull_import_and_poll_preserves_metadata(self):
         identity = self.finished()

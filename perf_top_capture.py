@@ -66,8 +66,8 @@ class TopCapture:
         # stop polling must not restart adbd or reset its confirmation deadline.
         with self.adb.device(serial):
             try:
-                self.adb.run("-s", serial, "root", timeout=10)
-                self.adb.run("-s", serial, "wait-for-device", timeout=10)
+                self.adb.run("-s", serial, "root", timeout=30)
+                self.adb.run("-s", serial, "wait-for-device", timeout=30)
                 if self.adb.shell(serial, "id -u") != "0":
                     raise AdbError("设备未取得 root 权限，可能不支持 adb root", 403)
             except AdbError as exc:

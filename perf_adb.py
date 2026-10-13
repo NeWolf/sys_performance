@@ -32,7 +32,7 @@ class AdbController:
         # Local service lifetime only; PID observations are not process birth times.
         self.capture_times = {}
 
-    def run(self, *args, timeout=10, output=None):
+    def run(self, *args, timeout=30, output=None):
         if not self.executable:
             raise AdbError("未找到 adb，请安装 Android platform-tools 并加入 PATH", 503)
         try:
@@ -76,7 +76,7 @@ class AdbController:
     def shell(self, serial, script, root=False, output=None):
         command = "su 0 sh -c " + shlex.quote(script) if root else "sh -c " + shlex.quote(script)
         return self.run("-s", serial, "shell", "-T", command,
-                        timeout=40 if output is not None else 10, output=output)
+                        timeout=40 if output is not None else 30, output=output)
 
     def _shell_step(self, serial, script, root=False, *, step):
         try:
