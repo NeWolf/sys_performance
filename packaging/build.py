@@ -73,6 +73,7 @@ def main():
         run(npm, "--prefix", "frontend", "run", "lint")
     for resource in ("frontend/dist/index.html", "frontend/dist/JD_logo.png", "frontend/src/sysmonitor_test/sysmonitor",
                      "report_assets/report.css", "report_assets/report.js",
+                     "report_assets/report_compact.css", "report_assets/report_compact.js",
                      "report_assets/vendor/echarts.min.js", "report_assets/vendor/ECHARTS-LICENSE",
                      "report_assets/vendor/ECHARTS-NOTICE", "JD_logo.png", "device_top_capture.sh"):
         if not (ROOT / resource).is_file():

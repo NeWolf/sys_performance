@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { formatNumber, formatTime, sessionPath, useResource, useAnalysisStream } from './api'
+import { formatNumber, formatTime, formatPid, roundMetric, subtractMetric, scaleMetric, sessionPath, useResource, useAnalysisStream } from './api'
 import { AnalysisProgress } from './Progress'
 import type { Overview, Session } from './api'
 import { ComparisonBars } from './Chart'
@@ -9,12 +9,23 @@ type Stat = 'avg' | 'p95' | 'max' | 'total'
 type Difference = { baseline: number | null; target: number | null; delta: number | null; percent: number | null }
 type Metric = { label: string; unit: string; baseline_count: number; target_count: number; comparable: boolean; statistics: Partial<Record<Stat, Difference>> }
 type Snapshot = { session: Session; cycles: number; segments: number; duration_seconds: number; formats: string[]; interval: { count: number; min: number | null; max: number | null; median: number | null; invalid: number } }
-type Process = { name: string; status: 'matched' | 'baseline_only' | 'target_only'; baseline: { observed: number; pids: number[]; formats: string[] } | null; target: { observed: number; pids: number[]; formats: string[] } | null; metrics: Record<string, Metric> }
+type Process = { name: string; status: 'matched' | 'baseline_only' | 'target_only'; baseline: { observed: number; pids: number[]; pid_changes: number; formats: string[] } | null; target: { observed: number; pids: number[]; pid_changes: number; formats: string[] } | null; metrics: Record<string, Metric> }
 type Comparison = { baseline: Snapshot; target: Snapshot; system: Record<string, Metric>; io: Record<string, Metric>; processes: Process[]; warnings: string[] }
 const fields = [ ['cpu1c', 'CPU'], ['rss_kb', '内存'], ['rd_kb', '物理读取'], ['wr_kb', '物理写入'], ['rchar_kb', '逻辑读取'], ['wchar_kb', '逻辑写入'] ]
 const labels: Record<Stat, string> = { avg: '均值', p95: 'P95', max: '峰值', total: '有效累计' }
 type SideLabels = { baselineLabel: string; targetLabel: string }
-function signed(value: number | null | undefined) { return value == null ? '—' : `${value > 0 ? '+' : ''}${formatNumber(value, 2)}` }
+function signed(value: number | null | undefined) {
+  const rounded = roundMetric(value)
+  return rounded == null ? '—' : `${rounded > 0 ? '+' : ''}${formatNumber(rounded)}`
+}
+
+function difference(metric: Metric | undefined, stat: Stat): Difference {
+  const source = metric?.statistics[stat]
+  const baseline = roundMetric(source?.baseline)
+  const target = roundMetric(source?.target)
+  const delta = metric?.comparable ? subtractMetric(target, baseline) : null
+  return { baseline, target, delta, percent: baseline === null || baseline === 0 ? null : scaleMetric(delta, 100, Math.abs(baseline)) }
+}
 function unit(field: string, stat: Stat, metric: Metric) { return field.endsWith('_kb') && field !== 'rss_kb' ? (stat === 'total' ? 'KB' : 'KB/周期') : metric.unit }
 
 function SessionChoice({ label, labelValue, onLabelChange, sessions, id, segment, onChange, onSegment }: { label: string; labelValue: string; onLabelChange: (value: string) => void; sessions: Session[]; id: string; segment: string; onChange: (id: string) => void; onSegment: (value: string) => void }) {
@@ -32,13 +43,13 @@ function Coverage({ title, data }: { title: string; data: Snapshot }) {
 }
 
 function MetricCells({ field, metric, stat }: { field: string; metric: Metric; stat: Stat }) {
-  const diff = metric.statistics[stat]
+  const diff = difference(metric, stat)
   const suffix = unit(field, stat, metric)
   return <><td>{formatNumber(diff?.baseline, 2)} {suffix}</td><td>{formatNumber(diff?.target, 2)} {suffix}</td><td className={diff?.delta == null ? '' : diff.delta > 0 ? 'compare-up' : diff.delta < 0 ? 'compare-down' : ''}>{signed(diff?.delta)} {diff?.delta == null ? '' : suffix === '%' ? '百分点' : suffix}</td><td>{signed(diff?.percent)}{diff?.percent == null ? '' : '%'}</td><td>{metric.baseline_count} / {metric.target_count}{!metric.comparable && <small>口径不同，不计算差值</small>}</td></>
 }
 
 function barItem(name: string, metric: Metric, stat: Stat): ComparisonBarItem {
-  const diff = metric.statistics[stat]
+  const diff = difference(metric, stat)
   return { name, baseline: diff?.baseline ?? null, target: diff?.target ?? null,
     delta: diff?.delta ?? null, percent: diff?.percent ?? null, comparable: metric.comparable }
 }
@@ -70,7 +81,7 @@ function Results({ data, baselineLabel, targetLabel }: { data: Comparison } & Si
   const [query, setQuery] = useState('')
   const [page, setPage] = useState(0)
   const selectedStat = processStat === 'total' && (field === 'cpu1c' || field === 'rss_kb') ? 'avg' : processStat
-  const value = (p: Process) => p.metrics[field]?.statistics[selectedStat]?.delta
+  const value = (p: Process) => difference(p.metrics[field], selectedStat).delta
   const comparable = data.processes.filter((p) => value(p) != null)
   const rows = data.processes.filter((p) => p.name.toLowerCase().includes(query.toLowerCase()) && (order === 'unavailable' ? value(p) == null : value(p) != null && (order === 'increase' ? value(p)! > 0 : order === 'decrease' ? value(p)! < 0 : true)))
   rows.sort((a, b) => (order === 'absolute' ? Math.abs(value(b)!) - Math.abs(value(a)!) : order === 'increase' ? value(b)! - value(a)! : order === 'decrease' ? value(a)! - value(b)! : 0) || a.name.localeCompare(b.name))
@@ -92,7 +103,7 @@ function Results({ data, baselineLabel, targetLabel }: { data: Comparison } & Si
         <label className="process-search">原始进程名<input value={query} onChange={(e) => { setQuery(e.target.value); setPage(0) }} placeholder="搜索进程名称" /></label>
       </div><p className="muted">当前指标可比较 {comparable.length} 个进程；缺值或单侧观察 {data.processes.length - comparable.length} 个，不纳入排名。</p>
       <ComparisonBars baselineLabel={baselineLabel} targetLabel={targetLabel} title={`进程变化前 20 名 · ${fields.find(([key]) => key === field)?.[1]} · ${labels[selectedStat]}`} unit={rankUnit} ranking items={rankedRows.map((p) => barItem(p.name, p.metrics[field], selectedStat))} note={`差值 = ${targetLabel} − ${baselineLabel}；按当前搜索和排序展示前 ${rankedRows.length} 名，不随表格翻页变化。${field === 'cpu1c' ? '进程 CPU 为单核口径，可超过 100%。' : field === 'rss_kb' ? '跨来源内存仍参与排行，GPU 回填等口径差异可能影响数值，结果仅供参考。' : 'IO 非速率，累计量受时长和有效覆盖影响。'}`} />
-      <div className="table-scroll"><table><thead><tr><th>原始进程名 / 状态</th><th>{baselineLabel}</th><th>{targetLabel}</th><th>差值</th><th>相对变化</th><th>有效样本（{baselineLabel} / {targetLabel}）</th><th>观察周期（{baselineLabel} / {targetLabel}）</th></tr></thead><tbody>{rows.slice(current * 50, (current + 1) * 50).map((p) => <tr key={p.name}><td className="compare-name">{p.name}<small>{statusLabels[p.status]}</small><small>来源：{p.baseline?.formats.join(' + ') || '—'} / {p.target?.formats.join(' + ')|| '—'}</small><small title={`${baselineLabel} PID：${p.baseline?.pids.join(', ') || '—'}；${targetLabel} PID：${p.target?.pids.join(', ') || '—'}`}>PID 数：{p.baseline?.pids.length ?? '—'} / {p.target?.pids.length ?? '—'}</small></td><MetricCells field={field} metric={p.metrics[field]} stat={selectedStat} /><td>{p.baseline?.observed ?? '—'} / {p.target?.observed ?? '—'}</td></tr>)}</tbody></table></div>
+      <div className="table-scroll"><table><thead><tr><th>原始进程名 / 状态</th><th>{baselineLabel}</th><th>{targetLabel}</th><th>差值</th><th>相对变化</th><th>有效样本（{baselineLabel} / {targetLabel}）</th><th>观察周期（{baselineLabel} / {targetLabel}）</th></tr></thead><tbody>{rows.slice(current * 50, (current + 1) * 50).map((p) => <tr key={p.name}><td className="compare-name">{p.name}<small>{statusLabels[p.status]}</small><small>来源：{p.baseline?.formats.join(' + ') || '—'} / {p.target?.formats.join(' + ')|| '—'}</small><small>{baselineLabel}：{p.baseline ? formatPid(p.baseline.pids, p.baseline.pid_changes) : '—'}；{targetLabel}：{p.target ? formatPid(p.target.pids, p.target.pid_changes) : '—'}</small></td><MetricCells field={field} metric={p.metrics[field]} stat={selectedStat} /><td>{p.baseline?.observed ?? '—'} / {p.target?.observed ?? '—'}</td></tr>)}</tbody></table></div>
       {!rows.length && <p>当前范围没有进程。可切换指标或查看“无法比较 / 单侧观察”。</p>}
       <div className="pagination"><span>{rows.length} 个进程 · 第 {current + 1} / {pages} 页</span><div><button disabled={!current} onClick={() => setPage(current - 1)}>上一页</button><button disabled={current + 1 >= pages} onClick={() => setPage(current + 1)}>下一页</button></div></div>
     </section>

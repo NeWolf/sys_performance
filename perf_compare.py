@@ -5,9 +5,10 @@ import time
 from concurrent.futures import CancelledError
 from collections import defaultdict
 
+from perf_metrics import round_metric, scale_metric, subtract_metric, sum_metrics
 from perf_report_data import (
-    INCREMENTS, PROCESS_FIELDS, SYSTEM_FIELDS, _insert_values, _number,
-    _prepare, _process_cycle, _statistics,
+    INCREMENTS, PROCESS_FIELDS, SYSTEM_FIELDS, _insert_values, _statistics,
+    _prepare, _process_cycle,
 )
 
 
@@ -37,13 +38,14 @@ def _snapshot(store, session_id, segment=None, report=None, cancelled=None):
         axes = defaultdict(list)
         for row in db.execute("SELECT segment,cycle,MIN(ts),MAX(ts) FROM report_source GROUP BY segment,cycle ORDER BY segment,cycle"):
             axes[row[0]].append(row[2] if row[2] == row[3] else None)
-        intervals, duration, invalid = [], 0, 0
+        intervals, durations, invalid = [], [], 0
         for timestamps in axes.values():
             valid = [ts for ts in timestamps if ts is not None]
-            duration += (max(valid) - min(valid)) / 1000 if valid else 0
+            if valid:
+                durations.append(scale_metric(max(valid) - min(valid), divisor=1000))
             for a, b in zip(timestamps, timestamps[1:]):
                 if a is not None and b is not None and b > a:
-                    intervals.append((b - a) / 1000)
+                    intervals.append(scale_metric(b - a, divisor=1000))
                 else:
                     invalid += 1
         intervals.sort()
@@ -56,18 +58,17 @@ def _snapshot(store, session_id, segment=None, report=None, cancelled=None):
             data = json.loads(row[0])
             source = data.get("source_format", "sysmonitor")
             formats.add(source)
-            values = {field: _number(data.get(field)) for field in COMPARE_SYSTEM_FIELDS}
+            values = {field: round_metric(data.get(field)) for field in COMPARE_SYSTEM_FIELDS}
             total = values["mem_total_mb"]
-            remainder = _number(data.get("mem_free_mb" if source == "top" else "mem_avail_mb"))
+            remainder = round_metric(data.get("mem_free_mb" if source == "top" else "mem_avail_mb"))
             used = values["mem_used_mb"]
             if total is not None and remainder is not None and (source != "top" or used is None):
-                used = _number(total - remainder)
+                used = subtract_metric(total, remainder)
             values["mem_used_mb"] = used
-            values["mem_remaining_mb"] = (
-                _number(total - used) if total is not None and used is not None else None)
-            values["mem_percent"] = _number(used / total * 100) if used is not None and total is not None and total > 0 else None
+            values["mem_remaining_mb"] = subtract_metric(total, used)
+            values["mem_percent"] = scale_metric(used, 100, total) if total is not None and total > 0 else None
             cpu = values["cpu_total"]
-            values["cpu_idle"] = 100 - cpu if cpu is not None else None
+            values["cpu_idle"] = subtract_metric(100, cpu)
             _insert_values(db, "system", values)
             if index % 256 == 0:
                 report("system", index, system_count)
@@ -79,14 +80,21 @@ def _snapshot(store, session_id, segment=None, report=None, cancelled=None):
         cursor = db.execute("SELECT * FROM report_source WHERE kind IN ('P','DP') ORDER BY segment,name,cycle,id")
         for (part, name), rows in itertools.groupby(cursor, key=lambda row: (row["segment"], row["name"])):
             if name not in processes:
-                processes[name] = dict(scope="p" + str(len(processes)), name=name, pids=set(), formats=set(), observed=0)
+                processes[name] = dict(scope="p" + str(len(processes)), name=name, pids=set(),
+                                       formats=set(), observed=0, pid_changes=0, pid_path=[])
             process = processes[name]
+            previous = None
             for cycle, members in itertools.groupby(rows, key=lambda row: row["cycle"]):
                 members = list(members)
                 process["formats"].update(json.loads(row["data"]).get("source_format", "sysmonitor")
                             for row in members if row["kind"] == "P")
                 full, values = _process_cycle(members)
                 process["pids"].update(pid for pid in full[9] if pid is not None)
+                current = full[9]
+                if current != previous:
+                    process["pid_changes"] += int(previous is not None)
+                    process["pid_path"].append(dict(segment=part, cycle=cycle, ts=full[1], pids=current))
+                    previous = current
                 process["observed"] += 1
                 _insert_values(db, process["scope"], values)
                 db.executemany("INSERT INTO compare_io VALUES (?,?,?,?)",
@@ -98,7 +106,7 @@ def _snapshot(store, session_id, segment=None, report=None, cancelled=None):
         # Only sum observed names when every observed member has a valid value.
         # Absent names are never invented, and this is not whole-device disk I/O.
         db.execute("""INSERT INTO report_values
-            SELECT 'io',field,SUM(value),0 FROM compare_io
+            SELECT 'io',field,metric_sum(value),0 FROM compare_io
             GROUP BY segment,cycle,field HAVING COUNT(value)=COUNT(*)""")
         scopes = {"system": COMPARE_SYSTEM_FIELDS, "io": sorted(INCREMENTS)}
         scopes.update({p["scope"]: PROCESS_FIELDS for p in processes.values()})
@@ -109,17 +117,19 @@ def _snapshot(store, session_id, segment=None, report=None, cancelled=None):
             process["pids"] = sorted(process["pids"])
             process["formats"] = sorted(process["formats"])
         return dict(session=session, segment=segment, cycles=sum(map(len, axes.values())),
-                    segments=len(axes), duration_seconds=duration, formats=sorted(formats),
+                    segments=len(axes), duration_seconds=sum_metrics(durations), formats=sorted(formats),
                     interval=dict(count=len(intervals), min=intervals[0] if intervals else None,
                                   max=intervals[-1] if intervals else None,
-                                  median=(intervals[(len(intervals)-1)//2] + intervals[len(intervals)//2]) / 2 if intervals else None,
+                                  median=scale_metric(sum_metrics((intervals[(len(intervals)-1)//2],
+                                                                   intervals[len(intervals)//2])), divisor=2) if intervals else None,
                                   invalid=invalid),
                     system=metrics["system"], io=metrics["io"], processes=processes)
 
 
 def _difference(before, after):
-    delta = _number(after - before) if before is not None and after is not None else None
-    percent = _number(delta / abs(before) * 100) if delta is not None and before else None
+    before, after = round_metric(before), round_metric(after)
+    delta = subtract_metric(after, before)
+    percent = scale_metric(delta, 100, abs(before)) if before else None
     return dict(baseline=before, target=after, delta=delta, percent=percent)
 
 

@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 
 import perf_slate
+from perf_metrics import round_metric, scale_metric
 from perf_report_data import KDMIPS_PER_CORE, REQUIRED_PROCESSES, build_report_data
 from perf_report_ui import EXCEL_BUDGETS
 
@@ -30,7 +31,8 @@ def _valid(value):
 
 
 def _values(points, field, divisor=1):
-    return sorted(p[field] / divisor for p in points if _valid(p.get(field)))
+    values = (scale_metric(p.get(field), divisor=divisor) for p in points)
+    return sorted(value for value in values if value is not None)
 
 
 def _rank(values, percent):
@@ -38,7 +40,8 @@ def _rank(values, percent):
 
 
 def _fmt(value):
-    return format(value, ".2f") if _valid(value) else ""
+    value = round_metric(value)
+    return format(value, ".2f") if value is not None else ""
 
 
 def _windows(store, session_id, segments, scenes):
@@ -91,7 +94,7 @@ def _statistics(processes, schema, scene, windows, factor, plain=()):
                 points.append(point)
     cpu, memory = _values(points, "cpu1c"), _values(points, "rss_kb", 1024)
     p95, peak = _rank(cpu, 95), max(cpu) if cpu else None
-    k = lambda value: value / 100 * factor if value is not None and factor is not None else None
+    k = lambda value: scale_metric(value, factor, 100)
     # Match the focus-process table: physical IO peak in MB/cycle, not MB/s.
     reads, writes = _values(points, "rd_kb", 1024), _values(points, "wr_kb", 1024)
     return [p95, k(p95), peak, k(peak),
@@ -129,6 +132,7 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     default_factor = factor is None
     if default_factor:
         factor = KDMIPS_PER_CORE
+    factor = round_metric(factor)
     if scenes is not None and (not isinstance(scenes, dict) or any(type(k) is not int for k in scenes) or
                                any(not isinstance(v, str) or v not in _SCENES for v in scenes.values())):
         raise ValueError("scenes可省略；给出时每段必须是background/foreground/unknown")
@@ -212,7 +216,7 @@ def build_admission(store, session_id, template: list, output_dir: Path,
             texts = [_fmt(value) for value in values] if applicable or not has_data else ["-"] * len(values)
             colors = []
             for value, key in zip(values, columns):
-                limit = source.get(key)
+                value, limit = round_metric(value), round_metric(source.get(key))
                 color = None
                 # IO budgets are MB/s, but measured peaks are MB/cycle.
                 if key not in "KLRS" and _valid(value) and _valid(limit):

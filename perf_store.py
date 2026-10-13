@@ -14,6 +14,21 @@ from perf_parser import iter_records, rotation_key
 from perf_top_parser import detect_source_format, iter_top_records
 from perf_groups import GroupStore
 from perf_metrics import CATEGORIES, INCREMENTS, LABELS, METHOD, NOTES, NUMERIC, metadata, system_cpu_reference, cpu_reference_note
+from perf_metrics import PRECISION_VERSION, register_metric_sql, round_metric, scale_metric, subtract_metric
+
+
+# Only measures are rounded; IDs, timestamps, categories and coverage stay exact.
+_SAMPLE_METRICS = tuple(dict.fromkeys(
+    field for fields in NUMERIC.values() for field in fields)) + (
+        "cpu_capacity", "cpu_single_core", "cpu_idle", "mem_free_mb")
+
+
+def _metric_point(raw, extra_metrics=()):
+    point = json.loads(raw)
+    for field in (*_SAMPLE_METRICS, *extra_metrics):
+        if field in point:
+            point[field] = round_metric(point[field])
+    return point
 
 
 CAPTURE_PROCESS_NAME = "sh /data/local/tmp/sysmonitor_top_capture/"
@@ -109,6 +124,10 @@ class Store(GroupStore):
                     session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     version TEXT NOT NULL, document BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS report_compact_cache (
+                    session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                    version TEXT NOT NULL, document BLOB NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS analysis_cache (
                     session TEXT REFERENCES sessions(id) ON DELETE CASCADE,
                     scope TEXT, result TEXT NOT NULL, PRIMARY KEY(session, scope)
@@ -153,6 +172,22 @@ class Store(GroupStore):
             self._migrate_capture_processes(
                 db, migration="tcpdump_process_identity_v1",
                 candidate="instr(name,'tcpdump')>0")
+            db.commit()
+            self._migrate_metric_precision(db)
+
+    @staticmethod
+    def _migrate_metric_precision(db):
+        """Invalidate derived data once per precision version, never raw records."""
+        migration = "metric_precision_" + PRECISION_VERSION
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM store_migrations WHERE name=?", (migration,)).fetchone():
+            return
+        for table in ("analysis_cache", "report_cache", "report_compact_cache",
+                      "process_rank_v3", "process_rank_ready_v3",
+                      "process_name_rank_v2", "process_name_ready_v2",
+                      "process_rss_rank_v1", "process_rss_ready_v1"):
+            db.execute(f"DELETE FROM {table}")
+        db.execute("INSERT INTO store_migrations VALUES (?)", (migration,))
 
     @staticmethod
     def _migrate_capture_processes(db, migration="capture_process_identity_v1",
@@ -187,7 +222,7 @@ class Store(GroupStore):
                        "'$.raw_name',COALESCE(json_extract(data,'$.raw_name'),name)) "
                        f"WHERE session=? AND kind IN ('P','DP') AND name IN "
                        f"(SELECT name FROM {mapping} WHERE session=?)", (sid, sid))
-        for table in ("analysis_cache", "report_cache", "process_rank_v3", "process_rank_ready_v3",
+        for table in ("analysis_cache", "report_cache", "report_compact_cache", "process_rank_v3", "process_rank_ready_v3",
                       "process_name_rank_v2", "process_name_ready_v2",
                       "process_rss_rank_v1", "process_rss_ready_v1"):
             db.executemany(f"DELETE FROM {table} WHERE session=?", ((sid,) for sid in affected))
@@ -198,6 +233,7 @@ class Store(GroupStore):
     def connect(self):
         db = sqlite3.connect(str(self.path), timeout=30)
         db.row_factory = sqlite3.Row
+        register_metric_sql(db)
         db.execute("PRAGMA foreign_keys=ON")
         try:
             yield db
@@ -345,7 +381,7 @@ class Store(GroupStore):
         if kind not in NUMERIC:
             raise ValueError("不支持的记录类型")
         self.session(session_id)
-        scope = json.dumps([1, kind, pid, segment, name], ensure_ascii=False)
+        scope = json.dumps([PRECISION_VERSION, kind, pid, segment, name], ensure_ascii=False)
         where, params = "session=? AND kind=?", [session_id, kind]
         for key, value in (("pid", pid), ("segment", segment), ("name", name)):
             if value is not None:
@@ -364,7 +400,9 @@ class Store(GroupStore):
             db.execute("PRAGMA temp_store=FILE")
             db.execute("PRAGMA temp.cache_size=-8192")
             fields = NUMERIC[kind] + CATEGORIES.get(kind, ())
-            columns = ",".join("json_extract(data,'$.%s') AS %s" % (f, f) for f in fields)
+            columns = ",".join(
+                ("metric_round(json_extract(data,'$.%s')) AS %s" if f in NUMERIC[kind]
+                 else "json_extract(data,'$.%s') AS %s") % (f, f) for f in fields)
             db.execute("CREATE TEMP TABLE metric_scope AS SELECT ts," + columns +
                        " FROM records WHERE " + where, params)
             bounds = dict(db.execute("SELECT COUNT(*) samples, MIN(ts) start, MAX(ts) end FROM metric_scope").fetchone())
@@ -374,10 +412,10 @@ class Store(GroupStore):
                 row = dict(db.execute(f"""WITH ranked AS (
                     SELECT {field} value, ROW_NUMBER() OVER (ORDER BY {field}) rn,
                            COUNT(*) OVER () n FROM metric_scope WHERE {field} IS NOT NULL
-                    ) SELECT COUNT(*) count, MIN(value) min, MAX(value) max, AVG(value) avg,
+                    ) SELECT COUNT(*) count, MIN(value) min, MAX(value) max, metric_avg(value) avg,
                     MAX(CASE WHEN rn=(95*n+99)/100 THEN value END) p95,
                     MAX(CASE WHEN rn=(99*n+99)/100 THEN value END) p99,
-                    SUM(CAST(value AS REAL)) total FROM ranked""").fetchone())
+                    metric_sum(value) total FROM ranked""").fetchone())
                 if field not in INCREMENTS:
                     row.pop("total")
                 result["metrics"][field] = dict(row, **metadata(field))
@@ -387,7 +425,7 @@ class Store(GroupStore):
                 count = sum(row["count"] for row in rows)
                 result["categories"][field] = {
                     "label": LABELS[field], "note": NOTES.get(field, ""), "count": count,
-                    "values": [dict(row, percent=100 * row["count"] / count) for row in rows]}
+                    "values": [dict(row, percent=scale_metric(row["count"], 100, count)) for row in rows]}
             # A concurrent deletion must not resurrect a cached session.
             db.execute("INSERT OR IGNORE INTO analysis_cache SELECT id,?,? FROM sessions WHERE id=?",
                        (scope, json.dumps(result, ensure_ascii=False), session_id))
@@ -416,29 +454,33 @@ class Store(GroupStore):
         self.session(session_id)
         io_fields = ("rd_kb", "wr_kb", "rchar_kb", "wchar_kb")
         sums = ",".join(
-            f"SUM(CASE WHEN kind='P' THEN CAST(json_extract(data,'$.{field}') AS REAL) END) AS {field}"
+            f"metric_sum(CASE WHEN kind='P' THEN json_extract(data,'$.{field}') END) AS {field}"
             for field in io_fields)
         with self.connect() as db:
             profiles = set()
 
             def reference(raw):
-                resolved = system_cpu_reference(json.loads(raw))
+                data = _metric_point(raw)
+                resolved = system_cpu_reference(data)
                 profiles.add((resolved["cpu_platform"], resolved["cpu_capacity"]))
-                return resolved["cpu_single_core"]
+                if data.get("source_format") == "top":
+                    return round_metric(resolved["cpu_single_core"])
+                return scale_metric(data.get("cpu_total"), resolved["cpu_capacity"], 100)
 
             db.create_function("system_cpu_reference", 1, reference)
+            db.create_function("metric_subtract", 2, subtract_metric, deterministic=True)
             # Include S-only cycles so absent IO remains NULL, not a fabricated zero.
             # Spill the full cycle aggregation to disk rather than loading all P rows.
             db.execute("PRAGMA temp_store=FILE")
             db.execute("""CREATE TEMP TABLE process_reference_cycles AS
                 SELECT MIN(id) id, segment, cycle, MIN(ts) ts,
-                MAX(CASE WHEN kind='S' THEN json_extract(data,'$.cpu_total') END) cpu_total,
+                MAX(CASE WHEN kind='S' THEN metric_round(json_extract(data,'$.cpu_total')) END) cpu_total,
                 MAX(CASE WHEN kind='S' THEN system_cpu_reference(data) END) cpu_single_core,
                 MAX(CASE WHEN kind='S' THEN CASE
                     WHEN json_extract(data,'$.source_format')='top'
-                    THEN json_extract(data,'$.mem_used_mb')
-                    ELSE json_extract(data,'$.mem_total_mb')
-                        - json_extract(data,'$.mem_avail_mb') END END) mem_used_mb,
+                    THEN metric_round(json_extract(data,'$.mem_used_mb'))
+                    ELSE metric_subtract(json_extract(data,'$.mem_total_mb'),
+                        json_extract(data,'$.mem_avail_mb')) END END) mem_used_mb,
                 """ + sums + """ FROM records
                 WHERE session=? AND segment=? AND kind IN ('S','P')
                 GROUP BY segment,cycle""", (session_id, segment))
@@ -476,7 +518,7 @@ class Store(GroupStore):
             previous = None
             runs = dict.fromkeys(fields, 0)
             for row in cursor:
-                data = json.loads(row["data"])
+                data = _metric_point(row["data"])
                 for field in fields:
                     if (previous is None or data.get(field) is None or
                             previous["data"].get(field) is None or
@@ -499,14 +541,14 @@ class Store(GroupStore):
         if type(limit) is not int or limit < 1:
             raise ValueError("limit 必须是正整数")
         if count <= limit:
-            return {"points": [dict(json.loads(row["data"]), segment=row["segment"], cycle=row["cycle"])
+            return {"points": [dict(_metric_point(row["data"], extra_metrics), segment=row["segment"], cycle=row["cycle"])
                                for row in cursor], "total": count, "sampled": False}
         metrics = tuple(dict.fromkeys(
             (*extra_metrics, *(field for fields in NUMERIC.values() for field in fields))))
         width = max(1, math.ceil(count / max(1, limit // (2 * len(metrics) + 2))))
         result, selected, extrema = [], {}, {}
         for index, row in enumerate(cursor):
-            point = dict(json.loads(row["data"]), segment=row["segment"], cycle=row["cycle"])
+            point = dict(_metric_point(row["data"], extra_metrics), segment=row["segment"], cycle=row["cycle"])
             identity = row["id"]
             if index % width == 0:
                 result.extend(value for _, value in sorted(selected.items()))
@@ -547,26 +589,27 @@ class Store(GroupStore):
 
     def overview(self, session_id):
         session = self.session(session_id)
+        scope = "overview-v1:" + PRECISION_VERSION
         with self.connect() as db:
-            cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope='overview-v1'",
-                                (session_id,)).fetchone()
+            cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope=?",
+                                (session_id, scope)).fetchone()
             if cached:
                 return dict(session, **json.loads(cached[0]))
             stats = db.execute("""SELECT COUNT(*) samples,
-                AVG(json_extract(data,'$.cpu_total')) cpu_avg,
-                MAX(json_extract(data,'$.cpu_total')) cpu_peak,
-                MIN(json_extract(data,'$.mem_avail_mb')) mem_available_min,
-                MAX(json_extract(data,'$.mem_used_mb')) mem_used_peak
+                metric_avg(metric_round(json_extract(data,'$.cpu_total'))) cpu_avg,
+                MAX(metric_round(json_extract(data,'$.cpu_total'))) cpu_peak,
+                MIN(metric_round(json_extract(data,'$.mem_avail_mb'))) mem_available_min,
+                MAX(metric_round(json_extract(data,'$.mem_used_mb'))) mem_used_peak
                 FROM records WHERE session=? AND kind='S'""", (session_id,)).fetchone()
             segments = db.execute("""SELECT segment,MIN(ts) start,MAX(ts) end,COUNT(*) records
                 FROM records WHERE session=? GROUP BY segment ORDER BY segment""", (session_id,)).fetchall()
-            exporters = db.execute("""SELECT name,MAX(json_extract(data,'$.size_mb')) peak_mb,
+            exporters = db.execute("""SELECT name,MAX(metric_round(json_extract(data,'$.size_mb'))) peak_mb,
                 COUNT(*) samples FROM records WHERE session=? AND kind='DE'
                 GROUP BY name ORDER BY peak_mb DESC LIMIT 100""", (session_id,)).fetchall()
             result = dict(stats=dict(stats), segments=[dict(r) for r in segments],
                           exporters=[dict(r) for r in exporters])
-            db.execute("INSERT OR IGNORE INTO analysis_cache SELECT id,'overview-v1',? FROM sessions WHERE id=?",
-                       (json.dumps(result, ensure_ascii=False), session_id))
+            db.execute("INSERT OR IGNORE INTO analysis_cache SELECT id,?,? FROM sessions WHERE id=?",
+                       (scope, json.dumps(result, ensure_ascii=False), session_id))
         return dict(session, **result)
 
     def _ensure_process_ranks(self, db, session_id):
@@ -587,18 +630,18 @@ class Store(GroupStore):
             WITH ranked AS (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY segment,pid,name,kind
-                    ORDER BY json_extract(data,'$.cpu1c') IS NULL,json_extract(data,'$.cpu1c')) rn,
-       COUNT(json_extract(data,'$.cpu1c')) OVER (PARTITION BY segment,pid,name,kind) n
+                    ORDER BY metric_round(json_extract(data,'$.cpu1c')) IS NULL,metric_round(json_extract(data,'$.cpu1c'))) rn,
+       COUNT(metric_round(json_extract(data,'$.cpu1c'))) OVER (PARTITION BY segment,pid,name,kind) n
                 FROM records WHERE session=? AND kind IN ('P','DP')
             ) SELECT ?,segment,pid,name,
-                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
-                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
+                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
                 SUM(kind='P'),
-                MAX(json_extract(data,'$.cpu1c')), AVG(json_extract(data,'$.cpu1c')),
-                MAX(json_extract(data,'$.rss_kb')), MAX(json_extract(data,'$.wait')),
-                SUM(CAST(json_extract(data,'$.rd_kb') AS REAL)),
-                SUM(CAST(json_extract(data,'$.wr_kb') AS REAL)),
-                MAX(CASE WHEN kind='DP' THEN json_extract(data,'$.size_kb') END)
+                MAX(metric_round(json_extract(data,'$.cpu1c'))), metric_avg(metric_round(json_extract(data,'$.cpu1c'))),
+                MAX(metric_round(json_extract(data,'$.rss_kb'))), MAX(metric_round(json_extract(data,'$.wait'))),
+                metric_sum(metric_round(json_extract(data,'$.rd_kb'))),
+                metric_sum(metric_round(json_extract(data,'$.wr_kb'))),
+                MAX(CASE WHEN kind='DP' THEN metric_round(json_extract(data,'$.size_kb')) END)
             FROM ranked GROUP BY segment,pid,name""", (session_id, session_id))
         db.execute("""INSERT INTO process_rank_ready_v3 SELECT ?,COUNT(*)
             FROM process_rank_v3 WHERE session=?""", (session_id, session_id))
@@ -622,17 +665,17 @@ class Store(GroupStore):
             WITH ranked AS (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY segment,name,kind
-                    ORDER BY json_extract(data,'$.cpu1c') IS NULL,json_extract(data,'$.cpu1c')) rn,
-                    COUNT(json_extract(data,'$.cpu1c')) OVER (PARTITION BY segment,name,kind) n
+                    ORDER BY metric_round(json_extract(data,'$.cpu1c')) IS NULL,metric_round(json_extract(data,'$.cpu1c'))) rn,
+                    COUNT(metric_round(json_extract(data,'$.cpu1c'))) OVER (PARTITION BY segment,name,kind) n
                 FROM records WHERE session=? AND kind IN ('P','DP')
             ) SELECT ?,segment,name,
-                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
-                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN json_extract(data,'$.cpu1c') END),
-                SUM(kind='P'), MAX(json_extract(data,'$.cpu1c')), AVG(json_extract(data,'$.cpu1c')),
-                MAX(json_extract(data,'$.rss_kb')), MAX(json_extract(data,'$.wait')),
-                SUM(CAST(json_extract(data,'$.rd_kb') AS REAL)),
-                SUM(CAST(json_extract(data,'$.wr_kb') AS REAL)),
-                MAX(CASE WHEN kind='DP' THEN json_extract(data,'$.size_kb') END)
+                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                SUM(kind='P'), MAX(metric_round(json_extract(data,'$.cpu1c'))), metric_avg(metric_round(json_extract(data,'$.cpu1c'))),
+                MAX(metric_round(json_extract(data,'$.rss_kb'))), MAX(metric_round(json_extract(data,'$.wait'))),
+                metric_sum(metric_round(json_extract(data,'$.rd_kb'))),
+                metric_sum(metric_round(json_extract(data,'$.wr_kb'))),
+                MAX(CASE WHEN kind='DP' THEN metric_round(json_extract(data,'$.size_kb')) END)
             FROM ranked GROUP BY segment,name""", (session_id, session_id))
         from itertools import groupby
         # P/DP repeats and duplicate rows within one cycle do not imply a restart.
@@ -671,13 +714,13 @@ class Store(GroupStore):
             pid = "-1" if merged else "pid"
             db.execute(f"""INSERT INTO process_rss_rank_v1
                 WITH ranked AS (
-                    SELECT segment,pid,name,json_extract(data,'$.rss_kb') value,
+                    SELECT segment,pid,name,metric_round(json_extract(data,'$.rss_kb')) value,
                     ROW_NUMBER() OVER (PARTITION BY {identity}
-                        ORDER BY json_extract(data,'$.rss_kb')) rn,
+                        ORDER BY metric_round(json_extract(data,'$.rss_kb'))) rn,
                     COUNT(*) OVER (PARTITION BY {identity}) n
                     FROM records WHERE session=? AND kind='P'
-                    AND json_extract(data,'$.rss_kb') IS NOT NULL
-                ) SELECT ?,?,segment,{pid},name,AVG(value),
+                    AND metric_round(json_extract(data,'$.rss_kb')) IS NOT NULL
+                ) SELECT ?,?,segment,{pid},name,metric_avg(value),
                     MAX(CASE WHEN rn=(95*n+99)/100 THEN value END),
                     MAX(CASE WHEN rn=(99*n+99)/100 THEN value END)
                     FROM ranked GROUP BY {identity}""", (session_id, session_id, merged))

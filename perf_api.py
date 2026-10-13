@@ -26,6 +26,7 @@ from perf_metrics import resource_settings
 
 from perf_adb import AdbController, AdbError
 from perf_report import REPORT_CSP, render_report
+from perf_report_compact import REPORT_CSP as COMPACT_REPORT_CSP
 from perf_store import Store
 from perf_top_capture import TopCapture
 from perf_version import VERSION
@@ -579,12 +580,13 @@ def create_app(database, port=8765, development=False, frontend=None):
             compare_slots, "对比")
 
     @app.get("/api/sessions/{session_id}/report/stream")
-    async def report_stream(session_id: str):
+    async def report_stream(session_id: str, style: Literal["default", "compact"] = "default"):
         def prepare_report(**callbacks):
-            # Keep HTML out of NDJSON: long reports can exceed browser string limits.
-            # The authenticated download endpoint reuses the completed disk cache.
+            # Keep HTML out of NDJSON; the download endpoint reuses this style's cache.
+            if style == "compact":
+                callbacks["style"] = style
             render_report(store, session_id, **callbacks)
-            return f"/api/sessions/{session_id}/report"
+            return f"/api/sessions/{session_id}/report" + ("?style=compact" if style == "compact" else "")
 
         return analysis_stream(prepare_report, report_slots, "性能分析")
 
@@ -704,10 +706,13 @@ def create_app(database, port=8765, development=False, frontend=None):
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/sessions/{session_id}/report")
-    def report(session_id: str):
-        return HTMLResponse(render_report(store, session_id), headers={
-            "Content-Disposition": 'attachment; filename="sysmonitor-report.html"',
-            "Content-Security-Policy": REPORT_CSP + "; sandbox allow-scripts",
+    def report(session_id: str, style: Literal["default", "compact"] = "default"):
+        document = render_report(store, session_id, style=style) if style == "compact" else render_report(store, session_id)
+        filename = "sysmonitor-report-compact.html" if style == "compact" else "sysmonitor-report.html"
+        csp = COMPACT_REPORT_CSP if style == "compact" else REPORT_CSP
+        return HTMLResponse(document, headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Security-Policy": csp + "; sandbox allow-scripts",
         })
 
     @app.get("/api/{remaining:path}")

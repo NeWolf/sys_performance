@@ -5,13 +5,15 @@ Only connection-local SQLite temporary tables are written. Public payload versio
 """
 import itertools
 import json
-import math
 import posixpath
 import time
 from concurrent.futures import CancelledError
 from collections import Counter, defaultdict
 
-from perf_metrics import METHOD, metadata, to_kdmips, system_cpu_reference, cpu_reference_note
+from perf_metrics import (
+    METHOD, metadata, to_kdmips, system_cpu_reference, cpu_reference_note,
+    round_metric, scale_metric, subtract_metric, sum_metrics, register_metric_sql,
+)
 
 
 KDMIPS_PER_CORE = 28.75
@@ -93,26 +95,15 @@ FULL_CYCLE_SCHEMA = (
 
 
 def _number(value):
-    if type(value) not in (int, float):
-        return None
-    try:
-        return value if math.isfinite(value) else None
-    except OverflowError:
-        return None
+    return round_metric(value)
 
 
 def _sum(values):
-    values = list(values)
-    if not values or any(value is None for value in values):
-        return None
-    try:
-        return _number(sum(values))
-    except OverflowError:
-        return None
+    return sum_metrics(values)
 
 
 def _percent(count, total):
-    return count / total * 100 if total else None
+    return scale_metric(count, 100, total)
 
 
 def _metric_metadata(field):
@@ -131,10 +122,11 @@ def _metric_metadata(field):
 
 
 def _insert_values(db, scope, values, active=False):
-    # REAL prevents SQLite SUM integer overflow for uint64 I/O counters.
+    # Only finite, rounded metrics enter the connection-local statistics table.
     db.executemany("INSERT INTO report_values VALUES (?,?,?,?)",
-                   ((scope, field, float(value), int(active))
-                    for field, value in values.items() if value is not None))
+                   ((scope, field, value, int(active))
+                    for field, raw in values.items()
+                    if (value := round_metric(raw)) is not None))
 
 
 def _statistics(db, scopes, active=False):
@@ -149,9 +141,9 @@ def _statistics(db, scopes, active=False):
                ROW_NUMBER() OVER (PARTITION BY scope,field ORDER BY value) AS rank,
                COUNT(*) OVER (PARTITION BY scope,field) AS n
         FROM report_values %s)
-        SELECT scope,field,COUNT(*),MIN(value),AVG(value),
+        SELECT scope,field,COUNT(*),MIN(value),metric_avg(value),
                MAX(CASE WHEN rank=(95*n+99)/100 THEN value END),
-               MAX(CASE WHEN rank=(99*n+99)/100 THEN value END),MAX(value),SUM(value)
+               MAX(CASE WHEN rank=(99*n+99)/100 THEN value END),MAX(value),metric_sum(value)
         FROM ranked GROUP BY scope,field""" % where
     for row in db.execute(sql):
         scope, field, count, low, avg, p95, p99, high, total = row
@@ -266,6 +258,7 @@ def _required(processes, segments):
 
 
 def _prepare(db, session_id):
+    register_metric_sql(db)
     # One session scan; indices/sorts live only in this connection's temp database.
     db.execute("CREATE TEMP TABLE report_source AS SELECT id,segment,cycle,ts,kind,pid,name,source,line,data FROM records WHERE session=?", (session_id,))
     db.execute("CREATE INDEX temp.report_identity ON report_source(kind,segment,name,cycle,id)")
@@ -412,18 +405,18 @@ def _build_system(db, store, segment, cycles, advance=None, include_full_system=
         if data.get("source_format") == "top":
             used = values["mem_used_mb"]
         else:
-            used = total - available if total is not None and available is not None else None
+            used = subtract_metric(total, available)
         values["mem_used_mb"] = used
         cpu = values["cpu_total"]
-        values["cpu_idle"] = 100 - cpu if cpu is not None else None
-        values["mem_percent"] = _number(used / total * 100) if used is not None and total is not None and total > 0 else None
+        values["cpu_idle"] = subtract_metric(100, cpu)
+        values["mem_percent"] = scale_metric(used, 100, total) if total is not None and total > 0 else None
         reference = system_cpu_reference(data)
         capacity = reference["cpu_capacity"]
         for field, target in SYSTEM_CPU_SINGLE_FIELDS.items():
             value = values[field]
             values[target] = (reference["cpu_single_core"] if field == "cpu_total" else
-                              _number(value * capacity / 100)
-                              if value is not None and capacity is not None else None)
+                              subtract_metric(capacity, reference["cpu_single_core"]) if field == "cpu_idle" else
+                              scale_metric(value, capacity, 100))
         _insert_values(db, scope, values)
         samples += 1
         if advance is not None:
@@ -476,7 +469,7 @@ def _payload(session, systems, processes, required):
             merge="使用 full_cycles（schema见 full_cycle_schema），仅选择同 segment 的不同原始 name；按该段全部 cycle 对齐。缺任一选中名称的行或字段则对应合计为null，否则求和；对全量合计有效周期重算最近秩统计。不要相加各进程p95/p99，严禁跨段求和。",
             provenance="每条 full_cycles 附 first_record_id/last_record_id，结合 session+segment+name+cycle 查询 records 可追溯所有 P/DP source/line；范围可能穿插其他记录。系统明细直接附 source/line。",
             matching="Excel原名逐字优先；仅绝对路径可退化basename，歧义仅列候选。WebView截断行始终待确认。required按每段标记，无采集为missing；dp_only不是P采集成功。",
-            precision="统计临时表使用SQLite REAL；大整数可能有IEEE754舍入。完整周期数组不降采样，输出体积随名称周期数增长。",
+            precision="指标输入先按十进制HALF_UP舍入至两位，合计、均值及派生计算使用共享十进制函数，结果保留两位；整数计数、时间戳、标识符及原始records不改。统计临时表使用SQLite REAL，大整数可能有IEEE754舍入。完整周期数组不降采样，输出体积随名称周期数增长。",
         ),
     )
 

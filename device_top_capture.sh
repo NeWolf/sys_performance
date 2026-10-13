@@ -86,21 +86,62 @@ control_lock() {
     exec 0>> "$ROOT/control.lock" || fail 'Cannot open Top control lock; state unconfirmed'
     flock -n 0 || fail 'Another device operation is active; retry'
 }
-load_state() {
-    [ -f "$DIR/state" ] && [ ! -L "$DIR/state" ] || fail 'Unsafe state; retry recovery'
-    [ "$(wc -c < "$DIR/state")" -le 2048 ] || fail 'Invalid state; retry recovery'
-    awk -v id="$ID" -v max="$MAX_BYTES" '
-        NR==1 && $0!=id { bad=1 }
+state_validity() (
+    # 0 = valid, 1 = corrupt data, 2 = unreadable/unsafe/tool failure.
+    [ -f "$DIR/state" ] && [ -r "$DIR/state" ] && [ ! -L "$DIR/state" ] || exit 2
+    SIZE=$(wc -c < "$DIR/state") || exit 2
+    case "$SIZE" in ''|*[!0-9[:space:]]*) exit 2;; esac
+    [ "$SIZE" -le 2048 ] || exit 1
+    LC_ALL=C awk -v id="$ID" -v max="$MAX_BYTES" -v size="$SIZE" '
+        # Validate encoded UTF-8 without depending on locale or external decoders.
+        function valid_title(s,    i,b,n,left,lo,hi) {
+            if (length(s)>960 || length(s)%2 || s!~/^[0-9a-f]*$/) return 0
+            n=0; left=0; lo=128; hi=191
+            for (i=1; i<=length(s); i+=2) {
+                b=(index("0123456789abcdef",substr(s,i,1))-1)*16 + index("0123456789abcdef",substr(s,i+1,1))-1
+                if (left) {
+                    if (b<lo || b>hi) return 0
+                    left--; lo=128; hi=191
+                } else {
+                    n++
+                    if (b<=127) continue
+                    if (b>=194 && b<=223) left=1
+                    else if (b>=224 && b<=239) {
+                        left=2
+                        if (b==224) lo=160
+                        if (b==237) hi=159
+                    } else if (b>=240 && b<=244) {
+                        left=3
+                        if (b==240) lo=144
+                        if (b==244) hi=143
+                    } else return 0
+                }
+            }
+            return left==0 && n<=120
+        }
+        NR==1 && ("id:" $0)!=("id:" id) { bad=1 }
         NR==2 && $0!~/^(starting|running|stopped|completed|error)$/ { bad=1 }
-        NR==3 && $0!~/^[0-9]+$/ { bad=1 }
-        NR==4 && $0!~/^(-1|[0-9]+)$/ { bad=1 }
-        NR==5 && ($0!~/^[0-9]+([.][0-9]+)?$/ || $0<1 || $0>3600) { bad=1 }
-        NR==6 && ($0!~/^[0-9]+$/ || $0>max) { bad=1 }
-        NR==7 && $0!~/^[a-z_]+$/ { bad=1 }
-        NR==8 && ($0!~/^[0-9a-f]*$/ || length($0)>960) { bad=1 }
-        NR>8 && $0!~/^[0-9]+$/ { bad=1 }
-        END { exit (bad || (NR!=8 && NR!=10)) }
-    ' "$DIR/state" || fail 'Invalid state; retry recovery'
+        NR==3 && ($0!~/^[0-9]+$/ || length($0)>10 || $0+0>10000000) { bad=1 }
+        NR==4 && ($0!~/^(-1|[0-9]+)$/ || ($0!="-1" &&
+            (length($0)>6 || $0+0<1 || $0+0>100000))) { bad=1 }
+        NR==5 && ($0!~/^[0-9]+([.][0-9]+)?$/ || length($0)>24 || $0+0<1 || $0+0>3600) { bad=1 }
+        NR==6 && ($0!~/^[0-9]+$/ || length($0)>10 || $0+0>max) { bad=1 }
+        NR==7 && $0!~/^(none|size_limit|top_failed_or_timeout|sample_limit|invalid_top|disk_error|detach_failed|interrupted|sampling_overrun|clock_failed)$/ { bad=1 }
+        NR==8 && !valid_title($0) { bad=1 }
+        NR>8 && ($0!~/^[0-9]+$/ || length($0)>12) { bad=1 }
+        # Every record must end with LF; otherwise status would join the last
+        # field and the observation timestamp. Byte accounting also catches NUL
+        # bytes on awk implementations that discard them while parsing input.
+        { bytes+=length($0)+1 }
+        END { exit (bad || bytes!=size+0 || (NR!=8 && NR!=10)) ? 42 : 0 }
+    ' "$DIR/state"
+    case $? in 0) exit 0;; 42) exit 1;; *) exit 2;; esac
+)
+validate_state() {
+    state_validity || fail 'Invalid or unreadable state; retry recovery'
+}
+load_state() {
+    validate_state
     {
         IFS= read -r STATE_ID; IFS= read -r STATUS
         IFS= read -r COUNT; IFS= read -r TARGET
@@ -111,6 +152,24 @@ load_state() {
     } < "$DIR/state"
     archive_name "$DIR"
 }
+# A corrupt task has no trustworthy committed byte count: never recover/truncate
+# its archive. It may be bypassed only with a verified modern lifetime lock.
+# Keep its files for manual deletion; query and launch both hold control.lock.
+lock_worker() {
+    [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] || return 1
+    exec 0< "$DIR/worker.lock" || return 1
+    flock -n 0 || return 1
+    [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] &&
+        [ "$DIR/worker.lock" -ef /proc/self/fd/0 ]
+}
+worker_inactive() ( lock_worker )
+inactive_invalid_state() (
+    [ -f "$DIR/state" ] && [ -r "$DIR/state" ] && [ ! -L "$DIR/state" ] || return 1
+    worker_inactive || return 1
+    # Only invalid state data, not archive metadata errors, permits bypass.
+    state_validity >/dev/null 2>&1
+    [ "$?" -eq 1 ]
+)
 confirmed_terminal() {
     case "$STATUS" in stopped|completed|error) ;; *) return 1;; esac
     [ ! -L "$DIR/done" ] && [ -f "$DIR/done" ] &&
@@ -279,19 +338,13 @@ recover() (
     # lock on stdin (inherited by every writer, including append subprocesses).
     [ ! -L "$DIR/worker.lock" ] || fail 'Unsafe worker lock; retry recovery'
     if [ -e "$DIR/worker.lock" ]; then
-        [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] || fail 'Unsafe worker lock; retry recovery'
-        exec 0> "$DIR/worker.lock"
-        flock -n 0
-        RC=$?
-        [ "$RC" -ne 1 ] || exit 0
-        [ "$RC" -eq 0 ] || fail 'Cannot inspect worker lock; retry recovery'
+        # Busy is not confirmed stopped, even if state becomes terminal before
+        # the caller reads it again. Also verify the opened lock inode.
+        lock_worker || fail 'Worker lock is not confirmed inactive; retry recovery'
     else
         # A legacy launch may still be delayed before exec of its worker.
         [ "$STATUS" != starting ] || fail 'Legacy launch is unconfirmed; inspect device and retry recovery'
-        legacy_quiet
-        RC=$?
-        [ "$RC" -ne 1 ] || exit 0
-        [ "$RC" -eq 0 ] || fail 'Cannot confirm no legacy writer; restore proc visibility and retry recovery'
+        legacy_quiet || fail 'Legacy writer is not confirmed inactive; restore proc visibility and retry recovery'
     fi
     load_state
     confirmed_terminal && exit 0
@@ -309,6 +362,36 @@ recover() (
     ENDED_AT=$(date +%s)
     printf '%s\n' "$ID" > "$DIR/done" || fail 'Cannot publish recovery; retry'
     state
+)
+clear_task() (
+    DIR=$1; ID=${DIR##*/}; ACTION=$2
+    [ -d "$DIR" ] && [ ! -L "$DIR" ] || fail 'Unsafe task directory'
+    archive_name "$DIR"
+    for FILE in done state cleaned "$ARCHIVE_NAME" sample header worker.lock; do
+        [ ! -L "$DIR/$FILE" ] || fail 'Unsafe task file'
+        [ ! -e "$DIR/$FILE" ] || [ -f "$DIR/$FILE" ] || fail 'Unsafe task file'
+    done
+    [ -f "$DIR/state" ] && [ -r "$DIR/state" ] || fail 'Unreadable task state'
+    if ( validate_state ) >/dev/null 2>&1; then
+        load_state
+        confirmed_terminal || fail 'Capture is not stopped'
+        if [ -e "$DIR/worker.lock" ]; then
+            lock_worker || fail 'Capture lock is not confirmed inactive'
+        else
+            legacy_quiet || fail 'Legacy capture is not confirmed inactive'
+        fi
+    else
+        # No guessed byte count, recovery or done marker for corrupt data.
+        # Hold the verified lifetime lock throughout the entire truncation.
+        lock_worker || fail 'Corrupt capture lock is not confirmed inactive'
+        state_validity >/dev/null 2>&1
+        [ "$?" -eq 1 ] || fail 'Task state cannot be safely inspected'
+    fi
+    [ "$ACTION" = apply ] || exit 0
+    for FILE in "$ARCHIVE_NAME" sample header; do
+        [ ! -f "$DIR/$FILE" ] || truncate -s 0 "$DIR/$FILE" || fail 'Cannot clear Top logs'
+    done
+    : > "$DIR/cleaned" || fail 'Cannot mark cleared Top logs'
 )
 MODE=$1
 shift
@@ -342,7 +425,15 @@ launch)
     if [ -e "$ROOT/current" ]; then
         NEW_ID=$ID
         current
-        ( load_state; confirmed_terminal ) || fail 'Previous capture is not confirmed stopped'
+        archive_name "$DIR"
+        ( load_state; confirmed_terminal && {
+            if [ -e "$DIR/worker.lock" ] || [ -L "$DIR/worker.lock" ]; then
+                worker_inactive
+            else
+                legacy_quiet
+            fi
+        } ) 2>/dev/null || inactive_invalid_state ||
+            fail 'Previous capture is not confirmed stopped'
         ID=$NEW_ID
     fi
     DIR=$ROOT/$ID
@@ -474,10 +565,21 @@ status)
     [ -e "$ROOT/current" ] || { echo idle; exit 0; }
     control_lock
     current
+    if ! ( validate_state ) >/dev/null 2>&1; then
+        CONFIRMATION=unconfirmed
+        inactive_invalid_state && ( archive_name "$DIR" ) >/dev/null 2>&1 && CONFIRMATION=inactive
+        printf 'corrupt\n%s\n%s\n' "$ID" "$CONFIRMATION"
+        if [ -f "$DIR/cleaned" ] && [ ! -L "$DIR/cleaned" ]; then echo cleaned; else echo present; fi
+        exit 0
+    fi
     load_state
     UNCONFIRMED=
     if ! confirmed_terminal; then
         recover || UNCONFIRMED=1
+    elif [ -e "$DIR/worker.lock" ] || [ -L "$DIR/worker.lock" ]; then
+        worker_inactive || UNCONFIRMED=1
+    else
+        legacy_quiet || UNCONFIRMED=1
     fi
     read_bytes 2048 "$DIR/state" || fail 'Cannot read capture state'
     date +%s
@@ -491,30 +593,13 @@ clear)
     control_lock
     current
     [ "$ID" = "$EXPECTED" ] || fail 'Capture identity changed'
-    # Preflight every task before touching any log. Metadata and controller
-    # scripts stay in place, including current, so local archives remain usable.
-    for TASK in "$ROOT"/*; do
-        TASK_ID=${TASK##*/}
-        valid_id "$TASK_ID" || continue
-        [ -d "$TASK" ] && [ ! -L "$TASK" ] || fail 'Unsafe task directory'
-        archive_name "$TASK"
-        for FILE in done state cleaned "$ARCHIVE_NAME" sample header; do
-            [ ! -L "$TASK/$FILE" ] || fail 'Unsafe task file'
-            [ ! -e "$TASK/$FILE" ] || [ -f "$TASK/$FILE" ] || fail 'Unsafe task file'
+    # Preflight all tasks, then recheck and hold each lifetime lock while clearing.
+    # The parent keeps control.lock; no new task may launch during either pass.
+    for ACTION in check apply; do
+        for TASK in "$ROOT"/*; do
+            valid_id "${TASK##*/}" || continue
+            clear_task "$TASK" "$ACTION" || fail 'Cannot safely clear Top logs'
         done
-        [ -f "$TASK/done" ] && [ "$(read_bytes 34 "$TASK/done")" = "$TASK_ID" ] || fail 'Capture is not stopped'
-        # done precedes terminal state: require both to avoid racing finish().
-        [ "$(head -n 1 "$TASK/state")" = "$TASK_ID" ] || fail 'Invalid task state'
-        TERMINAL=$(head -n 2 "$TASK/state" | tail -n 1)
-        case "$TERMINAL" in stopped|completed|error) ;; *) fail 'Capture is not stopped';; esac
-    done
-    for TASK in "$ROOT"/*; do
-        valid_id "${TASK##*/}" || continue
-        archive_name "$TASK"
-        for FILE in "$ARCHIVE_NAME" sample header; do
-            [ ! -f "$TASK/$FILE" ] || truncate -s 0 "$TASK/$FILE" || fail 'Cannot clear Top logs'
-        done
-        : > "$TASK/cleaned" || fail 'Cannot mark cleared Top logs'
     done
     ;;
 stop|pull)

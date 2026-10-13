@@ -618,7 +618,7 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
         sid = self.load(text)
         raw = build_report_data(self.store, sid)["systems"][0]
         self.assert_metric(raw["metrics"]["mem_used_mb"], 1, [7516] * 5)
-        self.assertAlmostEqual(raw["metrics"]["mem_percent"]["avg"], 7516 / 14725 * 100)
+        self.assertEqual(raw["metrics"]["mem_percent"]["avg"], 51.04)
         old_version = "1:" + REPORT_CACHE_VERSION.split(":", 1)[1]
         with self.store.connect() as db:
             db.execute("INSERT INTO report_cache(session,version,document) VALUES (?,?,?)",
@@ -707,8 +707,8 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
                 cells = dict(zip(PROCESS_HEADERS, process_row(process, 1)))
                 for header_name, key, expected in (
                         ("活跃P95 %", "p95", p95), ("活跃峰值 %", "max", peak),
-                        ("活跃P95K KDMIPS", "p95k", None if p95 is None else p95 / 100 * 28.75),
-                        ("活跃峰值K KDMIPS", "peakk", None if peak is None else peak / 100 * 28.75)):
+                        ("活跃P95K KDMIPS", "p95k", {None: None, 3.5: 1.01, 7.4: 2.13, 19: 5.46, 95: 27.31}[p95]),
+                        ("活跃峰值K KDMIPS", "peakk", {None: None, 3.5: 1.01, 7.4: 2.13, 19: 5.46, 20:5.75, 100: 28.75}[peak])):
                     if expected is None:
                         self.assertIsNone(cells[header_name])
                         self.assertIsNone(active[key])

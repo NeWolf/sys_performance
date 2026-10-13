@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { api, apiResponse, errorMessage, formatMemory, formatTime, sessionPath, useResource } from './api'
 import type { Session } from './api'
 import { Dashboard } from './Dashboard'
+import type { ReportStyle } from './Dashboard'
 import { Compare } from './Compare'
 import { Devices } from './Devices'
 import { EditContext, useEditGuard, useWorkspaceGuard } from './Editing'
@@ -30,6 +31,7 @@ type WorkspaceView = typeof workspaceViews[number]['id']
 
 function Workspace() {
   const [view, setView] = useState<WorkspaceView>('capture')
+  const [reportStyle, setReportStyle] = useState<ReportStyle>('default')
   const currentView = workspaceViews.find((item) => item.id === view)!
   const guard = useEditGuard()
   const [revision, setRevision] = useState(0)
@@ -112,15 +114,17 @@ function Workspace() {
   function exportReport() {
     if (!activeId || !guard.confirm('有未保存的分析配置或进程组。离线交互报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃当前草稿。是否继续下载？')) return
     void perform('正在生成 HTML 报告…', async (signal) => {
-      const response = await apiResponse(`${sessionPath(activeId)}/report`, { signal })
+      const response = await apiResponse(`${sessionPath(activeId)}/report${reportStyle === 'compact' ? '?style=compact' : ''}`, { signal })
+      if (response.headers.get('content-type')?.split(';')[0]?.trim() !== 'text/html') throw new Error('本地服务返回了无效报告格式，请重试。')
       const blob = await response.blob()
       if (signal.aborted) return
+      if (!blob.size) throw new Error('本地服务返回了空报告，请重试。')
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
       // 下载名必须去除控制字符及跨平台文件名禁用字符。
       // eslint-disable-next-line no-control-regex
-      link.download = `${(active?.name || 'sysmonitor-report').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 100)}.html`
+      link.download = `${(active?.name || 'sysmonitor-report').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 100)}${reportStyle === 'compact' ? '-compact' : ''}.html`
       document.body.append(link)
       link.click()
       link.remove()
@@ -152,7 +156,14 @@ function Workspace() {
         <header className="topbar"><span>性能工作台 <b>/</b> {currentView.label}</span><div className="app-info"><span className="app-version" title={appVersion.error ? `版本读取失败：${appVersion.error}` : '当前应用版本'}>{appVersion.data ? `JDPerf v${appVersion.data.version}` : appVersion.loading ? '版本读取中…' : '版本暂不可用'}</span><span className="badge">本地服务 · 127.0.0.1</span></div></header>
         <div className="main-content">
           <div className="page-heading"><div><p className="eyebrow">ANDROID / {currentView.label}</p><h1>{currentView.label}</h1><p>{currentView.description}{active && (view === 'analysis' || view === 'report') ? ` · 当前会话：${active.name}` : ''}</p></div>
-            <div className="actions">{view === 'report' && <button className="primary" disabled={!activeId || guard.busy} onClick={exportReport}>导出离线交互 HTML 报告</button>}{(view === 'analysis' || view === 'report') && <button className="danger" disabled={!activeId || guard.busy} onClick={deleteSession}>删除会话</button>}</div>
+            <div className="actions">{(view === 'analysis' || view === 'report') && <>
+              <label>报告样式 <select value={reportStyle} disabled={!activeId || guard.busy} onChange={(event) => {
+                const next = event.target.value as ReportStyle
+                if (next !== reportStyle && window.confirm('切换样式将清空报告内的搜索、曲线选择与合并结果，不影响原始数据或未保存配置。是否继续？')) setReportStyle(next)
+              }}><option value="default">原版完整报告</option><option value="compact">简洁组合图</option></select></label>
+              <button className="primary" disabled={!activeId || guard.busy} onClick={exportReport}>导出当前样式 HTML</button>
+              <button className="danger" disabled={!activeId || guard.busy} onClick={deleteSession}>删除会话</button>
+            </>}</div>
           </div>
           <Devices view={view} onAdvanced={() => setView('advanced')} disabled={guard.busy} onImported={(id) => { setSelected(id); setRevision((value) => value + 1); setView('analysis') }} />
           <ViewPanel active={view === 'capture'}>
@@ -174,7 +185,7 @@ function Workspace() {
           {notice && <div className="banner success" role="status">{notice}</div>}
           {view === 'compare' && (compareSessions ? <Compare sessions={compareSessions} /> : <div className="banner info" role="status">{sessions.error || '正在读取采集会话…'}</div>)}
           <ViewPanel active={view === 'analysis' || view === 'report'}>
-            {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} /> : <section className="empty-state panel"><img className="empty-symbol" src="/JD_logo.png" alt="JDPerf 标志" width={120} height={60} /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据集</button></section>}
+            {activeId ? <Dashboard key={`${activeId}:${revision}`} id={activeId} view={view} disabled={guard.busy} reportStyle={reportStyle} /> : <section className="empty-state panel"><img className="empty-symbol" src="/JD_logo.png" alt="JDPerf 标志" width={120} height={60} /><h2>先选择一个分析会话</h2><p>从历史会话打开日志，或前往数据集导入本地日志、连接设备拉取。</p><button className="primary" onClick={() => setView('capture')}>前往数据集</button></section>}
           </ViewPanel>
         </div>
       </main>

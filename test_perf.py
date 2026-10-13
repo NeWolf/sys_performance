@@ -313,11 +313,186 @@ class CpuReferenceTests(unittest.TestCase):
                          ["cpu_single_core"], 123)
 
 
+class MetricPrecisionTests(ReportAssertions, unittest.TestCase):
+    # Explicit expectations shared across runtimes, never computed by production helpers.
+    ROUND_CASES = [(1.005, 1.01), (-1.005, -1.01), (2.675, 2.68),
+                   (-2.675, -2.68), (0.0049, 0), (-0.0049, 0),
+                   (0.005, 0.01), (-0.005, -0.01), (1e-7, 0), (1200, 1200)]
+    SCALE_CASES = [(1.005, 1, 1, 1.01), (100, 1.005, 1, 101),
+                   (100, 1, 1.005, 99.01), (1.005, 1.005, 1.005, 1.01),
+                   (1, 1, 8, 0.13), (-1, 1, 8, -0.13),
+                   (1, 1, -8, -0.13), (1, 0.004, 1, 0),
+                   (1, 1, 0.004, None), (1, 1, -0.004, None),
+                   (1, 1, 0, None), (None, 1, 1, None)]
+    PID_CASES = [({'pids': [3, 1, 3, 2]}, '3, 1, 2'),
+                 ({'pids': [1, 2, 3, 4], 'pid_changes': 7}, 'PID变化7次'),
+                 ({'pids': [1, 2, 3, 4], 'pid_changes': 0}, 'PID变化0次'),
+                 ({'pids': [1, 2, 3, 4]}, 'PID变化未知次'),
+                 ({'pids': [1, 2, 3, 4], 'pid_changes': True}, 'PID变化未知次')]
+
+    def shared_script(self, checks):
+        source = Path('report_assets/report.js').read_text(encoding='utf-8')
+        source = source[:source.index('  const observer =')] + source[
+            source.index('  function exactStats('):source.index('  // Never derive MB statistics')]
+        harness = """
+const assert = require('node:assert/strict');
+const document = {documentElement:{classList:{add(){}}},
+  getElementById:()=>({textContent:JSON.stringify({process_fields:[],full_cycle_schema:[],cycle_axis_schema:[]})})};
+"""
+        return harness + source + '\n' + checks + '\n})();'
+
+    def test_python_rounding_scale_sum_difference_and_format(self):
+        import math
+        from perf_metrics import round_metric, scale_metric, sum_metrics, subtract_metric
+        from perf_report_ui import number
+        for value, expected in self.ROUND_CASES:
+            with self.subTest(round=value):
+                self.assertEqual(round_metric(value), expected)
+        self.assertEqual(math.copysign(1, round_metric(-0.0049)), 1)
+        for a, b, c, expected in self.SCALE_CASES:
+            with self.subTest(scale=(a, b, c)):
+                self.assertEqual(scale_metric(a, b, c), expected)
+        for value in (None, True, '1.005', float('nan'), float('inf'), -float('inf')):
+            with self.subTest(invalid=value):
+                self.assertIsNone(round_metric(value))
+                for args in ((value, 1, 1), (1, value, 1), (1, 1, value)):
+                    self.assertIsNone(scale_metric(*args))
+        self.assertEqual(sum_metrics([1.005, 1.005, -0.005]), 2.01)
+        self.assertIsNone(sum_metrics([]))
+        self.assertIsNone(sum_metrics([1, None]))
+        self.assertEqual(subtract_metric(1.005, 0.004), 1.01)
+        self.assertIsNone(subtract_metric(1, True))
+        self.assertEqual([number(v) for v in (1200, -0.004, 1.005, None)],
+                         ['1,200.00', '0.00', '1.01', '—'])
+
+    def test_javascript_rounding_scale_sum_and_statistics(self):
+        checks = 'const rounds = ' + json.dumps(self.ROUND_CASES) + ';\n'
+        checks += 'const scales = ' + json.dumps(self.SCALE_CASES) + ';\n'
+        checks += """
+for (const [value,expected] of rounds) assert.equal(roundMetric(value),expected);
+assert.equal(Object.is(roundMetric(-0.0049),-0),false);
+for (const value of [null,true,'1.005',NaN,Infinity,-Infinity]) {
+  assert.equal(roundMetric(value),null);
+  for (const args of [[value,1,1],[1,value,1],[1,1,value]]) assert.equal(scaleMetric(...args),null);
+}
+assert.equal(sum([1.005,1.005,-0.005,null]),2.01);
+assert.equal(sum([null]),null);
+assert.equal(sum([]),null);
+assert.deepEqual([1200,-0.004,1.005,null].map(fmt),['1,200.00','0.00','1.01','—']);
+assert.equal(fmtCount(1200),'1,200');
+assert.deepEqual(exactStats([0,1.005,1.005,null,true].map(v=>({v})),'v'),
+  {count:3,min:0,avg:0.67,p95:1.01,p99:1.01,max:1.01,total:2.02});
+for (const [a,b,c,expected] of scales) assert.equal(scaleMetric(a,b,c),expected,JSON.stringify([a,b,c]));
+"""
+        self.run_report_script(self.shared_script(checks))
+
+    def test_python_pid_labels(self):
+        from perf_metrics import pid_label
+        self.assertIsNone(pid_label({'pids': []}))
+        for process, expected in self.PID_CASES:
+            with self.subTest(process=process):
+                self.assertEqual(pid_label(process), expected)
+
+    def test_javascript_pid_labels(self):
+        checks = 'const cases = ' + json.dumps(self.PID_CASES) + ';\n'
+        checks += """
+assert.equal(pidLabel({pids:[]}),'—');
+for (const [process,expected] of cases) {
+  assert.equal(pidLabel(process),expected);
+  assert.equal(processLabel({...process,name:'worker'}),
+    'worker · '+(new Set(process.pids).size > 3 ? '' : 'PID ')+expected);
+}
+"""
+        self.run_report_script(self.shared_script(checks))
+
+
 class StoreTests(ReportAssertions, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = Store(Path(self.temp.name) / "test.sqlite3")
+
+    def test_sqlite_metric_precision_and_empty_aggregates(self):
+        with self.store.connect() as db:
+            for value, expected in MetricPrecisionTests.ROUND_CASES + [
+                    (None, None), ('1.005', None), (float('inf'), None)]:
+                with self.subTest(scalar=value):
+                    self.assertEqual(db.execute('SELECT metric_round(?)', (value,)).fetchone()[0], expected)
+            db.execute('CREATE TEMP TABLE observations(value)')
+            for values, expected in (([1.005, 1.005, -0.005, None, 'invalid'], (2.01, 0.67)),
+                                     ([-1.005, -1.005, 0.005], (-2.01, -0.67)),
+                                     ([1.00, 1.01], (2.01, 1.01)),
+                                     ([-1.00, -1.01], (-2.01, -1.01)),
+                                     ([None, '1.005'], (None, None)), ([], (None, None))):
+                with self.subTest(values=values):
+                    db.execute('DELETE FROM observations')
+                    db.executemany('INSERT INTO observations VALUES (?)', [(v,) for v in values])
+                    self.assertEqual(tuple(db.execute(
+                        'SELECT metric_sum(value),metric_avg(value) FROM observations').fetchone()), expected)
+
+    def test_precision_migration_invalidates_all_caches_once(self):
+        from perf_metrics import PRECISION_VERSION
+        from perf_report import render_report
+        tables = ('analysis_cache', 'report_cache', 'report_compact_cache',
+                  'process_rank_v3', 'process_rank_ready_v3', 'process_name_rank_v2',
+                  'process_name_ready_v2', 'process_rss_rank_v1', 'process_rss_ready_v1')
+        sid = self.import_sample()['id']
+
+        def populate(store):
+            store.processes(sid)
+            store.processes(sid, merge_names=True)
+            store.statistics(sid, 'P')
+            render_report(store, sid)
+            render_report(store, sid, style='compact')
+
+        def snapshot(db, table):
+            return [tuple(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+
+        populate(self.store)
+        marker = 'metric_precision_' + PRECISION_VERSION
+        with self.store.connect() as db:
+            raw = snapshot(db, 'records')
+            self.assertTrue(raw)
+            for table in tables:
+                self.assertTrue(snapshot(db, table), table)
+            self.assertEqual(db.execute('DELETE FROM store_migrations WHERE name=?', (marker,)).rowcount, 1)
+        reopened = Store(self.store.path)
+        with reopened.connect() as db:
+            self.assertEqual(snapshot(db, 'records'), raw)
+            for table in tables:
+                self.assertEqual(snapshot(db, table), [], table)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM store_migrations WHERE name=?',
+                                        (marker,)).fetchone()[0], 1)
+        populate(reopened)
+        with reopened.connect() as db:
+            rebuilt = {table: snapshot(db, table) for table in tables}
+            self.assertTrue(all(rebuilt.values()))
+        again = Store(self.store.path)
+        with again.connect() as db:
+            self.assertEqual(snapshot(db, 'records'), raw)
+            for table in tables:
+                self.assertEqual(snapshot(db, table), rebuilt[table], table)
+
+    def test_pid_observed_sets_gap_and_segment_reset(self):
+        from perf_report_data import build_report_data
+        p, s = GroupStoreTests.p, GroupStoreTests.s
+        text = (s(1) + p(1, 11, 'worker') + p(1, 22, 'worker') + p(1, 11, 'worker') +
+                s(2) + p(2, 22, 'worker') + p(2, 11, 'worker') + s(3) +
+                s(4) + p(4, 22, 'worker') + p(4, 11, 'worker') +
+                s(5) + p(5, 33, 'worker') + s(6) + p(6, 44, 'worker') +
+                s(7) + p(7, 11, 'worker') + p(7, 22, 'worker') +
+                s(0) + p(0, 55, 'worker') + s(1) + p(1, 55, 'worker'))
+        sid = self.import_sample(text)['id']
+        rows = sorted(self.store.processes(sid, merge_names=True), key=lambda row: row['segment'])
+        self.assertEqual([r['pid_changes'] for r in rows], [3, 0])
+        self.assertEqual([r['pids'] for r in rows], [[11, 22, 33, 44], [55]])
+        self.assertEqual(rows[0]['pid_path'], [[11, 22], [33], [44], [11, 22]])
+        self.assertEqual(rows[1]['pid_path'], [[55]])
+        self.assertEqual(sorted(Store(self.store.path).processes(sid, merge_names=True),
+                                key=lambda row: row['segment']), rows)
+        processes = sorted(build_report_data(self.store, sid)['processes'], key=lambda row: row['segment'])
+        self.assertEqual([r['pid_changes'] for r in processes], [3, 0])
+        self.assertEqual([r['pids'] for r in processes], [[11, 22, 33, 44], [55]])
 
     def import_sample(self, text=SAMPLE):
         return self.store.import_files([("perf.log", io.BytesIO(text.encode()))])
@@ -379,7 +554,7 @@ class StoreTests(ReportAssertions, unittest.TestCase):
                             ("cpu_iow", 0), ("cpu_irq", 0), ("cpu_idle", 50)):
             metric = display["metrics"][field]
             self.assertEqual(metric["count"], 899)
-            self.assertAlmostEqual(metric["avg"], (898 * base * 7 + base * 8) / 899)
+            self.assertEqual(metric["avg"], {50: 350.06, 20: 140.02, 10: 70.01, 0: 0}[base])
             self.assertEqual([metric[key] for key in ("min", "p95", "p99", "max")],
                              [base * 7, base * 7, base * 7, base * 8])
             sampled = display["series"]["points"]
@@ -460,7 +635,7 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(remaining["statistics"]["avg"]["target"], 14725 - 123)
         self.assertEqual(remaining["statistics"]["avg"]["delta"], 5399 - 123)
         percent = result["system"]["mem_percent"]["statistics"]["avg"]
-        self.assertAlmostEqual(percent["delta"], (123 - 5399) / 14725 * 100)
+        self.assertAlmostEqual(percent["delta"], -35.83)
         self.assertNotIn("mem_free_mb", result["system"])
         self.assertNotIn("mem_avail_mb", result["system"])
         self.assertTrue(any("差值仅供参考" in warning for warning in result["warnings"]))
@@ -586,7 +761,7 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         for point in system["series"]["points"]:
             self.assertEqual(point["cpu_idle"], point["cpu_capacity"] - point["cpu_total"])
             self.assertEqual(point["mem_used_mb"], point["mem_total_mb"] - point["mem_avail_mb"])
-            self.assertIsInstance(point["mem_used_mb"], int)
+            self.assertEqual(point["mem_used_mb"] * 100, int(point["mem_used_mb"] * 100))
         self.assertIn("mem_percent", raw["systems"][0]["metrics"])
         self.assertNotIn("mem_percent", metrics)
         self.assertEqual(prepare_display(display), display)
@@ -681,11 +856,12 @@ class StoreTests(ReportAssertions, unittest.TestCase):
                     metric = system['metrics'][field]
                     self.assertIn(metric['label'], row)
                     expected = [metric['label'], metric.get('avg'), metric.get('p95'), metric.get('max')]
-                    self.assertEqual(re.findall(r'data-sort="([^"]*)"', row),
-                                     ['' if v is None else str(v) for v in expected])
+                    actual = re.findall(r'data-sort="([^"]*)"', row)
+                    self.assertEqual(actual[0], expected[0])
+                    self.assertEqual([None if v == '' else float(v) for v in actual[1:]], expected[1:])
                 for label in ('最小', '最大', 'P99', '有效样本'):
                     self.assertNotIn(label, cpu_table)
-                self.assertIn('data-sort="' + (str(value) if value is not None else '') + '"', cpu_table)
+                self.assertIn('data-sort="' + (str(float(value)) if value is not None else '') + '"', cpu_table)
                 memory_table = overview.split('data-table="overview-memory"', 1)[1].split('</table>', 1)[0]
                 self.assertEqual(re.findall(r'<th scope="col">(.*?)</th>', memory_table),
                                  ['内存指标', '均值', 'P95', '峰值'])
@@ -1056,17 +1232,29 @@ const assert = require('node:assert/strict');
 process.env.TZ = 'Asia/Shanghai';
 class Node {
   constructor() { this.children=[]; this.events={}; this.dataset={}; this.value='';
-    this.classList={add(){},toggle(){}}; this.nodes=new Map(); }
+    this.classList={add(){},toggle(){},contains:cls=>(this.className||'').split(' ').includes(cls)};
+    this.nodes=new Map(); this.style={}; }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children=nodes; }
   setAttribute() {}
+  removeAttribute() {}
   addEventListener(type, callback) { this.events[type]=callback; }
   getClientRects() { return []; }
   querySelector(selector) {
     if (!this.nodes.has(selector)) this.nodes.set(selector,new Node());
     return this.nodes.get(selector);
   }
-  querySelectorAll() { return []; }
+  querySelectorAll(selector) {
+    const table=this.tBodies ? this : this.nodes.get('table');
+    const rows=table?.tBodies?.flatMap(body=>Array.from(body.rows)) || [];
+    if (selector==='thead tr:first-child th' || selector==='th') return table?.tHead?.rows[0].cells || [];
+    if (selector==='tr[data-process]') return rows.filter(row=>row.dataset.process);
+    if (selector==='td[data-sort]') return rows.flatMap(row=>Array.from(row.cells||[]))
+      .filter(cell=>Object.hasOwn(cell.dataset,'sort'));
+    const descendants=this.children.flatMap(child=>[child,...child.querySelectorAll(selector)]);
+    if (selector.startsWith('.')) return descendants.filter(child=>child.classList.contains(selector.slice(1)));
+    throw new Error('Unsupported selector: '+selector);
+  }
 }
 const nodes = new Map();
 global.document = {
@@ -1088,9 +1276,9 @@ assert.equal(points[0].rchar_kb,469);
 assert.equal(points[0].wchar_kb,184);
 const cpu=referenceSeries(system,points,['cpu1c']);
 assert.equal(cpu[0].data[0][1],42.04*8);
-const otherPlatform = {...system,series:{points:system.series.points.map(p=>({...p,cpu_single_core:42.04*7}))}};
+const otherPlatform = {...system,full_points:system.full_points.map(p=>({...p,cpu_single_core:294.28}))};
 assert.equal(referenceSeries(otherPlatform,points,['cpu1c'])[0].data[0][1],42.04*7);
-const unknownPlatform = {...system,series:{points:system.series.points.map(p=>({...p,cpu_single_core:null}))}};
+const unknownPlatform = {...system,full_points:system.full_points.map(p=>({...p,cpu_single_core:null}))};
 assert.equal(referenceSeries(unknownPlatform,points,['cpu1c']).length,0);
 assert.equal(referenceSeries(system,points,['rss_kb'])[0].data[0][1],5399);
 assert.equal(referenceSeries(system,points,io).length,4);
@@ -1113,7 +1301,7 @@ const root=document.getElementById(system.id);
 const searchWrap = new Node(), searchInput = searchWrap.querySelector('.table-search');
 const searchTable = searchWrap.querySelector('table');
 const searchRow = new Node();
-searchRow.textContent='pid-worker pid4次变更，last：100';
+searchRow.textContent='pid-worker PID变化4次';
 searchRow.dataset.search='100, 600, 700, 800, 900';
 searchTable.tBodies=[{rows:[searchRow]}];
 searchTable.tHead={rows:[{cells:[]}]};
@@ -1125,6 +1313,15 @@ for (const [query, hidden] of [['900',false],['100',false],['PID-WORKER',false],
 delete searchRow.dataset.search;
 searchInput.value='pid-worker'; searchInput.events.input();
 assert.equal(searchRow.hidden,false);
+const precisionWrap=new Node(), precisionTable=precisionWrap.querySelector('table');
+const precisionHeaders=['PID','PID变化','活跃周期','活跃均值 CPU','内存峰值'];
+precisionTable.tHead={rows:[{cells:precisionHeaders.map(text=>{const cell=new Node();cell.textContent=text;return cell;})}]};
+const precisionRow=new Node(); precisionRow.dataset.process=data.processes.find(p=>!p.dp_only).id;
+precisionRow.cells=precisionHeaders.map((_,cellIndex)=>{const cell=new Node();cell.cellIndex=cellIndex;cell.dataset.sort='stale';return cell;});
+precisionTable.tBodies=[{rows:[precisionRow]}];
+normalizeTable(precisionWrap);
+assert.deepEqual(precisionRow.cells.map(cell=>cell.textContent),['5589','0','1','116.30','241.33']);
+assert.ok(precisionRow.dataset.search.includes('5589'));
 const allWrap = new Node(); allWrap.dataset.table='all';
 const allInput=allWrap.querySelector('.table-search'), systemToggle=allWrap.querySelector('.show-system-processes');
 systemToggle.checked=false;
@@ -1175,7 +1372,7 @@ mergeSystem.checked=false; mergeSystem.events.change();
 assert.equal(systemLabel.hidden,true);
 assert.equal(systemLabel.children[0].checked,true);
 assert.equal(root.querySelector('.merge-count').textContent,1);
-assert.equal(root.querySelector('.selected-list').children[0].title,systemProcess.name);
+assert.equal(root.querySelector('.selected-list').children[0].title,processLabel(systemProcess));
 mergeSearch.value='missing'; mergeSearch.events.input();
 assert.ok(candidates.children.every(label=>label.hidden));
 assert.equal(root.querySelector('.merge-count').textContent,1);
@@ -1256,8 +1453,56 @@ const longAxis=Array.from({length:1200},(_,i)=>[i+1,(i+1)*1000]);
 const longSystem={segment:0,cycle_axis:longAxis};
 const longProcess={segment:0,full_cycles:longAxis.map(([c,t])=>row(c,t,{rd_kb:c===501?null:1}))};
 const sampled=collectedIO(longSystem,[longProcess]);
-assert.equal(sampled.length,600);
+assert.equal(sampled.length,1200);
 assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
+const fullIO=collectedIO(longSystem,[longProcess],true);
+assert.equal(fullIO.length,1200);
+assert.equal(lineSeries(fullIO,'rd_kb','IO','red',1,0,true).flatMap(s=>s.data).length,1199);
+const full=Array.from({length:725},(_,i)=>({segment:0,cycle:i+1,ts:1000*(i+1),cpu1c:i,rss_kb:1024}));
+const stream=overlayStream(full,['cpu1c','rss_kb']);
+const lines=lineSeries(stream.points,'cpu1c','CPU','red',1,0,true);
+assert.equal(lines.flatMap(s=>s.data).length,725);
+assert.deepEqual(lines[0].data[600],[601000,600,601]);
+const missing=overlayStream(full.filter(p=>p.cycle!==601).map(p=>({...p})),['cpu1c']);
+assert.equal(lineSeries(missing.points,'cpu1c','CPU','red',1,0,true).length,2);
+const create=document.createElement;
+document.createElement=()=>{const n=new Node();n.style={};return n;};
+const entries=[{stream,field:'cpu1c',name:'系统',divisor:1},
+  {stream:missing,field:'cpu1c',name:'缺失进程',divisor:1}];
+const tooltipRows=box=>box.children[1].children.map(row=>row.children.slice(1).map(n=>n.textContent).join(''));
+const show=()=>['',...tooltipRows(overlayTooltip(entries,'%').formatter([{axisValue:601000}]))];
+const tip=overlayTooltip(entries,'%',{getBoundingClientRect:()=>({left:100,top:300})});
+assert.equal(tip.confine,false); assert.equal(tip.appendToBody,true);
+assert.equal(tip.backgroundColor,'#ffffff');
+document.documentElement.clientWidth=1000; document.documentElement.clientHeight=800;
+assert.deepEqual(tip.position([500,200],[],null,null,{contentSize:[560,600]}),[-72,-112]);
+assert.deepEqual(tip.position([20,10],[],null,null,{contentSize:[200,100]}),[32,-14]);
+assert.equal(show()[1],'系统：600.00 %');
+assert.equal(show()[2],'缺失进程：缺失或冲突');
+entries[0].stream=overlayStream([...full,{...full[600]}],['cpu1c']);
+assert.equal(show()[1],'系统：缺失或冲突');
+entries[0].stream=overlayStream(full.filter(p=>p.cycle!==601),['cpu1c']);
+entries[1].stream=stream;
+assert.equal(show()[1],'系统：缺失或冲突');
+assert.equal(show()[2],'缺失进程：600.00 %');
+entries[0].stream=overlayStream([...full,{...full[600],cycle:9999}],['cpu1c']);
+assert.ok(show().slice(1).every(text=>text.endsWith('缺失或冲突')));
+const memory=overlayTooltip([{stream,field:'rss_kb',name:'内存',divisor:1024}],'MB');
+assert.equal(tooltipRows(memory.formatter([{axisValue:601000}]))[0],'内存：1.00 MB');
+assert.equal(tooltipRows(overlayTooltip([{stream,field:'cpu1c',name:'零',divisor:1}],'%')
+  .formatter([{axisValue:1000}]))[0],'零：0.00 %');
+document.createElement=create;
+const visibleWrap=root.querySelector('[data-table="all"]');
+visibleWrap.querySelectorAll=()=>data.processes.map(p=>({hidden:p.dp_only,dataset:{process:p.id}}));
+visibleWrap.querySelector('.select-top15').events.click();
+const tags=root.querySelector('.selection-tags');
+const selectedCount=data.processes.filter(p=>!p.dp_only && valid(p.active.metrics.cpu1c.avg)).length;
+assert.equal(tags.children.length,selectedCount);
+visibleWrap.querySelector('.select-top15').events.click();
+assert.equal(tags.children.length,selectedCount);
+visibleWrap.querySelectorAll=()=>[];
+visibleWrap.querySelector('.select-top15').events.click();
+assert.equal(tags.children.length,selectedCount);
 })();
 """
         self.run_report_script(harness + prefix + checks)
@@ -1268,10 +1513,10 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
 
         cases = [
             ([[900]], "900"),
-            ([[900], [800], [700], [600]], "600, 700, 800, 900"),
-            ([[900], [800], [700], [600], [100]], "pid4次变更，last：100"),
-            ([[900], [800], [900], [800], [900]], "pid4次变更，last：900"),
-            ([[900], [800], [700], [600], [100, 200]], "pid4次变更，last：100, 200"),
+            ([[900], [800], [700], [600]], "PID变化3次"),
+            ([[900], [800], [700], [600], [100]], "PID变化4次"),
+            ([[900], [800], [900], [800], [900]], "800, 900"),
+            ([[900], [800], [700], [600], [100, 200]], "PID变化4次"),
         ]
         for sequence, expected in cases:
             with self.subTest(sequence=sequence):
@@ -1386,7 +1631,7 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
             self.assertEqual(client.put(settings, json=calibration).status_code, 200)
             calibrated = client.get(path + "/resources").json()
             self.assertEqual(calibrated["settings"], calibration)
-            self.assertAlmostEqual(calibrated["rows"][0]["kdmips"]["avg"], 33.43625)
+            self.assertAlmostEqual(calibrated["rows"][0]["kdmips"]["avg"], 33.44)
             self.assertEqual(client.get(base + "/processes?segment=99&with_total=true").json(),
                              dict(items=[], total=0, all_total=0))
             for query in ("segment=-1", "segment=true", "segment=9223372036854775808"):
@@ -1438,8 +1683,8 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
 
         for value, expected in ((None, "—"), (float('nan'), "—"),
                                 (float('inf'), "—"), (-float('inf'), "—"),
-                                (0, "0"), (0.5, "0.5"), (-2048, "-2,048"),
-                                (12.345, "12.35"), (1234, "1,234"), ("文本", "文本")):
+                                (0, "0.00"), (0.5, "0.50"), (-2048, "-2,048.00"),
+                                (12.345, "12.35"), (1234, "1,234.00"), ("文本", "文本")):
             with self.subTest(value=value):
                 self.assertEqual(number(value), expected)
         self.assertEqual(timestamp(None), "—")
@@ -1817,7 +2062,7 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
         single = self.store.processes(sid, segment=0, q='1')[0]
         self.assertEqual([single[k] for k in ('rss_avg_kb', 'rss_p95_kb', 'rss_p99_kb')], [50.5, 95, 99])
         merged = self.store.processes(sid, segment=0, merge_names=True, q='same')[0]
-        self.assertAlmostEqual(merged['rss_avg_kb'], 8050 / 102)
+        self.assertAlmostEqual(merged['rss_avg_kb'], 78.92)
         self.assertEqual((merged['rss_p95_kb'], merged['rss_p99_kb']), (97, 1000))
         self.assertEqual(merged['samples'], 103)
         dma = self.store.processes(sid, q='dma')[0]
@@ -1875,7 +2120,7 @@ assert.equal(lineSeries(sampled,'rd_kb','IO','red').length,2);
                          [800, 404, 760, 792])
         merged = self.store.processes(sid, merge_names=True, q='same', segment=0)[0]
         self.assertEqual((merged['cpu_peak'], merged['cpu_p95'], merged['cpu_p99']), (1600, 768, 800))
-        self.assertAlmostEqual(merged['cpu_avg'], 42000 / 101)
+        self.assertAlmostEqual(merged['cpu_avg'], 415.84)
         self.assertEqual(merged['samples'], 101)
         for merge in (False, True):
             for sort in ('cpu_peak', 'cpu_avg', 'cpu_p95', 'cpu_p99'):
@@ -1963,6 +2208,146 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         return dict(dict(name="组合", segment=0, members=[dict(pid=1, name="a"),
                         dict(pid=2, name="b")]), **changes)
 
+    def test_compact_full_resolution_samples_and_tooltip(self):
+        from perf_report import render_report
+        from perf_report_data import build_report_data
+        from perf_report_compact import render_document
+
+        sid = self.load(''.join(self.s(t) + (self.p(t, cpu1c=t % 100, rss_kb=1024)
+                                            if t != 601 else '') for t in range(1, 722)))
+        source = build_report_data(self.store, sid, include_full_system=True)
+        default = ReportMarkup(render_report(self.store, sid)).payload()
+        self.assertEqual(default['systems'][0]['full_points'], source['systems'][0]['full_points'])
+        self.assertEqual(len(default['systems'][0]['full_points']), 721)
+        data = ReportMarkup(render_report(self.store, sid, style='compact')).payload()
+        system, process = data['systems'][0], data['processes'][0]
+        self.assertEqual(len(system['chart_samples']), 721)
+        self.assertEqual(len(process['chart_samples']), 720)
+        self.assertEqual(system['chart_samples'],
+                         [[p['cycle'], p['ts'], p['cpu_single_core'], p['mem_used_mb']]
+                          for p in source['systems'][0]['full_points']])
+        self.assertEqual([r[2] for r in process['chart_samples']],
+                         [t % 100 for t in range(1, 722) if t != 601])
+        with self.assertRaisesRegex(ValueError, '完整整机采样'):
+            render_document(build_report_data(self.store, sid))
+        js = (Path(__file__).parent / 'report_assets/report_compact.js').read_text()
+        prefix = js[:js.index("  plot('system-cpu'")]
+        harness = """
+const assert = require('node:assert/strict');
+global.window = {};
+global.document = {
+  getElementById: () => ({textContent:JSON.stringify(data)}),
+  createElement: () => ({textContent:'',style:{},children:[],append(...nodes){this.children.push(...nodes);}}),
+  documentElement:{clientWidth:900,clientHeight:420,classList:{add(){}}}
+};
+const rows = box => box.children[1].children.map(row => row.children.slice(1).map(n => n.textContent).join('：'));
+"""
+        shared = Path('report_assets/report.js').read_text(encoding='utf-8')
+        shared = shared[:shared.index('  const observer =')] + shared[
+            shared.index('  function exactStats('):shared.index('  // Never derive MB statistics')]
+        script = 'const data = ' + json.dumps(data) + ';\n' + harness + shared
+        script += '\nwindow.shared = {data,valid,fmt,scaleMetric,metric,exactStats,processLabel,el};})();\n'
+        script += prefix + '\nreturn {curves,cpuTooltip,sampleTooltip}; };\n'
+        script += """
+const system = window.shared.data.systems[0], process = window.shared.data.processes[0];
+const api = window.setupCompactReport(system,window.shared);
+const lines = api.curves(process,'cpu1c','test','red');
+assert.equal(lines.flatMap(s => s.data).length,720);
+assert.equal(lines.length,2); // Missing cycle must break the curve.
+assert.equal(api.curves(system,'mem_used_mb','memory','red').flatMap(s => s.data).length,721);
+const chart = {getBoundingClientRect:()=>({left:100,top:100})};
+const tooltip = api.cpuTooltip([process],chart);
+assert.equal(tooltip.backgroundColor,'#ffffff');
+assert.equal(tooltip.appendToBody,true);
+assert.equal(tooltip.confine,false);
+assert.equal(tooltip.transitionDuration,0); // Position interpolation can briefly moveoutside the viewport.
+assert.equal(tooltip.displayTransition,false); // Hidden shells must not overflow after shrinking the window.
+assert.deepEqual(tooltip.position([700,280],[],null,null,{contentSize:[560,390]}),[128,-82]);
+assert.deepEqual(tooltip.position([-200,-200],[],null,null,{contentSize:[560,390]}),[-88,-88]);
+const show = ts => tooltip.formatter([{axisValue:ts}]);
+assert.equal(tooltip.formatter([]),'');
+const missing = system.chart_samples[600];
+assert.equal(rows(show(missing[1]))[1],window.shared.processLabel(process)+'：缺失或冲突');
+const present = process.chart_samples[600];
+assert.equal(rows(show(present[1]))[1],window.shared.processLabel(process)+'：'+window.shared.fmt(present[2])+' %');
+assert.equal(show(present[1]).className,'compact-tooltip');
+assert.equal(show(present[1]).children[1].className,'compact-tooltip-list');
+const memory = api.sampleTooltip([
+  {item:system,name:'整机内存',color:'#202c40'},
+  {item:process,name:process.name,color:'#2e956b',divisor:1024}
+],3,'MB',chart);
+assert.equal(rows(memory.formatter([{axisValue:present[1]}]))[1],process.name+'：1.00 MB');
+assert.equal(rows(memory.formatter([{axisValue:missing[1]}]))[1],process.name+'：缺失或冲突');
+assert.equal(memory.formatter([{axisValue:present[1]}]).children[1].children[1].children[0].style.backgroundColor,'#2e956b');
+const zero = process.chart_samples.find(row=>row[2]===0);
+assert.equal(rows(show(zero[1]))[1],window.shared.processLabel(process)+'：0.00 %');
+process.chart_samples.push([...present]);
+const duplicate = window.setupCompactReport(system,window.shared).cpuTooltip([process]);
+assert.equal(rows(duplicate.formatter([{axisValue:present[1]}]))[1],window.shared.processLabel(process)+'：缺失或冲突');
+system.chart_samples.push([9999,present[1],20,100]);
+const conflict = window.setupCompactReport(system,window.shared).cpuTooltip([process]);
+assert.equal(rows(conflict.formatter([{axisValue:present[1]}]))[0],'整机总 CPU：缺失或冲突');
+"""
+        self.run_report_script(script)
+
+    def test_compact_report_statistics_security_and_independent_cache(self):
+        from unittest.mock import patch
+        from perf_report import render_report
+        from perf_report_data import build_report_data
+        from perf_report_ui import prepare_display
+        from perf_report_compact import JS, REPORT_CSP, render_document
+
+        hostile = '</script><img src=x onerror=alert(1)>'
+        sid = self.load(self.s(1) + self.p(1, name=hostile, cpu1c=0, rss_kb=1024) +
+                        self.s(2) + self.p(2, name=hostile, cpu1c=20, rss_kb=3072))
+        source = build_report_data(self.store, sid, include_full_system=True)
+        before = json.dumps(source, sort_keys=True)
+        compact = render_document(source)
+        self.assertEqual(json.dumps(source, sort_keys=True), before)
+        markup = ReportMarkup(compact)
+        data = markup.payload()
+        expected = prepare_display(source)
+        self.assertEqual(data['systems'][0]['metrics'], expected['systems'][0]['metrics'])
+        self.assertEqual(data['systems'][0]['chart_samples'],
+                         [[p['cycle'], p['ts'], p['cpu_single_core'], p['mem_used_mb']]
+                          for p in source['systems'][0]['full_points']])
+        self.assertNotIn('full_points', data['systems'][0])
+        self.assertEqual(data['processes'][0]['metrics'], expected['processes'][0]['metrics'])
+        self.assertEqual(data['processes'][0]['metrics']['cpu1c']['avg'], 10)
+        self.assertEqual(data['processes'][0]['metrics']['rss_kb']['p95'], 3072)
+        self.assertNotIn('full_cycles', data['processes'][0])
+        self.assertIn('data-sort="2.0"', compact)  # RSS mean is displayed in MB.
+        self.assertNotIn(('img', {'src': 'x', 'onerror': 'alert(1)'}), markup.tags)
+        self.assertEqual(markup.scripts[-1], [{}, JS])
+        digest = base64.b64encode(hashlib.sha256(JS.encode()).digest()).decode()
+        self.assertIn("script-src 'sha256-" + digest + "'", REPORT_CSP)
+        for attrs, content in markup.scripts[:-1]:
+            self.assertEqual(attrs['type'], 'application/json')
+            self.assertNotRegex(content, r'[<>&]')
+        for tag, attrs in markup.tags:
+            self.assertFalse(any(key.startswith('on') for key in attrs))
+            self.assertFalse({'src', 'srcdoc', 'srcset'}.intersection(attrs))
+        policies = [attrs['content'] for tag, attrs in markup.tags
+                    if tag == 'meta' and attrs.get('http-equiv') == 'Content-Security-Policy']
+        self.assertEqual(policies, [REPORT_CSP])
+        default = render_report(self.store, sid)
+        self.assertEqual(render_report(self.store, sid, style='compact'), compact)
+        self.assertNotEqual(default, compact)
+        with patch('perf_report.build_report_data', side_effect=AssertionError('cache miss')):
+            self.assertEqual(render_report(self.store, sid), default)
+            self.assertEqual(render_report(Store(self.store.path), sid, style='compact'), compact)
+        with self.assertRaises(ValueError):
+            render_report(self.store, sid, style='unknown')
+        with self.store.connect() as db:
+            db.execute("UPDATE report_compact_cache SET document=? WHERE session=?", (b'corrupt', sid))
+        self.assertEqual(render_report(self.store, sid, style='compact'), compact)
+        self.assertTrue(self.store.delete(sid))
+        with self.store.connect() as db:
+            for table in ('report_cache', 'report_compact_cache'):
+                self.assertEqual(db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
+        with self.assertRaises(KeyError):
+            render_report(self.store, sid, style='compact')
+
     def test_report_cache_persists_and_is_session_scoped(self):
         from unittest.mock import patch
         from perf_report import render_report
@@ -2014,8 +2399,8 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assert_report(render_report(self.store, sid))
         other = self.load(self.s(2) + self.p(2))
 
-        def build_then_delete(store, session_id):
-            data = build_report_data(store, session_id)
+        def build_then_delete(store, session_id, **kwargs):
+            data = build_report_data(store, session_id, **kwargs)
             store.delete(session_id)
             return data
 
@@ -2114,7 +2499,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
                        "WHERE session=? AND kind='P' AND ts=3", (sid,))
         data = self.assert_report(render_report(self.store, sid))
         process = data["processes"][0]
-        self.assert_metric(process["metrics"]["cpu"], 3, [0, 1019 / 3, 999, 999, 999])
+        self.assert_metric(process["metrics"]["cpu"], 3, [0, 339.67, 999, 999, 999])
         self.assert_metric(process["metrics"]["cpu1c"], 2, [800, 880, 960, 960, 960])
         self.assert_metric(process["metrics"]["rss_kb"], 2, [0] * 5)
         self.assertEqual([row[2:4] for row in process["full_cycles"]],
@@ -2184,7 +2569,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assert_lines(self.report_lines(full_points, "cpu1c"), len(full_points), len(full_points) - 1)
         raw_points = [dict(zip(full_data["full_cycle_schema"], row), segment=0)
                       for row in full_data["processes"][0]["full_cycles"]]
-        self.assert_lines(self.report_lines(raw_points, "cpu1c", mark_runs=True), 600, 599)
+        self.assert_lines(self.report_lines(raw_points, "cpu1c", mark_runs=True), 1001, 1000)
         with self.store.connect() as db:
             db.execute("UPDATE records SET data=json_set(data,'$.cpu',NULL,'$.cpu1c',NULL) "
                        "WHERE session=? AND kind='P' AND ts=501", (sid,))
@@ -2233,7 +2618,7 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         self.assert_lines(self.report_lines(rss_points, "rss_kb"), len(rss_points), len(rss_points) - 1)
         raw_points = [dict(zip(data["full_cycle_schema"], row), segment=0)
                       for row in process["full_cycles"]]
-        self.assert_lines(self.report_lines(raw_points, "cpu1c", mark_runs=True), 600, 598)
+        self.assert_lines(self.report_lines(raw_points, "cpu1c", mark_runs=True), 1000, 998)
 
     def test_report_chart_requires_same_segment_known_run_and_increasing_time(self):
         first = dict(ts=1, cpu1c=10, segment=0, _run_cpu1c=1)
@@ -2366,11 +2751,20 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
 
     def test_focus_table_group_interactions(self):
         source = (Path(__file__).parent / "report_assets/report.js").read_text(encoding="utf-8")
+        helpers = source[:source.index("  const observer =")]
         functions = source[source.index("  function setupFocusTable("):source.index("  function setupSegment(")]
         script = r"""
 const assert = require('node:assert/strict');
 class Node {
-  constructor() { this.children=[]; this.dataset={}; this.events={}; this.attrs={}; this.hidden=false; }
+  constructor() { this.children=[]; this.dataset={}; this.events={}; this.attrs={}; this.hidden=false;
+    this.classList={contains: name=>this.className===name,add(){}}; }
+  querySelector(selector) { return this.children.find(n=>'.'+n.className===selector) || null; }
+  querySelectorAll(selector) {
+    if (selector==='td[data-sort]') return this.children.filter(n=>'sort' in n.dataset);
+    throw new Error('Unsupported selector: '+selector);
+  }
+  closest(selector) { assert.equal(selector,'tbody'); return this.parent; }
+  get cellIndex() { return this.parent.children.indexOf(this); }
   get childNodes() { return this.children; }
   get textContent() { return this.text || this.children.map(n=>n.textContent).join(''); }
   set textContent(value) { this.text=value; this.children=[]; }
@@ -2381,9 +2775,17 @@ class Node {
   setAttribute(k,v) { this.attrs[k]=v; }
   removeAttribute(k) { delete this.attrs[k]; }
 }
-const el = () => new Node();
+const makeNode = () => new Node();
+global.document = {createElement:makeNode,documentElement:new Node(),getElementById:()=>({textContent:JSON.stringify({
+  process_fields:[],full_cycle_schema:[],cycle_axis_schema:[],processes:[
+    {id:'p1',pids:[123],metrics:{cpu1c:{p95:10,max:10}}},
+    {id:'p2',pids:[123],metrics:{cpu1c:{p95:0,max:0}}}
+  ]
+})})};
+""" + helpers + r"""
 function group(name, value, id) {
   const g=el(), identity=el(), strong=el(), measured=el(), standards=[el(),el()];
+  measured.className='measured';
   strong.text=name; identity.append(strong); identity.rowSpan=3;
   standards[0].append(identity); g.append(...standards, measured);
   g.dataset.search=name+' module PID123';
@@ -2404,6 +2806,13 @@ const input=el(), standards=el(), count=el(), scroll=el(), wrap=el();
 input.value='';standards.checked=true;wrap.dataset.table='excel';
 wrap.querySelector=s=>({table,'.table-search':input,'.show-standards':standards,
                       '.table-count':count,'.scroll':scroll}[s]);
+wrap.querySelectorAll=s=> {
+  if (s==='thead tr:first-child th') return headers;
+  const rows=[a,b,c].map(g=>g.querySelector('.measured'));
+  if (s==='tr[data-process]') return rows.filter(r=>r.dataset.process);
+  if (s==='td[data-sort]') return rows.flatMap(r=>r.querySelectorAll(s));
+  throw new Error('Unsupported selector: '+s);
+};
 const selected=new Set();
 """ + functions + r"""
 setupTable(wrap,id=>{selected.has(id)?selected.delete(id):selected.add(id);});
@@ -2438,6 +2847,9 @@ input.value='pid123';input.events.input();assert.equal(count.textContent,'3 / 3 
 let prevented=0;
 for (const key of ['Enter',' ']) a.querySelector('.measured').events.keydown({key,preventDefault(){prevented++;}});
 assert.equal(prevented,2);assert.ok(selected.has('p1'));
+assert.equal(a.querySelector('.measured').children[1].textContent,'10.00');
+assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').textContent,'123');
+})();
 """
         self.run_report_script(script)
 
@@ -2450,7 +2862,8 @@ assert.equal(prevented,2);assert.ok(selected.has('p1'));
                                   segments=[dict(segment=0, status="collected", process_ids=["p0"]),
                                             dict(segment=1, status="missing", process_ids=[])])],
                     processes=[dict(id="p0", pids=[123], metrics=dict(
-                        cpu1c=dict(p95=100, max=200), rss_kb=dict(max=2048)))])
+                        cpu1c=dict(p95=100, max=200), rss_kb=dict(max=2048)),
+                                    display_metrics=dict(rss_mb=dict(max=2)))])
         original = copy.deepcopy(data)
         html = required_table(data, 0)
         measured = re.search(r'<tr class="measured".*?</tr>', html)[0]
@@ -2738,7 +3151,7 @@ assert.equal(prevented,2);assert.ok(selected.has('p1'));
         a, b, dma = result["rows"]
         self.assertEqual(a["statistics"]["cpu1c"],
                          dict(count=2, min=50, avg=75, max=100, p95=100, p99=100))
-        self.assertEqual(a["kdmips"], dict(min=14.375, avg=21.5625, p95=28.75, p99=28.75, max=28.75))
+        self.assertEqual(a["kdmips"], dict(min=14.38, avg=21.56, p95=28.75, p99=28.75, max=28.75))
         self.assertEqual(a["statistics"]["rd_kb"]["total"], 6)
         self.assertEqual(b["statistics"]["cpu1c"]["count"], 3)
         self.assertEqual(b["statistics"]["cpu1c"]["avg"], 40)
@@ -2769,8 +3182,8 @@ assert.equal(prevented,2);assert.ok(selected.has('p1'));
         row = resources["rows"][0]
         self.assertEqual(row["statistics"]["cpu1c"],
                          dict(count=100, min=1, avg=50.5, max=100, p95=95, p99=99))
-        for key, expected in dict(min=0.2875, avg=14.51875, p95=27.3125,
-                                  p99=28.4625, max=28.75).items():
+        for key, expected in dict(min=0.29, avg=14.52, p95=27.31,
+                                  p99=28.46, max=28.75).items():
             self.assertAlmostEqual(row["kdmips"][key], expected)
         self.assertEqual(number(row["kdmips"]["p99"]), "28.46")
         self.assertEqual(resources["settings"]["cpu_platform"], "<platform>")
@@ -2804,7 +3217,7 @@ assert.equal(prevented,2);assert.ok(selected.has('p1'));
                          {"cpu_platform": "a" * 121}, {"cpu_platform": None}, []):
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 self.store.save_report_settings(sid, settings)
-        self.assertEqual(to_kdmips(50, 28.75), 14.375)
+        self.assertEqual(to_kdmips(50, 28.75), 14.38)
         self.assertIsNone(to_kdmips(50, None))
         self.assertIsNone(to_kdmips(1e308, 1e308))
         for changes in (dict(service_category="invalid"), dict(service_category=[]),
@@ -2900,10 +3313,11 @@ assert.equal(prevented,2);assert.ok(selected.has('p1'));
         self.assertEqual(analyses["P"]["coverage"],
                          dict(cycles=100, complete=100, partial=0, missing=0, duplicates=0))
         for key in ("p95", "p99", "max"):
-            self.assertEqual(number(scaled(metrics["cpu1c"][key], 100 / factor)), "232.3")
+            from perf_metrics import to_kdmips
+            self.assertEqual(number(to_kdmips(metrics["cpu1c"][key], factor)), "232.30")
             self.assertEqual(scaled(metrics["rss_kb"][key], 1024), 101)
-        self.assertIn('>232.3</td>', module)
-        self.assertIn('>101</td>', module)
+        self.assertIn('>232.30</td>', module)
+        self.assertIn('>103,424.00</td>', module)  # Raw statistics retain their KB unit.
         for field in ("rd_kb", "wr_kb", "rchar_kb", "wchar_kb"):
             m = metrics[field]
             self.assertEqual(m["count"], 100)
@@ -3176,6 +3590,27 @@ class ApiTests(ReportAssertions, unittest.TestCase):
             **self.headers, "Origin": "http://evil.example",
         }).status_code, 403)
 
+    def test_compact_report_api_and_stream(self):
+        from perf_report_compact import REPORT_CSP
+        sid = self.upload().json()['id']
+        base = f'/api/sessions/{sid}/report'
+        response = self.client.get(base + '?style=compact', headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text[:500])
+        self.assertIn('text/html', response.headers['content-type'])
+        self.assertIn('sysmonitor-report-compact.html', response.headers['content-disposition'])
+        self.assertEqual(response.headers['content-security-policy'], REPORT_CSP + '; sandbox allow-scripts')
+        self.assertIn('data-report-style="compact"', response.text)
+        stream = self.client.get(base + '/stream?style=compact', headers=self.headers)
+        self.assertEqual(stream.status_code, 200)
+        events = [json.loads(line) for line in stream.text.splitlines() if line]
+        self.assertTrue(any(event.get('type') == 'result' and event.get('data') == base + '?style=compact' for event in events), events)
+        for suffix in ('', '/stream'):
+            self.assertEqual(self.client.get(base + suffix + '?style=invalid', headers=self.headers).status_code, 422)
+            self.assertEqual(self.client.get(base + suffix + '?style=compact').status_code, 403)
+        default = self.client.get(base, headers=self.headers)
+        self.assertEqual(default.status_code, 200)
+        self.assertNotIn('data-report-style="compact"', default.text)
+
     def test_compare_api_validation(self):
         a = self.upload().json()["id"]
         b = self.upload(SAMPLE.replace("42.04", "50.04")).json()["id"]
@@ -3272,17 +3707,23 @@ const compile = source => ts.transpileModule(source, {compilerOptions: {
   assert.equal(await loadReport(path, controller.signal), 'blob:report');
   releaseReport('blob:report');
   assert.deepEqual(released, ['blob:report']);
-  for (const invalid of ['https://example.com/report', '//example.com', '<html>', '', null]) {
+  for (const style of ['default', 'compact']) {
+    assert.equal(await loadReport(path + '?style=' + style, controller.signal), 'blob:report');
+  }
+  for (const invalid of ['https://example.com/report', '//example.com', '<html>', '', null,
+    path + '?style=unknown', path + '?style=compact&redirect=https://example.com',
+    path + '?style=compact#fragment', path + '?style=compact&style=default',
+    path + '?style=COMPACT', path + '/../../token']) {
     await assert.rejects(() => loadReport(invalid, controller.signal));
   }
-  assert.equal(calls, 1);
+  assert.equal(calls, 3);
   response = {headers: new Headers({'Content-Type': 'application/json'})};
   await assert.rejects(() => loadReport(path, controller.signal), /格式/);
   response = {headers: new Headers({'Content-Type': 'text/html'}), blob: async () => new Blob([])};
   await assert.rejects(() => loadReport(path, controller.signal), /空报告/);
   response.blob = async () => { controller.abort(); return blob; };
   await assert.rejects(() => loadReport(path, controller.signal));
-  assert.equal(created, 1);
+  assert.equal(created, 3);
   assert.ok(!source.includes('srcDoc={'));
   assert.ok(source.includes('sandbox="allow-scripts"'));
 

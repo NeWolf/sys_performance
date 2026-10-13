@@ -48,7 +48,7 @@ class TopCapture:
                     max_bytes=MAX_ARCHIVE_BYTES, remote_path=None,
                     connected=False, connection_error=None,
                     started_at=None, ended_at=None, elapsed_seconds=None,
-                    remote_cleaned=False, warning=None)
+                    remote_cleaned=False, state_corrupt=False, warning=None)
 
     @staticmethod
     def _serial(serial):
@@ -83,7 +83,7 @@ class TopCapture:
                 return limit
             value = min(limit, deadline - time.monotonic())
             if value <= 0:
-                raise AdbError("停止确认超时；任务可能仍在运行，请查询状态或重试停止。未拉取日志。", 504)
+                raise AdbError("停止确认超时；任务可能仍在运行，请查询状态或重试停止。未拉取或清理日志。", 504)
             return value
 
         def shell(command):
@@ -120,6 +120,18 @@ class TopCapture:
         if raw == "idle":
             return dict(self._empty(serial), connected=True)
         fields = raw.splitlines()
+        if fields and fields[0] == "corrupt":
+            if (len(fields) != 4 or not re.fullmatch(ID_PATTERN, fields[1])
+                    or fields[2] not in {"inactive", "unconfirmed"}
+                    or fields[3] not in {"present", "cleaned"}):
+                raise AdbError("设备 Top 损坏状态协议无效，未执行任务操作", 502)
+            inactive = fields[2] == "inactive"
+            return dict(self._empty(serial), id=fields[1], status="corrupt",
+                        state_corrupt=True, running=not inactive, connected=inactive,
+                        count=None, target_count=None, interval=None, bytes=None,
+                        error="state_corrupt", remote_cleaned=fields[3] == "cleaned",
+                        connection_error=None if inactive else
+                        "采集锁占用或无法确认；禁止新采集，可重试停止或清理。未确认停止不会清理日志。")
         unconfirmed = bool(fields and fields[-1] == "unconfirmed")
         if unconfirmed:
             fields.pop()
@@ -240,12 +252,14 @@ class TopCapture:
                 size = path.stat().st_size
                 saved_warning = self._saved_warning(path, size)
                 if (0 < size <= MAX_ARCHIVE_BYTES
-                        and (size == state["bytes"] or saved_warning
+                        and (size == state["bytes"] or saved_warning or state["state_corrupt"]
                              or state["id"] in self._archives)):
                     self._archives[state["id"]] = path
                     state["archive"] = "/api/top/archive?capture_id=" + state["id"]
                     state["warning"] = state["warning"] or saved_warning
-                    if size != state["bytes"] and not state["warning"]:
+                    if state["state_corrupt"] and not state["warning"]:
+                        state["warning"] = "设备状态损坏，无法核对日志完整性；已有本地归档已保留，可下载或导入分析。"
+                    elif size != state["bytes"] and not state["warning"]:
                         state["warning"] = (
                             f"Top 归档字节数不一致：本地实际={size} 字节，"
                             f"设备记录={state['bytes']} 字节。"
@@ -330,7 +344,7 @@ class TopCapture:
                     return state
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise AdbError("停止确认超时；任务可能仍在运行，请查询状态或重试停止。未拉取日志。", 504)
+                    raise AdbError("停止确认超时；任务可能仍在运行，请查询状态或重试停止。未拉取或清理日志。", 504)
                 time.sleep(min(STOP_POLL_SECONDS, remaining))
         except AdbError as exc:
             cached = self._states.get(serial)
@@ -355,9 +369,7 @@ class TopCapture:
         with self._lock:
             self._available()
             with self._device(serial):
-                state = self._current(serial, capture_id)
-                if state["running"] or state["stopping"]:
-                    raise AdbError("请先停止 Top 采集并等待结束，再清理设备日志", 409)
+                self._stop_confirmed(serial, capture_id)
                 self._command(serial, "clear", capture_id)
                 return self._query(serial)
 
@@ -370,6 +382,8 @@ class TopCapture:
                 state = self._stop_confirmed(serial, capture_id)
                 if state["remote_cleaned"]:
                     raise AdbError("设备 Top 日志已清理，本地已拉取的归档不受影响", 409)
+                if state.get("state_corrupt"):
+                    raise AdbError("Top 状态损坏，无法确认完整样本；请安全清理后重新采集。本地归档不受影响。", 409)
                 if state["bytes"] == 0:
                     raise AdbError("设备没有完整的 Top 样本", 404)
                 self.archive_root.mkdir(parents=True, exist_ok=True)

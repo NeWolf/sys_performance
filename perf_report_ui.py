@@ -6,6 +6,8 @@ import math
 from html import escape
 from pathlib import Path
 
+from perf_metrics import round_metric, scale_metric, subtract_metric, pid_label
+
 ASSETS = Path(__file__).resolve().parent / "report_assets"
 CSS = (ASSETS / "report.css").read_text(encoding="utf-8")
 # One fixed trusted script, never interpolated with session/log values.
@@ -21,13 +23,34 @@ def esc(value):
     return escape("—" if value is None else str(value), quote=True)
 
 
+def display_statistics(values):
+    from decimal import Decimal, ROUND_HALF_UP, localcontext
+    values = sorted(v for value in values if (v := round_metric(value)) is not None)
+    count = len(values)
+    with localcontext() as context:
+        context.prec = 400
+        total = sum((Decimal(str(v)) for v in values), Decimal(0))
+        avg = float((total / count).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if count else None
+    return dict(count=count, min=values[0] if count else None, avg=round_metric(avg),
+                p95=values[(count * 95 + 99) // 100 - 1] if count else None,
+                p99=values[(count * 99 + 99) // 100 - 1] if count else None,
+                max=values[-1] if count else None, total=round_metric(float(total)) if count else None)
+
+
 def number(value):
     if value is None:
         return "—"
     if isinstance(value, (int, float)):
-        if not math.isfinite(value):
-            return "—"
-        return format(value, ",.2f").rstrip("0").rstrip(".")
+        value = round_metric(value)
+        return format(value, ",.2f") if value is not None else "—"
+    return str(value)
+
+
+def integer(value):
+    if value is None or isinstance(value, float) and not math.isfinite(value):
+        return "—"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value)
 
 
@@ -36,13 +59,59 @@ def stamp(value):
     return timestamp(value, local=True)
 
 
+def prepare_precision(data):
+    """Recompute display aggregates from full observations, never sampled charts."""
+    from perf_report_data import SYSTEM_CPU_SINGLE_FIELDS
+    if data.get("display_precision") == "half-up-2":
+        return data
+    schema = {name: i for i, name in enumerate(data.get("full_cycle_schema", []))}
+    for process in data.get("processes", []):
+        rows = process.get("full_cycles")
+        if rows is None:
+            continue
+        cpu_index = schema.get("cpu1c")
+        active = [row for row in rows if cpu_index is not None and
+                  (round_metric(row[cpu_index]) or 0) > 0]
+        for scope, observations in ((process, rows), (process.setdefault("active", {}), active)):
+            for field, stats in scope.get("metrics", {}).items():
+                if field in schema:
+                    stats.update(display_statistics(row[schema[field]] for row in observations))
+            scope.setdefault("display_metrics", {})["rss_mb"] = dict(
+                display_statistics(scale_metric(row[schema["rss_kb"]], 1, 1024)
+                                   for row in observations) if "rss_kb" in schema else display_statistics([]),
+                label="驻留内存 RSS", unit="MB")
+        process["active"]["cycles"] = len(active)
+        cycles = process.get("coverage", {}).get("cycles", 0)
+        process["active"]["percent_of_segment"] = scale_metric(len(active), 100, cycles)
+    for system in data.get("systems", []):
+        points = system.get("full_points")
+        if points is not None:
+            for field, stats in system["metrics"].items():
+                source = SYSTEM_CPU_SINGLE_FIELDS.get(field, field)
+                calculated = display_statistics(point.get(source) for point in points)
+                stats.update({key: value for key, value in calculated.items() if key in stats})
+        else:
+            # Without full samples retain upstream aggregates; do not use downsampling.
+            for stats in system["metrics"].values():
+                for key in ("min", "avg", "p95", "p99", "max", "total"):
+                    if key in stats:
+                        stats[key] = round_metric(stats[key])
+    data["display_precision"] = "half-up-2"
+    data.setdefault("method", {})["precision"] = (
+        "所有指标先将输入按十进制HALF_UP舍入至两位，再计算并舍入结果；正负对称，显示固定两位。"
+        "单位换算使用精确十进制，RSS逐观察周期由KB换算为MB后统计，原KB数据结构保留。"
+        "整数计数、周期、时间戳和标识符不按指标舍入；排序和标准比较使用显示精度。"
+        "去重PID超过3个时显示PID变化N次（真实变更次数），不附加最后周期PID，搜索仍包含全部原始PID。")
+    return data
+
+
 def prepare_display(data):
     """Use full-sample single-core CPU statistics without changing raw data."""
     from copy import deepcopy
     from perf_report_data import SYSTEM_CPU_SINGLE_FIELDS
     data = deepcopy(data)
     if data.get("display_cpu_basis") == "system-and-process-single-core":
-        return data
+        return prepare_precision(data)
     data["display_cpu_basis"] = "system-and-process-single-core"
     memory_field = ("mem_free_mb" if data["session"].get("summary", {}).get("source_format") == "top"
                     else "mem_avail_mb")
@@ -60,8 +129,9 @@ def prepare_display(data):
     data["method"]["cpu"] = "整机与进程 CPU 均采用单核口径，一个核心满载100%，整机总占用可超过100%。整机逐样本按平台满载值换算，无法换算留空。进程仍使用cpu1c，缺失不回退；固定28.75 KDMIPS/核。"
     data["method"]["system"] = "每条原始S有效字段独立统计，重复S不去重；单核口径空闲=平台满载值−单核口径总占用。各字段均先逐样本换算，再用全量有效样本计算P95/P99。超标判断仍按整机满载100%口径，严格大于90/95/99%，分母为有效S样本，非时间占比。缺失字段留空。"
     data["method"]["memory"] = "内存单位为MB。sysmonitor：已用＝MemTotal−MemAvailable，含不可回收部分，不把可回收cache算作已用；任一字段缺失则已用缺失。Top：已用直接取Mem行的used，空闲直接取free，沿用设备top口径，不等同于sysmonitor；free不等于MemAvailable，不用free冒充可用内存。Swap不计入物理内存。"
+    data["method"]["charts"] = "全进程 CPU、内存、IO 叠加图保留全部采样点，不降采样；其他趋势图每系列最多600点。缺值、缺周期及非递增时间处断线。全进程悬浮提示按精确时间与周期匹配，缺失或冲突不使用邻近值、不补零。精确统计与合并均使用全量有效样本，不使用降采样点。"
     data["method"]["chart_time"] = "趋势横轴显示小时:分钟:秒（本机时间，与日志时间表一致），提示保留完整日期时间；虚线为整段全量P95/P99，缩放不重算。"
-    return data
+    return prepare_precision(data)
 
 
 def time_label(system):
@@ -81,17 +151,20 @@ def time_label(system):
 
 def metric(item, field, key="avg", active=False):
     scope = (item or {}).get("active", {}) if active else (item or {})
-    return scope.get("metrics", {}).get(field, {}).get(key)
+    stats = scope.get("display_metrics", {}).get(field, {}) if field == "rss_mb" else scope.get("metrics", {}).get(field, {})
+    value = stats.get(key)
+    return value if key == "count" else round_metric(value)
 
 
 def scaled(value, divisor):
-    return value / divisor if value is not None else None
+    return scale_metric(value, 1, divisor)
 
 
 def grid(headers, rows, identities=None, searchable=False, role="", search_terms=None):
     out = ['<div class="data-table" data-table="' + esc(role) + '">']
     if searchable:
-        system_toggle = '<label><input type="checkbox" class="show-system-processes">显示系统进程</label>' if role == "all" else ''
+        system_toggle = ('<label><input type="checkbox" class="show-system-processes">显示系统进程</label>'
+                         '<button type="button" class="select-top15" title="按当前筛选范围内活跃 CPU 均值降序添加前15，保留已有选择">勾选前15（活跃CPU均值）</button>') if role == "all" else ''
         out.append('<div class="controls js-only"><label>搜索 <input type="search" class="table-search" placeholder="名称、PID、状态；点击表头排序" aria-label="搜索表格"></label>' + system_toggle + '<span class="table-count" aria-live="polite"></span></div>')
     out.append('<div class="scroll"><table><thead><tr>')
     out.extend('<th scope="col">' + esc(h) + '</th>' for h in headers)
@@ -114,12 +187,19 @@ def grid(headers, rows, identities=None, searchable=False, role="", search_terms
                 value = value.lstrip()
             cls = ' class="name"' if isinstance(value, str) and len(value) > 22 else ''
             title = ' title="' + esc(value) + '"' if role == "all" and (column == 1 or headers[column] == "PID") else ''
-            out.append('<td' + cls + title + ' data-sort="' + esc('' if value is None else value) + '">' + esc(number(value)) + '</td>')
+            is_count = headers[column] in {"序号", "PID", "有效样本", "有效周期", "CPU有效周期", "内存有效周期", "活跃周期", "PID变化", "样本数", "记录ID", "周期", "行号"}
+            if not is_count and isinstance(value, (int, float)):
+                value = round_metric(value)
+            out.append('<td' + cls + title + ' data-sort="' + esc('' if value is None else value) + '">' + esc(integer(value) if is_count else number(value)) + '</td>')
         out.append('</tr>')
     return ''.join(out) + '</tbody></table></div></div>'
 
 
-def statistics(metrics, cycles=None):
+def statistics(metrics, cycles=None, display_metrics=None):
+    metrics = dict(metrics)
+    if display_metrics and "rss_mb" in display_metrics:
+        metrics.pop("rss_kb", None)
+        metrics["rss_mb"] = display_metrics["rss_mb"]
     groups = []
     for category in ("cpu", "memory", "io"):
         rows = []
@@ -134,13 +214,13 @@ def statistics(metrics, cycles=None):
             kind = "io" if field in dict(IO_FIELDS) else "cpu" if field.startswith("cpu") else "memory"
             if kind != category:
                 continue
-            divisor = 1024 if field == "rss_kb" else 1
-            unit = "MB" if field == "rss_kb" else "KB/周期" if kind == "io" else m.get("unit", "%")
-            row = [m.get("label", field), unit, m.get("count", 0), *[scaled(m.get(k), divisor) for k, _ in STATS]]
+            # Without per-observation MB statistics, retain KB rather than convert an aggregate.
+            unit = "KB" if field == "rss_kb" else "MB" if field == "rss_mb" else "KB/周期" if kind == "io" else m.get("unit", "%")
+            row = [m.get("label", field), unit, m.get("count", 0), *[round_metric(m.get(k)) for k, _ in STATS]]
             if kind == "io":
                 row += [m.get("total")]
             elif kind == "cpu":
-                row += [scaled(m.get(k), 100 / 28.75) for k in ("p95", "max")]
+                row += [scale_metric(m.get(k), 28.75, 100) for k in ("p95", "max")]
             rows.append(row)
         if rows:
             groups.append(grid(headers, rows))
@@ -152,7 +232,7 @@ def stat_cards(metrics):
     for field, m in metrics.items():
         out.append('<div class="stat-item"><div class="stat-header"><span>' + esc(m.get("label", field)) + ' · ' + esc(m.get("unit", "%")) + '</span><strong>' + esc(number(m.get("avg"))) + '</strong></div><div class="stat-details">')
         for key, label in (("max", "最大"), ("min", "最小"), ("p95", "P95"), ("p99", "P99"), ("count", "有效样本")):
-            out.append('<div><span>' + label + '</span><b class="' + key + '">' + esc(number(m.get(key))) + '</b></div>')
+            out.append('<div><span>' + label + '</span><b class="' + key + '">' + esc(integer(m.get(key)) if key == "count" else number(m.get(key))) + '</b></div>')
         out.append('</div></div>')
     return ''.join(out) + '</div>'
 
@@ -168,16 +248,11 @@ PROCESS_HEADERS += ["PID变化"]
 def process_row(p, ordinal):
     p = p or {}
     cpu = lambda k, active=False: metric(p, "cpu1c", k, active)
-    pid_label = ', '.join(str(v) for v in p.get("pids", [])) or None
-    if p.get("pid_changes", 0) > 3:
-        path = p.get("pid_path", [])
-        last = ', '.join(str(v) for v in path[-1]["pids"]) if path else ""
-        pid_label = f'pid{p["pid_changes"]}次变更，last：{last or "—"}'
-    rows = [ordinal, p.get("name"), pid_label,
+    rows = [ordinal, p.get("name"), pid_label(p),
             p.get("active", {}).get("cycles"),
             *[cpu(k, True) for k in ("avg", "p95", "max")],
-            scaled(cpu("p95", True), 100 / 28.75), scaled(cpu("max", True), 100 / 28.75),
-            *[scaled(metric(p, "rss_kb", k), 1024) for k in ("avg", "p95", "max")],
+            scale_metric(cpu("p95", True), 28.75, 100), scale_metric(cpu("max", True), 28.75, 100),
+            *[metric(p, "rss_mb", k) for k in ("avg", "p95", "max")],
             metric(p, "rd_kb", "total"), metric(p, "wr_kb", "total")]
     for field, _ in IO_FIELDS:
         rows.extend(metric(p, field, k) for k in ("avg", "p95", "max"))
@@ -240,7 +315,7 @@ EXCEL_BUDGETS = {
 
 
 def budget_comparison(value, source, column):
-    """Compare raw values only against budgets with matching units and required scenarios."""
+    """Compare display-precision values against applicable budgets with matching units."""
     # IO measurements are MB/cycle, while source budgets are MB/s.
     if column in (5, 6):
         return "", ""
@@ -257,6 +332,7 @@ def budget_comparison(value, source, column):
     limit = source.get(columns[column])
     if not valid(value) or not valid(limit):
         return "", ""
+    value, limit = round_metric(value), round_metric(limit)
     detail = label + '标准：' + number(limit)
     if value > limit:
         return "budget-high", "高于适用标准；" + detail
@@ -287,15 +363,15 @@ def required_table(data, segment):
         search = ' '.join(str(v) for v in (name, item["module"], item["business"], state,
                                           ', '.join(map(str, (p or {}).get("pids", [])))))
         out.append('<tbody class="focus-group" data-search="' + esc(search) + '">')
-        measured = [metric(p, "cpu1c", "p95"), scaled(metric(p, "cpu1c", "p95"), 100 / 28.75),
-                    metric(p, "cpu1c", "max"), scaled(metric(p, "cpu1c", "max"), 100 / 28.75),
-                    scaled(metric(p, "rss_kb", "max"), 1024),
+        measured = [metric(p, "cpu1c", "p95"), scale_metric(metric(p, "cpu1c", "p95"), 28.75, 100),
+                    metric(p, "cpu1c", "max"), scale_metric(metric(p, "cpu1c", "max"), 28.75, 100),
+                    metric(p, "rss_mb", "max"),
                     scaled(metric(p, "rd_kb", "max"), 1024), scaled(metric(p, "wr_kb", "max"), 1024)]
         # Keep one shared identity cell; the visibility control moves it between rows.
         identity = ('<strong>' + esc(name) + '</strong><span>' + esc(item["module"]) +
                     ' · ' + esc(item["business"]) + '</span><span>前台需求 ' + esc(source.get("D")) +
                     ' / 后台需求 ' + esc(source.get("E")) + '</span><span>' + esc(state) +
-                    ' · Excel 行 ' + esc(item["excel_row"]) + '</span>')
+                    ' · Excel 行 ' + esc(item["excel_row"]) + '</span><span class="process-pid">' + esc(pid_label(p)) + '</span>')
         for index, (label, kind, values) in enumerate((
                 ("后台标准", "standard background", [source.get(c) for c in "FGHIJKL"]),
                 ("前台标准", "standard foreground", [source.get(c) for c in "MNOPQRS"]),
@@ -307,6 +383,8 @@ def required_table(data, segment):
                 out.append('<td class="focus-identity" rowspan="3">' + identity + '</td>')
             out.append('<th scope="row">' + label + '</th>')
             for column, value in enumerate(values):
+                if isinstance(value, (int, float)):
+                    value = round_metric(value)
                 color, hint = budget_comparison(value, source, column) if index == 2 else ("", "")
                 comparison = (' class="' + color + '" title="' + esc(hint) + '"') if color else ''
                 out.append('<td data-sort="' + esc('' if value is None else value) + '"' + comparison + '>' + esc(number(value)) + '</td>')
@@ -338,7 +416,7 @@ def segment_html(data, system):
     out.append('<details class="overview-notes"><summary>查看统计口径与图表说明</summary><p class="note">单核满载为 100%，整机总占用可超过 100%；空闲 = 平台满载值 − 单核口径整机 CPU 总占用。' + esc(system.get("cpu_reference_note", "平台未知，不推定满载值。")) + '总占用曲线红色加粗。默认仅显示 CPU 总占用与已使用内存，点击图例可显示其他曲线。内存单位为 MB；sysmonitor 已使用内存 = MemTotal − MemAvailable，空闲内存指可用的 MemAvailable，已使用含不可回收部分、不把可回收 cache 算作已用。Top 已使用内存直接取 Mem 行的 used，空闲内存直接取 free，沿用设备 top 口径；free 不等于 MemAvailable，不用 free 冒充可用内存，Swap 不计入物理内存。总内存不绘图、不展示分位数。虚线为完整时段全量有效样本的 P95 / P99，缩放不重算；横轴为小时:分钟:秒（本机时间），缺失不补零。</p></details>')
     out.append('</section>')
     reference_note = '<p class="note">默认参照：系统 CPU 使用单核口径。' + esc(system.get("cpu_reference_note", "平台未知，不推定满载值。")) + '已使用内存：sysmonitor＝总内存−MemAvailable，Top＝Mem 行的 used。IO 按本周期已采集 P 进程分别汇总物理读、物理写、逻辑读、逻辑写；未采集进程不计入，各字段仅汇总有效值（可能不完整），无有效值时断线。</p>'
-    out.append('<details class="panel" open><summary>全进程分析</summary><details class="report-notes"><summary>查看说明</summary><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。默认隐藏名称以 android、com.android、.、vendor、/apex/com.android、/system/、/vendor/ 开头、以方括号包裹或不含英文句点（.）的系统进程，但以 jkc 开头的名称不归入系统进程；可通过开关展示系统进程；筛选不移除已选曲线。列表按约6行高度展示，其余滚动查看；名称和 PID 完整展示，过长时换行。零活跃及 DP-only 身份完整保留；未启用 JavaScript 时展示全部进程。CPU 百分比与 KDMIPS 列均使用同名同周期合计后有效单核 CPU > 0 的活跃周期；KDMIPS = 对应百分比 ÷ 100 × 28.75，为派生估算。P95 按活跃样本升序取第 ceil(0.95 × 样本数) 项，峰值独立取最大值；活跃样本为1至19个时二者必然相等，高值重复时也可能相等。零活跃时这些 CPU 指标显示缺失；内存与 IO 仍按全部有效观察周期统计。</p>' + reference_note + '</details>')
+    out.append('<details class="panel" open><summary>全进程分析</summary><details class="report-notes"><summary>查看说明</summary><p class="note">点击行或按 Enter / 空格添加、移除叠加曲线；不改变统计。“勾选前15”按当前搜索及系统进程筛选范围内的活跃 CPU 均值降序添加，保留已有选择，缺失均值不参与。全进程 CPU、内存、IO 叠加图保留全部采样周期，可缩放逐秒查看；悬浮窗显示同周期同时间的参考值和已选进程，缺失或冲突不使用邻近值、不补零。默认隐藏名称以 android、com.android、.、vendor、/apex/com.android、/system/、/vendor/ 开头、以方括号包裹或不含英文句点（.）的系统进程，但以 jkc 开头的名称不归入系统进程；可通过开关展示系统进程；筛选不移除已选曲线。列表按约6行高度展示，其余滚动查看；名称完整展示并可换行；去重 PID 超过3个时显示真实变更次数和最后周期 PID，搜索包含全部原始 PID。零活跃及 DP-only 身份完整保留；未启用 JavaScript 时展示全部进程。CPU 百分比与 KDMIPS 列均使用同名同周期合计后有效单核 CPU > 0 的活跃周期；KDMIPS = 对应百分比 ÷ 100 × 28.75，为派生估算。P95 按活跃样本升序取第 ceil(0.95 × 样本数) 项，峰值独立取最大值；活跃样本为1至19个时二者必然相等，高值重复时也可能相等。零活跃时这些 CPU 指标显示缺失；内存与 IO 仍按全部有效观察周期统计。</p>' + reference_note + '</details>')
     out.append('<div class="selection-tags js-only" aria-live="polite"></div>')
     has_io = any((metric(p, field, "count") or 0) > 0
                  for p in processes for field, _ in IO_FIELDS)
@@ -368,27 +446,29 @@ def segment_html(data, system):
     out.append('<details class="panel"><summary>CPU 超标分布明细 · 整机 100% 口径</summary>' + chart(system, "exceed", "CPU 超标彩色柱", "small"))
     out.append(grid(["严格阈值 · 整机 %", "样本数", "有效 S 样本占比 %"], [[t["threshold"], t["count"], t["percent"]] for t in exceed["thresholds"]]))
     limit = exceed["thresholds"][0]["threshold"]
-    out.append('<details class="report-notes"><summary>查看说明</summary><p class="note">分母为有效系统CPU样本 ' + esc(exceed["valid_samples"]) + '；不是时间占比。超过 ' + esc(number(limit)) + '% 共 ' + esc(number(exceed["total"])) + ' 条，显示前 ' + esc(len(exceed["details"])) + ' 条；' + ('明细已截断。' if exceed["truncated"] else '明细未截断。') + '</p></details>')
+    out.append('<details class="report-notes"><summary>查看说明</summary><p class="note">分母为有效系统CPU样本 ' + esc(exceed["valid_samples"]) + '；不是时间占比。超过 ' + esc(number(limit)) + '% 共 ' + esc(integer(exceed["total"])) + ' 条，显示前 ' + esc(len(exceed["details"])) + ' 条；' + ('明细已截断。' if exceed["truncated"] else '明细未截断。') + '</p></details>')
     out.append(grid(["记录ID", "周期", "本机时间", "整机 CPU 总占用 · %", "来源", "行号"], [[r["record_id"], r["cycle"], stamp(r["ts"]), r["cpu_total"], r["source"], r["line"]] for r in exceed["details"]], searchable=True))
     out.append('</details>')
-    for role, title, field, key, active in (("active-top", "活跃 CPU Top30 · 活跃均值", "cpu1c", "avg", True), ("peak-top", "CPU 峰值 Top30 · 趋势", "cpu1c", "max", False), ("rss-top", "内存均值 Top30", "rss_kb", "avg", False)):
+    for role, title, field, key, active in (("active-top", "活跃 CPU Top30 · 活跃均值", "cpu1c", "avg", True), ("peak-top", "CPU 峰值 Top30 · 趋势", "cpu1c", "max", False), ("rss-top", "内存均值 Top30", "rss_mb", "avg", False)):
         ranked = sorted((p for p in processes if metric(p, field, key, active) is not None), key=lambda p: (-metric(p, field, key, active), p["name"]))[:30]
         tag = "details"
         heading = '<summary>' + title + '</summary>'
         out.append('<' + tag + ' class="panel">' + heading + chart(system, role, title, "tall" if role != "peak-top" else ""))
-        unit = "MB" if field == "rss_kb" else "%"
+        unit = "MB" if field == "rss_mb" else "%"
         headers = ["进程", "PID", "有效周期", *[label + " · " + unit for _, label in STATS]]
         rows = []
         for p in ranked:
-            m = (p["active"] if active else p)["metrics"][field]
-            rows.append([p["name"], ', '.join(map(str, p["pids"])), m["count"], *[scaled(m[k], 1024 if field == "rss_kb" else 1) for k, _ in STATS]])
-        out.append(grid(headers, rows, [p["id"] for p in ranked], True, role) + '</' + tag + '>')
+            rows.append([p["name"], pid_label(p), metric(p, field, "count", active),
+                         *[metric(p, field, k, active) for k, _ in STATS]])
+        out.append(grid(headers, rows, [p["id"] for p in ranked], True, role,
+                        search_terms=[', '.join(map(str, p["pids"])) for p in ranked]) + '</' + tag + '>')
     out.append('<details class="panel"><summary>物理 / 逻辑 IO · 有效增量及累计</summary><details class="report-notes"><summary>查看说明</summary><p class="note">KB/周期是计数增量，不是 KB/s 或 MB/s；累计只累加有效增量，缺失不补零。选择进程查看其独立曲线，默认展示物理 IO 有效累计靠前的进程。</p></details><div class="charts">')
     for role, title in (("io-physical", "物理 IO 增量"), ("io-logical", "逻辑 IO 增量"), ("io-physical-total", "物理 IO 累计"), ("io-logical-total", "逻辑 IO 累计")):
         out.append('<div><h4>' + title + '</h4>' + chart(system, role, title) + '</div>')
     io_headers = ["进程", "PID"] + [label + suffix for _, label in IO_FIELDS for suffix in ("均值 KB/周期", "P95 KB/周期", "峰值 KB/周期", "累计 KB")]
-    io_rows = [[p["name"], ', '.join(map(str, p["pids"])), *[metric(p, f, k) for f, _ in IO_FIELDS for k in ("avg", "p95", "max", "total")]] for p in processes]
-    out.append('</div>' + grid(io_headers, io_rows, [p["id"] for p in processes], True, "io") + '</details>')
+    io_rows = [[p["name"], pid_label(p), *[metric(p, f, k) for f, _ in IO_FIELDS for k in ("avg", "p95", "max", "total")]] for p in processes]
+    out.append('</div>' + grid(io_headers,io_rows, [p["id"] for p in processes], True, "io",
+                               search_terms=[', '.join(map(str, p["pids"])) for p in processes]) + '</details>')
     return ''.join(out) + '</section>'
 
 

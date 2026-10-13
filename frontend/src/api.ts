@@ -106,17 +106,68 @@ export function statisticsPath(id: string, kind: Kind, segment: number, filters:
   return `${sessionPath(id)}/statistics?${query}`
 }
 
-export function formatStatistic(value: MetricValue | undefined, unit: string, total = false): string {
+export function formatMetricValue(value: MetricValue | undefined, unit: string, average = false): string {
+  const count = /^(个|次)(\s*\/\s*周期)?$/.test(unit)
+  return formatNumber(value, count && !average && Number.isInteger(value) ? 0 : 2)
+}
+
+export function formatStatistic(value: MetricValue | undefined, unit: string, total = false, average = false): string {
   if (value == null) return '—'
   const suffix = total ? unit.replace(' / 周期', '') : unit
   if (suffix.startsWith('KB') || suffix.startsWith('MB')) {
     return formatMemory(value, suffix.startsWith('MB') ? 'MB' : 'KB') + (suffix.includes('周期') ? ' / 周期' : '')
   }
-  return `${formatNumber(value, 2)} ${suffix}`
+  return `${formatMetricValue(value, suffix, average)} ${suffix}`
 }
 
-export function formatNumber(value: number | null | undefined, digits = 1): string {
-  return value == null || !Number.isFinite(value) ? '—' : value.toLocaleString('zh-CN', { maximumFractionDigits: digits })
+// 从十进制字符串取整，避免二进制浮点的 .005 边界误差；负数对称、零不带负号。
+function roundedQuotient(numerator: bigint, denominator: bigint): bigint {
+  const negative = (numerator < 0n) !== (denominator < 0n)
+  const n = numerator < 0n ? -numerator : numerator
+  const d = denominator < 0n ? -denominator : denominator
+  const result = n / d + (n % d * 2n >= d ? 1n : 0n)
+  return negative ? -result : result
+}
+
+function decimalInteger(value: number, digits: number): bigint {
+  const [coefficient, exponent = '0'] = Math.abs(value).toString().split('e')
+  const [whole, fraction = ''] = coefficient.split('.')
+  const integer = BigInt(whole + fraction) * (value < 0 ? -1n : 1n)
+  const shift = Number(exponent) - fraction.length + digits
+  return shift >= 0 ? integer * 10n ** BigInt(shift) : roundedQuotient(integer, 10n ** BigInt(-shift))
+}
+
+function decimalNumber(value: bigint, digits: number): MetricValue {
+  const result = Number(`${value}e-${digits}`)
+  return Number.isFinite(result) ? result : null
+}
+
+export function roundMetric(value: number | null | undefined): MetricValue {
+  return value == null || !Number.isFinite(value) ? null : decimalNumber(decimalInteger(value, 2), 2)
+}
+
+export function subtractMetric(target: number | null | undefined, baseline: number | null | undefined): MetricValue {
+  if (target == null || baseline == null || ![target, baseline].every(Number.isFinite)) return null
+  return decimalNumber(decimalInteger(target, 2) - decimalInteger(baseline, 2), 2)
+}
+
+// 输入先保留两位，乘除采用十进制定点运算，整个公式的结果再 HALF_UP。
+export function scaleMetric(value: number | null | undefined, multiplier = 1, divisor = 1): MetricValue {
+  if (value == null || ![value, multiplier, divisor].every(Number.isFinite)) return null
+  const denominator = decimalInteger(divisor, 2)
+  if (denominator === 0n) return null
+  return decimalNumber(roundedQuotient(decimalInteger(value, 2) * decimalInteger(multiplier, 2), denominator), 2)
+}
+
+export function formatPid(pids: number[], changes: number): string {
+  const unique = [...new Set(pids)]
+  return unique.length > 3 ? `PID变化${Number.isFinite(changes) ? changes : '未知'}次` : `PID ${unique.join(', ') || '—'}`
+}
+
+export function formatNumber(value: number | null | undefined, digits = 2): string {
+  if (value == null || !Number.isFinite(value)) return '—'
+  const rounded = decimalNumber(decimalInteger(value, digits), digits)
+  return rounded == null ? '—' : rounded.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 
 // 日志时间明确为毫秒，不按数值大小猜测单位。
@@ -135,7 +186,9 @@ export function formatMemory(value: number | null | undefined, source: 'KB' | 'M
   if (value == null || !Number.isFinite(value)) return '—'
   const units = ['KB', 'MB', 'GB', 'TB', 'PB']
   let index = source === 'MB' ? 1 : 0
-  let amount = value
+  const input = roundMetric(value)!
+  let amount = input
+  const sourceIndex = index
   while (Math.abs(amount) >= 1024 && index < units.length - 1) {
     amount /= 1024
     index += 1
@@ -144,7 +197,10 @@ export function formatMemory(value: number | null | undefined, source: 'KB' | 'M
     amount *= 1024
     index -= 1
   }
-  return `${formatNumber(amount, 2)} ${units[index]}`
+  const converted = index >= sourceIndex
+    ? scaleMetric(input, 1, 1024 ** (index - sourceIndex))
+    : scaleMetric(input, 1024 ** (sourceIndex - index))
+  return `${formatNumber(converted)} ${units[index]}`
 }
 
 export function errorMessage(error: unknown): string {

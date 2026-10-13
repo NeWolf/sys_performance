@@ -327,8 +327,8 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(json.loads((self.output / "report.json").read_text()), result["blocks"])
 
     def test_equal_raw_threshold_and_missing_metrics_colors(self):
-        for cpu, expected in ((2, None), (2.0000001, perf_slate.HIGH_COLOR),
-                              (1.9999999, perf_slate.LOW_COLOR), (0, perf_slate.LOW_COLOR)):
+        for cpu, expected in ((2, None), (2.0000001, None),
+                              (1.9999999, None), (0, perf_slate.LOW_COLOR)):
             with self.subTest(cpu=cpu):
                 result = self.build(s(1) + p(1, cpu1c=cpu))
                 cell = process_rows(result["blocks"])[0]["children"][5]

@@ -5,7 +5,7 @@ import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, Ar
 import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsOption } from 'echarts'
 import type { SeriesData, StatisticsData } from './api'
-import { formatMemory, formatTime, formatNumber, formatStatistic, useResource } from './api'
+import { formatMemory, formatTime, formatNumber, formatMetricValue, formatStatistic, roundMetric, scaleMetric, useResource } from './api'
 
 registerCharts([LineChart, ScatterChart, BarChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, AriaComponent, MarkLineComponent, CanvasRenderer])
 
@@ -60,7 +60,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
           return [formatTime(timestamp), ...items.map((item) => {
             const raw = Array.isArray(item.value) ? item.value[1] : null
             const value = typeof raw === 'number' ? raw : null
-            const text = memoryUnit ? formatMemory(value, memoryUnit) : formatNumber(value)
+            const text = memoryUnit ? formatMemory(value, memoryUnit) : formatMetricValue(value, unit)
             const suffix = memoryUnit ? (unit.includes('周期') ? ' / 周期' : '') : ` ${unit}`
             return `${item.seriesName}: ${text}${value == null ? '' : suffix}`
           })].join('\n')
@@ -76,7 +76,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
       },
       yAxis: {
         type: 'value', name: memoryUnit ? (unit.includes('周期') ? '容量 / 周期' : '容量') : unit,
-        axisLabel: { formatter: (value: number) => memoryUnit ? formatMemory(value, memoryUnit) : formatNumber(value) },
+        axisLabel: { formatter: (value: number) => memoryUnit ? formatMemory(value, memoryUnit) : formatMetricValue(value, unit) },
         splitLine: { lineStyle: { color: '#edf1f6', type: 'dashed' } },
       },
       dataZoom: [{ type: 'inside' }, { type: 'slider', height: 16, bottom: 2, borderColor: 'transparent', labelFormatter: (value: number) => formatTime(value) }],
@@ -93,7 +93,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
             values.push([point.ts, null])
           }
           const value = point[field]
-          values.push([point.ts, typeof value === 'number' && Number.isFinite(value) ? value * scale : null])
+          values.push([point.ts, typeof value === 'number' ? scaleMetric(value, scale) : null])
         })
         return {
           name: label, type: seriesMode, data: values, connectNulls: false,
@@ -105,8 +105,8 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
             lineStyle: { type: 'dashed', width: 1 },
             label: { show: true, position: 'insideEndTop', formatter: '{b}' },
             data: (['p95', 'p99'] as const).flatMap((key) => {
-              const value = percentiles?.[field]?.[key]
-              return typeof value === 'number' && Number.isFinite(value)
+              const value = roundMetric(percentiles?.[field]?.[key])
+              return value !== null
                 ? [{ name: `${label} ${key.toUpperCase()} · ${formatStatistic(value, unit)}`, yAxis: value }]
                 : []
             }),
@@ -164,7 +164,8 @@ export function ComparisonBars({ title, unit, items, ranking = false, note, base
 }) {
   const host = useRef<HTMLDivElement>(null)
   const valid = (value: number | null) => value != null && Number.isFinite(value)
-  const rows = ranking ? items.filter((item) => item.comparable && valid(item.delta)) : items
+  const roundedItems = items.map((item) => ({ ...item, baseline: roundMetric(item.baseline), target: roundMetric(item.target), delta: roundMetric(item.delta), percent: roundMetric(item.percent) }))
+  const rows = ranking ? roundedItems.filter((item) => item.comparable && valid(item.delta)) : roundedItems
   const hasData = rows.some((item) => ranking ? valid(item.delta) : valid(item.baseline) || valid(item.target))
   const deltaUnit = unit === '%' ? '百分点' : unit
   const displayUnit = ranking ? deltaUnit : unit
@@ -271,7 +272,7 @@ export function StatisticsPanel({ title, path, trendPath, disabled }: {
         <div className="table-scroll"><table><thead><tr><th>指标 / 原始字段</th><th>有效样本</th><th>最小</th><th>均值</th><th>P95</th><th>P99</th><th>最大</th><th>增量累计</th></tr></thead>
           <tbody>{Object.entries(data.metrics).map(([key, item]) => <tr key={key}>
             <td><strong>{item.label}</strong><small>{key}</small>{item.note && <small>{item.note}</small>}</td><td>{formatNumber(item.count, 0)}</td>
-   {(['min', 'avg', 'p95', 'p99', 'max'] as const).map((stat) => <td key={stat}>{formatStatistic(item[stat], item.unit)}</td>)}
+   {(['min', 'avg', 'p95', 'p99', 'max'] as const).map((stat) => <td key={stat}>{formatStatistic(item[stat], item.unit, false, stat === 'avg')}</td>)}
             <td>{formatStatistic(item.total, item.unit, true)}</td>
           </tr>)}</tbody></table></div>
         <label className="metric-select">查看任意数值指标趋势 <select value={field} disabled={disabled} onChange={(event) => setField(event.target.value)}>

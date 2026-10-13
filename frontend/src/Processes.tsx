@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { sessionPath, useResource } from './api'
 import type { Overview, ProcessRow, SeriesData, Sort } from './api'
-import { formatNumber as n, formatMemory } from './api'
+import { formatNumber as n, formatMemory, formatPid, scaleMetric } from './api'
 import { SeriesChart, Trend, StatisticsPanel } from './Chart'
 import { seriesPath, statisticsPath } from './api'
 
@@ -19,11 +19,9 @@ const rssMetrics = [{ field: 'rss_kb', label: 'RSS' }]
 const ioMetrics = [{ field: 'rd_kb', label: '周期读取' }, { field: 'wr_kb', label: '周期写入' }]
 const dmaMetrics = [{ field: 'size_kb', label: '进程 dmabuf' }]
 type ProcessPage = { items: ProcessRow[]; total: number; all_total: number }
-const kdmips = (value: ProcessRow['cpu_p95']) => n(value == null ? null : value / 100 * 28.75, 2)
+const kdmips = (value: ProcessRow['cpu_p95']) => n(scaleMetric(value, 28.75, 100))
 const identity = (row: ProcessRow) => JSON.stringify([row.segment, row.name])
-const pidLabel = (row: ProcessRow) => row.pid_changes > 3
-  ? `PID变化${row.pid_changes}次`
-  : `PID ${row.pid_path.map((pids) => pids.length > 1 ? `[${pids.join(' + ')}]` : String(pids[0])).join(' → ')}`
+const pidLabel = (row: ProcessRow) => formatPid(row.pids, row.pid_changes)
 
 export function Processes({ id, segment, onSegment, disabled, members = [], memberSegment, onToggle, segments, visible = true }: {
   id: string; segment: number; onSegment: (value: number) => void; disabled: boolean

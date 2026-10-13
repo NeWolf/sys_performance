@@ -2,7 +2,7 @@
 import json
 import uuid
 
-from perf_metrics import INCREMENTS, METHOD, NUMERIC, metadata, resource_settings, to_kdmips
+from perf_metrics import INCREMENTS, METHOD, NUMERIC, metadata, resource_settings, round_metric, scale_metric
 
 
 def normalize_group(config, group_id):
@@ -156,6 +156,7 @@ class GroupStore:
             group = self._read_group(db, session_id, group_id)
             row = db.execute("SELECT config FROM report_settings WHERE session=?", (session_id,)).fetchone()
             settings = resource_settings(json.loads(row[0]) if row else {})
+            settings["kdmips_per_core"] = round_metric(settings["kdmips_per_core"])
             where, params = "session=? AND segment=? AND kind='P'", [session_id, group["segment"]]
             for field, op in (("start", ">="), ("end", "<=")):
                 if group[field] is not None:
@@ -164,7 +165,7 @@ class GroupStore:
             db.execute("CREATE TEMP TABLE resource_members (pid INTEGER,name TEXT,PRIMARY KEY(pid,name))")
             db.executemany("INSERT INTO resource_members VALUES (?,?)",
                            ((m["pid"], m["name"]) for m in group["members"]))
-            columns = ",".join("MAX(json_extract(data,'$.%s')) AS %s" % (f, f) for f in fields)
+            columns = ",".join("MAX(metric_round(json_extract(data,'$.%s'))) AS %s" % (f, f) for f in fields)
             db.execute("CREATE TEMP TABLE resource_cycles AS SELECT r.pid,m.name,cycle," + columns +
                        " FROM records r JOIN resource_members m ON r.pid=m.pid "
                        "AND (r.name=m.name OR json_extract(r.data,'$.raw_name')=m.name) WHERE " +
@@ -178,15 +179,15 @@ class GroupStore:
                         SELECT {field} value,ROW_NUMBER() OVER (ORDER BY {field}) rn,
                         COUNT(*) OVER () n FROM resource_cycles
                         WHERE pid=? AND name=? AND {field} IS NOT NULL
-                        ) SELECT COUNT(*) count,MIN(value) min,AVG(value) avg,MAX(value) max,
+                        ) SELECT COUNT(*) count,MIN(value) min,metric_avg(value) avg,MAX(value) max,
                         MAX(CASE WHEN rn=(95*n+99)/100 THEN value END) p95,
                         MAX(CASE WHEN rn=(99*n+99)/100 THEN value END) p99,
-                        SUM(CAST(value AS REAL)) total FROM ranked""",
+                        metric_sum(value) total FROM ranked""",
                         (member["pid"], member["name"])).fetchone())
                     if field not in INCREMENTS:
                         metric.pop("total")
                     statistics[field] = metric
-                kdmips = {key: to_kdmips(statistics["cpu1c"][key], settings["kdmips_per_core"])
+                kdmips = {key: scale_metric(statistics["cpu1c"][key], settings["kdmips_per_core"], 100)
                           for key in ("min", "avg", "p95", "p99", "max")}
                 rows.append(dict(member=member, statistics=statistics, kdmips=kdmips))
             note = ("成员独立统计：按 segment、毫秒闭区间及精确 PID/name 匹配 P 记录；"
@@ -219,7 +220,7 @@ class GroupStore:
             db.execute("CREATE TEMP TABLE group_members (pid INTEGER, name TEXT, PRIMARY KEY(pid,name))")
             db.executemany("INSERT INTO group_members VALUES (?,?)",
                            ((m["pid"], m["name"]) for m in group["members"]))
-            columns = ",".join("MAX(json_extract(r.data,'$.%s')) AS %s" % (f, f) for f in fields)
+            columns = ",".join("MAX(metric_round(json_extract(r.data,'$.%s'))) AS %s" % (f, f) for f in fields)
             db.execute("""CREATE TEMP TABLE member_cycles AS SELECT r.cycle,r.pid,m.name,
                 COUNT(*) n,""" + columns + """ FROM group_scope r JOIN group_members m
                 ON r.pid=m.pid AND (r.name=m.name OR json_extract(r.data,'$.raw_name')=m.name)
@@ -229,7 +230,7 @@ class GroupStore:
             complete = f"COUNT(m.pid)={member_count} AND MAX(m.n)=1"
             columns = ",".join(
                 f"CASE WHEN {complete} AND COUNT(m.{f})={member_count} "
-                f"THEN SUM(CAST(m.{f} AS REAL)) END AS {f}" for f in fields)
+                f"THEN metric_sum(m.{f}) END AS {f}" for f in fields)
             db.execute("""CREATE TEMP TABLE group_totals AS
                 SELECT c.cycle,c.ts,COUNT(m.pid) present,
                 COALESCE(MAX(m.n)>1,0) duplicate,""" + complete + " AS complete," + columns + """
@@ -264,10 +265,10 @@ class GroupStore:
             metric = dict(db.execute(f"""WITH ranked AS (
                 SELECT {field} value,ROW_NUMBER() OVER (ORDER BY {field}) rn,
                 COUNT(*) OVER () n FROM group_totals WHERE {field} IS NOT NULL
-                ) SELECT COUNT(*) count,MIN(value) min,MAX(value) max,AVG(value) avg,
+                ) SELECT COUNT(*) count,MIN(value) min,MAX(value) max,metric_avg(value) avg,
                 MAX(CASE WHEN rn=(95*n+99)/100 THEN value END) p95,
                 MAX(CASE WHEN rn=(99*n+99)/100 THEN value END) p99,
-                SUM(CAST(value AS REAL)) total FROM ranked""").fetchone())
+                metric_sum(value) total FROM ranked""").fetchone())
             if field not in INCREMENTS:
                 metric.pop("total")
             result["metrics"][field] = dict(metric, **metadata(field))

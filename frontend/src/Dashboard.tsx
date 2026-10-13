@@ -7,24 +7,25 @@ import { ReportConfig } from './ReportConfig'
 import { ViewPanel } from './ViewPanel'
 import { AdmissionReport } from './AdmissionReport'
 
-type DashboardProps = { id: string; disabled: boolean; view: string }
+export type ReportStyle = 'default' | 'compact'
+type DashboardProps = { id: string; disabled: boolean; view: string; reportStyle: ReportStyle }
 
-export function Dashboard({ id, disabled, view }: DashboardProps) {
+export function Dashboard({ id, disabled, view, reportStyle }: DashboardProps) {
   const [revision, setRevision] = useState(0)
   const { data, error, loading } = useResource<Overview>(sessionPath(id), revision)
   if (loading) return <div className="panel loading-state" role="status">正在读取会话统计…</div>
   if (error) return <div className="banner error" role="alert">{error} <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>
   if (!data) return null
-  return <Analysis data={data} disabled={disabled} view={view} />
+  return <Analysis data={data} disabled={disabled} view={view} reportStyle={reportStyle} />
 }
 
-function Analysis({ data, disabled, view }: { data: Overview; disabled: boolean; view: string }) {
+function Analysis({ data, disabled, view, reportStyle }: { data: Overview; disabled: boolean; view: string; reportStyle: ReportStyle }) {
   const [reportTab, setReportTab] = useState('groups')
   const [reportRevision, setReportRevision] = useState(0)
   const [segment, setSegment] = useState(data.segments[0]?.segment ?? 0)
   return <>
     <ViewPanel active={view === 'analysis'}>
-      <InteractiveReport key={data.id} id={data.id} name={data.name} segments={data.segments} disabled={disabled} />
+      <InteractiveReport key={data.id} id={data.id} name={data.name} segments={data.segments} disabled={disabled} reportStyle={reportStyle} />
       <details className="panel diagnostics">
         <summary>日志质量与来源</summary>
         <p className="muted">{formatNumber(data.summary.cycles, 0)} 个周期 · {data.summary.segments} 个时间段 · {formatTime(data.summary.first_ts)} → {formatTime(data.summary.last_ts)}</p>
@@ -53,7 +54,7 @@ function Analysis({ data, disabled, view }: { data: Overview; disabled: boolean;
 
 async function loadReport(path: string, signal: AbortSignal): Promise<string> {
   // Never send the session token to a URL supplied outside the local report API.
-  if (typeof path !== 'string' || !/^\/api\/sessions\/[a-f0-9]{32}\/report$/.test(path)) {
+  if (typeof path !== 'string' || !/^\/api\/sessions\/[a-f0-9]{32}\/report(?:\?style=(?:default|compact))?$/.test(path)) {
     throw new Error('本地服务返回了无效报告地址，请重试。')
   }
   const response = await apiResponse(path, { signal })
@@ -71,10 +72,10 @@ function releaseReport(url: string) {
   URL.revokeObjectURL(url)
 }
 
-function InteractiveReport({ id, name, segments, disabled }: { id: string; name: string; segments: Overview['segments']; disabled: boolean }) {
+function InteractiveReport({ id, name, segments, disabled, reportStyle }: { id: string; name: string; segments: Overview['segments']; disabled: boolean; reportStyle: ReportStyle }) {
   const [revision, setRevision] = useState(0)
   const [expanded, setExpanded] = useState(false)
-  const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream`, revision, loadReport, releaseReport)
+  const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream${reportStyle === 'compact' ? '?style=compact' : ''}`, revision, loadReport, releaseReport)
   useEffect(() => {
     if (!expanded) return
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setExpanded(false) }
@@ -87,7 +88,7 @@ function InteractiveReport({ id, name, segments, disabled }: { id: string; name:
   }
   return <section className={`analysis-report${expanded ? ' analysis-report-expanded' : ''}`} aria-label="交互性能分析">
     <div className="analysis-report-toolbar">
-      <div><strong>交互性能分析</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
+      <div><strong>交互性能分析 · {reportStyle === 'compact' ? '简洁组合图' : '原版完整报告'}</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
       <div className="actions">
         <AdmissionReport id={id} name={name} segments={segments} disabled={disabled} />
         <button disabled={disabled || result.loading} onClick={reload}>重新加载</button>

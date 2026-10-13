@@ -58,6 +58,16 @@ class Device:
     def action(self, serial, args, output=None):
         self.commands.append((serial, args))
         action = args[0]
+        job = self.jobs.get(serial)
+        if job and job[0] == "corrupt" and action != "start":
+            if action in {"stop", "clear", "pull"} and job[1] != args[1]:
+                raise AdbError("Capture identity changed", 502)
+            if action == "clear":
+                assert job[2] == "inactive"
+                job[3] = "cleaned"
+            if action == "pull":
+                raise AssertionError("Corrupt logs must not be pulled")
+            return "\n".join(job)
         if action == "start":
             identity, count, interval, title = args[1:]
             self.jobs[serial] = [identity, "running", "0", count, interval, "0", "none", title]
@@ -289,19 +299,70 @@ class TopCaptureTests(unittest.TestCase):
         self.assertEqual(restored.import_capture(identity)["id"], "session-1")
         self.assertNotEqual(self.top.start("device-1")["id"], identity)
 
-    def test_clear_rejects_active_stale_and_disconnected_tasks(self):
+    def test_clear_stops_active_task_before_cleaning(self):
         identity = self.top.start("device-1")["id"]
-        self.error(409, self.top.clear, "device-1", identity)
+        self.device.commands.clear()
+        self.assertTrue(self.top.clear("device-1", identity)["remote_cleaned"])
+        actions = [args[0] for _, args in self.device.commands]
+        self.assertEqual(actions[:3], ["stop", "status", "clear"])
+
+    def test_clear_rejects_unconfirmed_stale_and_disconnected_tasks(self):
+        identity = self.top.start("device-1")["id"]
         self.error(409, self.top.clear, "device-1", "f" * 32)
         self.error(400, self.top.clear, "device-1", "../outside")
         self.device.stop_delay = -1
         with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
             self.error(504, self.top.stop, "device-1", identity)
-        self.error(409, self.top.clear, "device-1", identity)
+            self.error(504, self.top.clear, "device-1", identity)
         self.adb.devices.return_value = []
         with self.assertRaises(AdbError):
             self.top.clear("device-1", identity)
         self.assertFalse(any(args[0] == "clear" for _, args in self.device.commands))
+
+    def test_corrupt_protocol_and_safe_actions(self):
+        identity = "c" * 32
+        self.device.jobs["device-1"] = ["corrupt", identity, "inactive", "present"]
+        state = self.top.status("device-1")
+        self.assertTrue(state["state_corrupt"])
+        self.assertTrue(state["connected"])
+        self.assertFalse(state["running"])
+        for key in ("count", "target_count", "interval", "bytes", "remote_path"):
+            self.assertIsNone(state[key])
+        self.error(409, self.top.pull, "device-1", identity)
+        self.assertFalse(any(args[0] == "pull" for _, args in self.device.commands))
+        self.assertTrue(self.top.clear("device-1", identity)["remote_cleaned"])
+        self.assertNotEqual(self.top.start("device-1")["id"], identity)
+        for raw in (f"corrupt\n{identity}\nfree\npresent", "corrupt\n../x\ninactive\npresent",
+                    f"corrupt\n{identity}\ninactive\npresent\nextra"):
+            self.error(502, self.top._decode, "device-1", raw)
+
+    def test_corrupt_unconfirmed_keeps_stop_but_blocks_start_and_clear(self):
+        identity = "c" * 32
+        self.device.jobs["device-1"] = ["corrupt", identity, "unconfirmed", "present"]
+        state = self.top.status("device-1")
+        self.assertFalse(state["connected"])
+        self.assertTrue(state["running"])
+        self.error(409, self.top.start, "device-1")
+        with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+            self.error(504, self.top.stop, "device-1", identity)
+            self.error(504, self.top.clear, "device-1", identity)
+        actions = [args[0] for _, args in self.device.commands]
+        self.assertIn("stop", actions)
+        self.assertNotIn("clear", actions)
+        self.assertNotIn("start", actions)
+
+    def test_corrupt_state_preserves_existing_local_archive_after_restart(self):
+        state = self.pulled()
+        identity = state["id"]
+        self.device.jobs["device-1"] = ["corrupt", identity, "inactive", "present"]
+        restored = self.controller()
+        state = restored.status("device-1")
+        self.assertTrue(state["archive"])
+        self.assertIn("无法核对", state["warning"])
+        self.assertNotIn("None", state["warning"])
+        self.assertEqual(restored.archive_path(identity).read_bytes(), RAW)
+        restored.clear("device-1", identity)
+        self.assertEqual(restored.archive_path(identity).read_bytes(), RAW)
 
     def test_clear_without_local_archive_does_not_invent_one(self):
         identity = self.finished()
@@ -944,9 +1005,10 @@ class TopCaptureTests(unittest.TestCase):
                                 dict(task, capture_id="../outside")):
                     self.assertEqual(client.post(url, json=invalid).status_code, 422)
                 self.assertEqual(client.post(url, json=dict(task, capture_id="f" * 32)).status_code, 409)
-            self.assertEqual(client.post("/api/top/clear", json=task).status_code, 409)
             self.device.stop_delay = -1
             with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+                self.assertEqual(client.post("/api/top/clear", json=task).status_code, 504)
+                self.assertFalse(any(args[0] == "clear" for _, args in self.device.commands))
                 self.assertEqual(client.post("/api/top/pull", json=task).status_code, 504)
             self.device.stop_delay = 0
             self.adb.devices.return_value = []
@@ -1056,7 +1118,9 @@ class DeviceScriptTests(unittest.TestCase):
                                    "MAX_BYTES=1000000000", "MAX_BYTES=" + str(limit)).replace(
                                        "PROC=/proc", "PROC=" + shlex.quote(str(self.proc))).replace(
                                            '[ "$DIR/worker.lock" -ef /proc/$$/fd/0 ]',
-                                           'same_stdin "$DIR/worker.lock"'))
+                                           'same_stdin "$DIR/worker.lock"').replace(
+                                               '[ "$DIR/worker.lock" -ef /proc/self/fd/0 ]',
+                                               'same_stdin "$DIR/worker.lock"'))
 
     def worker(self, limit=MAX_ARCHIVE_BYTES, target=1, interval=1):
         (self.job / "worker.lock").touch()
@@ -1172,6 +1236,14 @@ class DeviceScriptTests(unittest.TestCase):
         )
         self.command("top", shlex.quote(sys.executable) + " -c " + shlex.quote(code) +
                      '; cat "$TOP_FIXTURE"')
+        # Warm the newly created executable wrappers before timing the cadence.
+        # On macOS their first execution can delay entry into the Python top
+        # mock by >0.4 s, although the worker's first deadline already started.
+        # That cold-start delay shortens the measured first-to-last mock span.
+        subprocess.run(["timeout", "-s", "KILL", "10", "sh", "-c",
+                        "ulimit -f 8192 || exit 1; exec top -b -n 1 -d 1"],
+                       env=self.env, capture_output=True, check=True, timeout=8)
+        starts.write_text("")
         self.assertEqual(self.worker(target=4)[1], "completed")
         times = list(map(float, starts.read_text().splitlines()))
         # Old finish-then-sleep loop takes at least 4.2 s for these three gaps.
@@ -1902,6 +1974,317 @@ class DeviceScriptTests(unittest.TestCase):
                         (self.proc / '1/fd/7').symlink_to('/dev/null')
                     self.scan_legacy(1)
 
+    def test_corrupt_idle_status_and_launch_leave_old_files_untouched(self):
+        self.orphan()
+        state = b"\0" * 81
+        (self.job / "state").write_bytes(state)
+        archive = (self.job / "raw.txt").read_bytes()
+        inode = (self.job / "worker.lock").stat().st_ino
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(status.stdout.splitlines(),
+                         ["corrupt", self.identity, "inactive", "present"])
+        identity = "e" * 32
+        job = self.root / identity
+        self.command("timeout", 'sleep 1; exit 124')
+        self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
+        launched = self.shell("launch", identity, "1", "1", "")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        self.assertEqual((self.root / "current").read_text(), identity)
+        self.assertEqual((self.job / "state").read_bytes(), state)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+        self.assertEqual((self.job / "worker.lock").stat().st_ino, inode)
+        self.assertFalse((self.job / "done").exists())
+
+    def test_corrupt_live_lock_blocks_launch_clear_but_allows_stop(self):
+        import fcntl
+        self.orphan()
+        (self.job / "state").write_bytes(b"\0" * 81)
+        archive = (self.job / "raw.txt").read_bytes()
+        with (self.job / "worker.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.shell("status").stdout.splitlines(),
+                             ["corrupt", self.identity, "unconfirmed", "present"])
+            self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+            self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+            self.assertTrue((self.job / "stop").is_file())
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+        self.assertFalse((self.job / "done").exists())
+        self.assertFalse((self.root / ("e" * 32)).exists())
+
+    def test_corrupt_missing_linked_lock_and_bad_archive_block_bypass(self):
+        self.orphan(legacy=True)
+        (self.job / "state").write_bytes(b"broken")
+        archive = (self.job / "raw.txt").read_bytes()
+        for kind in ("missing", "linked", "archive"):
+            with self.subTest(kind=kind):
+                if kind == "linked":
+                    (self.job / "worker.lock").symlink_to(self.fixture)
+                elif kind == "archive":
+                    (self.job / "worker.lock").rename(self.job / "saved-link")
+                    (self.job / "worker.lock").touch()
+                    (self.job / "archive_name").write_text("../fixture")
+                self.assertEqual(self.shell("status").stdout.splitlines()[2], "unconfirmed")
+                self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+                self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+                self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+                self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+                self.assertEqual(self.fixture.read_bytes(), TOP)
+
+    def test_terminal_state_with_live_lock_is_unconfirmed(self):
+        import fcntl
+        self.orphan(status="completed")
+        (self.job / "done").write_text(self.identity)
+        archive = (self.job / "raw.txt").read_bytes()
+        with (self.job / "worker.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
+            self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+
+    def test_terminal_publication_during_busy_recovery_is_unconfirmed(self):
+        import fcntl
+        import sys
+        self.orphan()
+        archive = (self.job / "raw.txt").read_bytes()
+        # Publish terminal state exactly when recovery attempts the busy lock.
+        # The parent retains the real lifetime lock through status and decode.
+        self.command("flock", shlex.quote(sys.executable) + " -c " + shlex.quote(
+            "import fcntl,os,sys\nfrom pathlib import Path\n"
+            f"job=Path({str(self.job)!r})\n"
+            "if os.fstat(0).st_ino == (job/'worker.lock').stat().st_ino:\n"
+            " p=job/'state'; fields=p.read_text().splitlines()\n"
+            " fields[1]='completed'; fields[9]='101'\n"
+            " p.write_text('\\n'.join(fields)+'\\n')\n"
+            " (job/'done').write_text(fields[0]+'\\n')\n"
+            "try: fcntl.flock(0, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "except BlockingIOError: sys.exit(1)"
+        ))
+        with (self.job / "worker.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.shell("status")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines()[1], "completed")
+            self.assertEqual(result.stdout.splitlines()[-1], "unconfirmed")
+            decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout)
+            self.assertTrue(decoded["running"])
+            self.assertFalse(decoded["connected"])
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+        self.assertNotEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
+
+    def test_legacy_terminal_publication_during_busy_recovery_is_unconfirmed(self):
+        self.orphan(legacy=True)
+        # Deterministic legacy scan result: a writer remains while state changes.
+        source = self.script.read_text().replace("MODE=$1\n", """legacy_quiet() {
+    sed s/running/completed/ "$DIR/state" > "$DIR/state.new"
+    mv "$DIR/state.new" "$DIR/state"
+    printf '%s\\n' "$ID" > "$DIR/done"
+    return 1
+}
+MODE=$1
+""")
+        self.script.write_text(source)
+        result = self.shell("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[1], "completed")
+        self.assertEqual(result.stdout.splitlines()[-1], "unconfirmed")
+
+    def test_numeric_identity_corruption_never_recovers_archive(self):
+        import fcntl
+        self.identity = "0" * 31 + "1"
+        self.job = self.root / self.identity
+        self.job.mkdir()
+        self.orphan()
+        fields = (self.job / "state").read_text().splitlines()
+        archive = (self.job / "raw.txt").read_bytes()
+        inode = (self.job / "worker.lock").stat().st_ino
+        for bad_id in ("1", "01", "0" * 30 + "1", "0" * 32 + "1"):
+            with self.subTest(identity=bad_id):
+                fields[0] = bad_id
+                state = "\n".join(fields) + "\n"
+                (self.job / "state").write_text(state)
+                for busy in (False, True):
+                    with (self.job / "worker.lock").open("r+") as lock:
+                        if busy:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        result = self.shell("status")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.splitlines(), ["corrupt", self.identity,
+                                         "unconfirmed" if busy else "inactive", "present"])
+                    self.assertEqual((self.job / "state").read_text(), state)
+                    self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+                    self.assertEqual((self.job / "worker.lock").stat().st_ino, inode)
+                    self.assertFalse((self.job / "done").exists())
+        fields[0] = self.identity
+        fields[1] = "completed"
+        (self.job / "state").write_text("\n".join(fields) + "\n")
+        (self.job / "done").write_text(self.identity)
+        result = self.shell("status")
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout)
+        self.assertEqual(decoded["id"], self.identity)
+        self.assertFalse(decoded["state_corrupt"])
+
+    def test_missing_final_newline_uses_corrupt_lock_protocol(self):
+        import fcntl
+        self.orphan(status="completed")
+        (self.job / "done").write_text(self.identity)
+        state = (self.job / "state").read_bytes()[:-1]
+        (self.job / "state").write_bytes(state)
+        archive = (self.job / "raw.txt").read_bytes()
+        inode = (self.job / "worker.lock").stat().st_ino
+        with (self.job / "worker.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.shell("status").stdout.splitlines(),
+                             ["corrupt", self.identity, "unconfirmed", "present"])
+            self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+            self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+        result = self.shell("status")
+        self.assertEqual(result.stdout.splitlines(),
+                         ["corrupt", self.identity, "inactive", "present"])
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout)
+        self.assertFalse(decoded["running"])
+        self.assertTrue(decoded["state_corrupt"])
+        job = self.root / ("e" * 32)
+        self.command("timeout", 'sleep 1; exit 124')
+        self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
+        result = self.shell("launch", job.name, "1", "1", "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.job / "state").read_bytes(), state)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+        self.assertEqual((self.job / "worker.lock").stat().st_ino, inode)
+
+    def test_shell_and_python_state_constraints_agree(self):
+        import fcntl
+        self.orphan(status="completed")
+        (self.job / "done").write_text(self.identity)
+        baseline = (self.job / "state").read_text().splitlines()
+        archive = (self.job / "raw.txt").read_bytes()
+        invalid = [(2, "10000001"), (2, "00000000001"),
+                   (3, "0"), (3, "100001"), (3, "0000001"),
+                   (4, "1." + "0" * 23), (4, "3601"),
+                   (5, "00000000000"), (5, str(MAX_ARCHIVE_BYTES + 1)),
+                   (6, "unknown_error"), (7, "a"), (7, "ff"),
+                   (7, "c080"), (7, "eda080"), (7, "f4908080"),
+                   (7, "e4b8"), (7, "80"), (7, "c241"),
+                   (7, "61" * 121), (7, "f09f9880" * 121),
+                   (8, "0000000000000"), (9, "-1")]
+        valid = [(2, "10000000"), (2, "0000000001"),
+                 (3, "100000"), (3, "000001"), (3, "-1"),
+                 (4, "1." + "0" * 22), (4, "3600"),
+                 (5, str(MAX_ARCHIVE_BYTES)), (6, "clock_failed"),
+                 (7, ""), (7, "00"), (7, "7f"), (7, "c280"),
+                 (7, "e0a080"), (7, "ed9fbf"), (7, "f0908080"),
+                 (7, "f48fbfbf"), (7, "f09f9880" * 120),
+                 (8, "999999999999")]
+        decoder = TopCapture.__new__(TopCapture)
+        for expected_valid, cases in ((False, invalid), (True, valid)):
+            for index, value in cases:
+                with self.subTest(valid=expected_valid, field=index, value=value):
+                    fields = baseline.copy()
+                    fields[index] = value
+                    state = "\n".join(fields) + "\n"
+                    (self.job / "state").write_text(state)
+                    if not expected_valid:
+                        with self.assertRaises(AdbError):
+                            decoder._decode("device-1", state + "102\n")
+                    for busy in (False, True):
+                        with (self.job / "worker.lock").open("r+") as lock:
+                            if busy:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            result = self.shell("status")
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            decoded = decoder._decode("device-1", result.stdout)
+                            self.assertEqual(decoded.get("state_corrupt", False), not expected_valid)
+                            self.assertEqual(decoded["running"], busy)
+                            self.assertEqual(decoded["connected"], not busy)
+                            self.assertEqual(decoded["id"], self.identity)
+                    self.assertEqual((self.job / "state").read_text(), state)
+                    self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+
+    def test_state_inspection_failures_never_allow_bypass(self):
+        self.orphan()
+        (self.job / "state").write_bytes(b"broken")
+        archive = (self.job / "raw.txt").read_bytes()
+        original_awk = (self.bin / "awk").read_text()
+        for kind in ("awk", "wc", "unreadable", "linked"):
+            with self.subTest(kind=kind):
+                if kind == "awk":
+                    self.command("awk", 'case "$*" in */state) exit 2;; *) exec /usr/bin/awk "$@";; esac')
+                elif kind == "wc":
+                    (self.bin / "awk").write_text(original_awk)
+                    self.command("wc", 'n=$(/usr/bin/wc "$@") || exit 2; '
+                                 'if [ "$n" -eq 6 ]; then exit 2; fi; echo "$n"')
+                elif kind == "unreadable":
+                    self.command("wc", 'exec /usr/bin/wc "$@"')
+                    (self.job / "state").chmod(0)
+                else:
+                    (self.job / "state").chmod(0o600)
+                    (self.job / "state").rename(self.job / "saved-state")
+                    (self.job / "state").symlink_to(self.job / "saved-state")
+                self.assertEqual(self.shell("status").stdout.splitlines()[2], "unconfirmed")
+                self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+                self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+                self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+                self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+                self.assertFalse((self.job / "done").exists())
+
+    def test_corrupt_clear_holds_locks_and_preserves_metadata(self):
+        import sys
+        self.orphan()
+        (self.job / "state").write_bytes(b"\0" * 81)
+        for name in ("sample", "header"):
+            (self.job / name).write_bytes(b"unfinished")
+        historical = self.root / ("a" * 32)
+        historical.mkdir()
+        for name in ("state", "raw.txt", "sample", "header", "worker.lock"):
+            (historical / name).write_bytes((self.job / name).read_bytes())
+        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+        preserved = [self.root / "current", self.root / "control.lock", self.script]
+        preserved += [job / name for job in (historical, self.job) for name in ("state", "worker.lock")]
+        before = {p: (p.read_bytes(), p.stat().st_ino) for p in preserved}
+        self.command("truncate", shlex.quote(sys.executable) + " -c " + shlex.quote(
+            "import fcntl,sys\nfrom pathlib import Path\n"
+            "p=Path(sys.argv[2])\n"
+            "for lock in (p.parent/'worker.lock', p.parent.parent/'control.lock'):\n"
+            " with lock.open('r') as f:\n"
+            "  try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "  except BlockingIOError: pass\n"
+            "  else: raise AssertionError('lock not held: '+str(lock))\n"
+            "with p.open('r+b') as f: f.truncate(int(sys.argv[1]))"
+        ) + ' "$2" "$3"')
+        result = self.shell("clear", self.identity)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for p, expected in before.items():
+            self.assertEqual((p.read_bytes(), p.stat().st_ino), expected)
+        for job in (historical, self.job):
+            for name in ("raw.txt", "sample", "header"):
+                self.assertEqual((job / name).stat().st_size, 0)
+            self.assertTrue((job / "cleaned").is_file())
+            self.assertFalse((job / "done").exists())
+        self.assertEqual(self.shell("status").stdout.splitlines(),
+                         ["corrupt", self.identity, "inactive", "cleaned"])
+
+    def test_historical_live_lock_and_stale_identity_prevent_corrupt_clear(self):
+        import fcntl
+        self.orphan()
+        (self.job / "state").write_bytes(b"broken")
+        historical = self.root / ("e" * 32)
+        historical.mkdir()
+        (historical / "state").write_bytes(b"broken")
+        (historical / "worker.lock").touch()
+        (historical / "raw.txt").write_bytes(b"still writing")
+        original = (self.job / "raw.txt").read_bytes()
+        self.assertNotEqual(self.shell("clear", "f" * 32).returncode, 0)
+        with (historical / "worker.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+            self.assertEqual((self.job / "raw.txt").read_bytes(), original)
+            self.assertEqual((historical / "raw.txt").read_bytes(), b"still writing")
+            self.assertFalse((self.job / "cleaned").exists())
+
     def test_recovery_rejects_short_archive_invalid_state_and_symlink(self):
         self.orphan()
         (self.job / "raw.txt").write_bytes(b"short")
@@ -1911,7 +2294,8 @@ class DeviceScriptTests(unittest.TestCase):
         self.orphan()
         state = (self.job / "state").read_text()
         (self.job / "state").write_text(state.replace(str(len(RAW)), "-1"))
-        self.assertNotEqual(self.shell("status").returncode, 0)
+        self.assertEqual(self.shell("status").stdout.splitlines(),
+                         ["corrupt", self.identity, "inactive", "present"])
         (self.job / "state").write_text(state)
         (self.job / "raw.txt").rename(self.job / "safe-archive")
         (self.job / "raw.txt").symlink_to(self.fixture)

@@ -45,6 +45,12 @@ main{max-width:none}
 @media print{.focus-table .measured td.budget-high{color:#b42318}.focus-table .measured td.budget-low{color:#18743b}}
 .focus-table tbody tr:hover{box-shadow:inset 0 0 0 1px #99aacd50}.focus-table th button{width:100%;line-height:1.5}
 @media print{.focus-table{min-width:0}.focus-table .focus-identity{background:#fff;color:#222}.focus-table .background{background:#eef5ff;color:#17497a}.focus-table .foreground{background:#f6efff;color:#63358a}.focus-table .measured{background:#fff;color:#222}.focus-identity span{color:#555}}
+.overlay-tooltip{display:flex;flex-direction:column;width:min(560px,calc(100vw - 28px));max-height:calc(100vh - 28px);white-space:normal;font:12px/1.5 system-ui,-apple-system,sans-serif;color:#e8eeff}
+.overlay-tooltip-heading{flex-shrink:0;padding:12px 14px;border-bottom:1px solid #99aacd33;color:#bdd6ff;font-size:12px;overflow-wrap:anywhere}
+.overlay-tooltip-list{min-height:0;overflow:auto;overscroll-behavior:contain;padding:4px 14px 8px;scrollbar-width:thin;scrollbar-color:#60759b #172033}
+.overlay-tooltip-row{display:grid;grid-template-columns:8px minmax(0,1fr) max-content;align-items:baseline;gap:8px;padding:5px 0;border-bottom:1px solid #99aacd14}
+.overlay-tooltip-row:last-child{border-bottom:0}.overlay-tooltip-row.is-reference{background:#6caaff0a}
+.overlay-tooltip-dot{width:7px;height:7px;border-radius:50%;align-self:start;margin-top:6px}.overlay-tooltip-name{min-width:0;overflow-wrap:anywhere}.overlay-tooltip-value{white-space:nowrap;text-align:right;font-weight:600;font-variant-numeric:tabular-nums;color:#fff}.overlay-tooltip-value.is-missing{color:#b7c2d6;font-weight:400}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 @media(max-width:800px){main{padding:18px 12px}h1{font-size:24px}.panel{padding:12px}.charts,.merge-grid{grid-template-columns:1fr}.chart{height:330px}.chart.tall{height:740px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.stat-grid{grid-template-columns:1fr 1fr}.segment-heading h2{font-size:18px;margin-bottom:6px}}
 @media(max-width:480px){.stat-grid{grid-template-columns:1fr}.controls label{flex-wrap:wrap}}

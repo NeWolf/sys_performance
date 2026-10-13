@@ -4,11 +4,12 @@ import hashlib
 import threading
 import zlib
 
+import perf_report_compact
 from perf_report_data import _progress_reporter, build_report_data
 from perf_report_ui import CSS, JS, REPORT_CSP, render_document
 
 # Bump when Python report/statistics semantics change; assets/CSP invalidate automatically.
-REPORT_CACHE_VERSION = "23:" + hashlib.sha256(
+REPORT_CACHE_VERSION = "26:" + hashlib.sha256(
     (CSS + "\0" + JS + "\0" + REPORT_CSP).encode("utf-8")).hexdigest()
 # Bounded process-wide locks also coalesce requests through separate Store instances.
 _REPORT_LOCKS = tuple(threading.Lock() for _ in range(64))
@@ -26,8 +27,13 @@ def timestamp(value, *, local=False):
         return str(value) + " ms"
 
 
-def render_report(store, session_id, progress=None, cancelled=None):
+def render_report(store, session_id, progress=None, cancelled=None, *, style="default"):
     """Reuse a durable complete report; only successful generation is published."""
+    if style not in ("default", "compact"):
+        raise ValueError("未知报告样式")
+    table = "report_compact_cache" if style == "compact" else "report_cache"
+    version = REPORT_CACHE_VERSION + ":" + perf_report_compact.CACHE_VERSION if style == "compact" else REPORT_CACHE_VERSION
+    renderer = perf_report_compact.render_document if style == "compact" else render_document
     report = _progress_reporter(progress, cancelled)
     key = (str(store.path.resolve()), session_id)
     lock = _REPORT_LOCKS[hash(key) % len(_REPORT_LOCKS)]
@@ -40,8 +46,8 @@ def render_report(store, session_id, progress=None, cancelled=None):
             if not db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
                 raise KeyError(session_id)
             cached = db.execute(
-                "SELECT document FROM report_cache WHERE session=? AND version=?",
-                (session_id, REPORT_CACHE_VERSION)).fetchone()
+                f"SELECT document FROM {table} WHERE session=? AND version=?",
+                (session_id, version)).fetchone()
         if cached:
             report("read_cache")
             try:
@@ -51,21 +57,21 @@ def render_report(store, session_id, progress=None, cancelled=None):
             else:
                 report("complete")
                 return document
-        # Preserve the original two-argument call for callers without progress.
-        data = (build_report_data(store, session_id) if progress is None and cancelled is None else
-                build_report_data(store, session_id, progress=progress, cancelled=cancelled))
+        # Both styles need the complete system stream for per-cycle overlays.
+        data = build_report_data(store, session_id, progress=progress,
+                                 cancelled=cancelled, include_full_system=True)
         report("render")
-        document = render_document(data)
+        document = renderer(data)
         report("compress")
         compressed = zlib.compress(document.encode("utf-8"))
         report("save")
         with store.connect() as db:
             # One atomic replacement, guarded against concurrent session deletion.
             saved = db.execute(
-                "INSERT INTO report_cache(session,version,document) "
+                f"INSERT INTO {table}(session,version,document) "
                 "SELECT id,?,? FROM sessions WHERE id=? "
                 "ON CONFLICT(session) DO UPDATE SET version=excluded.version,document=excluded.document",
-                (REPORT_CACHE_VERSION, compressed, session_id))
+                (version, compressed, session_id))
             if not saved.rowcount:
                 raise KeyError(session_id)
             report("save")  # Cancellation before commit leaves the previous cache intact.

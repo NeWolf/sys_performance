@@ -10,13 +10,15 @@ type Status = {
 type PullResult = { id: string; duplicate: boolean; archive: string; files: string[] }
 type TopStatus = {
   id: string | null; status: string; running: boolean; stopping: boolean; importing: boolean
-  count: number; target_count: number; interval: number; serial: string | null
+  count: number | null; target_count: number | null; interval: number | null; serial: string | null
+  state_corrupt?: boolean
   error: string | null; warning?: string | null; archive: string | null; session_id: string | null
-  bytes: number; max_bytes: number; remote_path: string | null
+  bytes: number | null; max_bytes: number; remote_path: string | null
   connected: boolean; connection_error: string | null; remote_cleaned: boolean
   started_at: number | null; ended_at: number | null; elapsed_seconds: number | null
 }
 const topErrors: Record<string, string> = {
+  state_corrupt: '旧任务状态损坏，采样数及日志大小未知；确认锁空闲后可重新采集，或手动安全清理。不恢复损坏日志',
   size_limit: '已达到 1GB 文件上限，采集已停止',
   top_failed_or_timeout: 'Top 执行失败或超时', sample_limit: '单次样本超过限额',
   invalid_top: 'Top 输出无法识别', disk_error: '设备文件写入失败，请检查空间与权限',
@@ -25,6 +27,7 @@ const topErrors: Record<string, string> = {
   detach_failed: '设备后台任务启动失败', interrupted: '设备任务意外中断',
 }
 const topLabels: Record<string, string> = {
+  corrupt: '状态损坏',
   idle: '未开始', starting: '启动中', running: '采集中', stopping: '停止中',
   stopped: '已停止', completed: '采集完成', importing: '导入中', imported: '已导入', error: '异常',
 }
@@ -75,9 +78,9 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
     status: Boolean(serial),
     start: topReady && validTopSettings && !topActive,
     stop: topRecoverable,
-    pull: topRecoverable && !topStatus?.remote_cleaned
+    pull: topRecoverable && !topStatus?.remote_cleaned && !topStatus?.state_corrupt
       && Boolean(topStatus?.bytes || topStatus?.running || topStatus?.stopping || !topReady),
-    clear: topReady && Boolean(topStatus?.id) && !topActive && !topStatus?.remote_cleaned,
+    clear: topRecoverable && !topStatus?.remote_cleaned,
     import: topCurrent && Boolean(topStatus?.id && topStatus.archive) && !topActive,
     archive: topCurrent && Boolean(topStatus?.id && topStatus.archive) && !topActive,
   }
@@ -210,13 +213,13 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   async function performTop(action: 'status' | 'start' | 'stop' | 'pull' | 'clear' | 'import' | 'archive') {
     if (locked || running.current || !topAllowed[action]) return
     const captureId = topStatus?.id
-    if (action === 'start' && !window.confirm(`将在 ${serial} 推送脚本并开始设备端 Top 采集（${topInterval} 秒，${topCount === -1 ? '持续采集直到手动停止或达到上限' : `${topCount} 次`}）。无需 sysmonitor 或 root，不修改其采集开关。断连、关闭页面或退出本地服务不影响设备采集。原始文件最多 1GB（1,000,000,000 字节），到达上限前停止并保留完整样本。确认开始？`)) return
-    if (action === 'stop' && !window.confirm(`确认停止 ${serial} 的 Top 采集？已完成样本将保留，不影响 sysmonitor 采集。`)) return
+    if (action === 'start' && !window.confirm(`将在 ${serial} 推送脚本并开始设备端 Top 采集（${topInterval} 秒，${topCount === -1 ? '持续采集直到手动停止或达到上限' : `${topCount} 次`}）。无需 sysmonitor；操作前会请求 ADB root，不修改其采集开关。断连、关闭页面或退出本地服务不影响设备采集。原始文件最多 1GB（1,000,000,000 字节），到达上限前停止并保留完整样本。确认开始？`)) return
+    if (action === 'stop' && !window.confirm(`确认停止 ${serial} 的 Top 采集？${topStatus?.state_corrupt ? '旧任务状态损坏，仅确认停止，不恢复日志或保证样本完整性。' : '已完成样本将保留。'}不影响 sysmonitor 采集。`)) return
     if (action === 'pull') {
       const message = `将先安全停止 ${serial} 尚未结束的 Top 采集，确认停止后拉取日志并分析；停止失败则不拉取。成功后将切换会话并放弃未保存配置，设备日志和本地归档均保留。是否继续？`
       if (!guard.confirm(message) || (!guard.dirty && !window.confirm(message))) return
     }
-    if (action === 'clear' && !window.confirm(`将永久清空设备 ${serial} 上本工具产生的全部已结束 Top 日志（含历史任务），释放日志空间，保留任务元数据。当前任务：${captureId}。未拉取的日志将无法恢复，请先备份。不会停止正在运行的任务，也不会清理 SysMonitor 日志或本地已拉取、已导入的数据。确认清理？`)) return
+    if (action === 'clear' && !window.confirm(`将永久清空设备 ${serial} 上本工具产生的全部 Top 日志（含当前及历史任务），释放日志空间，保留任务元数据。当前任务：${captureId}。未拉取的日志将无法恢复，请先备份。会先请求停止当前任务，只有确认停止且所有待清理任务均无写入者后才清理；无法确认则不清理，不删除锁文件。不会清理 SysMonitor 日志或本地已拉取、已导入的数据。确认清理？`)) return
     if (action === 'import' && !guard.confirm('导入 Top 日志后将切换分析会话并放弃未保存配置，是否继续？')) return
     await mutation.run(async (signal) => {
       running.current = true
@@ -278,7 +281,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
             if (signal.aborted) return
             setTopStatus(next)
             setTopPollError('')
-            setNotice(action === 'clear' ? '设备上的 Top 日志已清空；SysMonitor 日志和本地归档保留，本地归档仍可导入或下载。' : action === 'start' ? '设备端 Top 任务已启动，断连或退出本地服务不会停止。可随时使用“拉取日志并分析”，自动安全停止并保存日志。' : '已确认停止 Top 采集，已完成样本保留，可拉取日志并分析。')
+            setNotice(action === 'clear' ? '设备上的 Top 日志已清空；SysMonitor 日志和本地归档保留，本地归档仍可导入或下载。' : action === 'start' ? '设备端 Top 任务已启动，断连或退出本地服务不会停止。可随时使用“拉取日志并分析”，自动安全停止并保存日志。' : next.state_corrupt ? '已确认采集锁空闲；旧任务状态损坏，无法保证样本完整。可重新采集或安全清理。' : '已确认停止 Top 采集，已完成样本保留，可拉取日志并分析。')
           }
         }
       } finally {
@@ -332,7 +335,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       <p className="muted">按本地时间及设备 PID 记录，每 5 秒随状态刷新；采集开关关闭或进程退出后停止计时。记录仅在本地服务运行期间保留，超过 24 小时在下次确认状态时清除；不会停止设备采集或删除日志。</p>
       <details><summary>设备日志文件</summary><pre>{current.files || '暂无日志文件'}</pre></details></div>}
     <section aria-label="独立 Top 采集">
-      <div className="section-heading"><div><h2>Top 采集</h2><p className="muted">自动推送脚本到设备独立运行，无需 sysmonitor 或 root；使用上方所选 ADB 设备。</p></div></div>
+      <div className="section-heading"><div><h2>Top 采集</h2><p className="muted">自动推送脚本到设备独立运行，无需 sysmonitor；操作前会请求 ADB root；使用上方所选 ADB 设备。</p></div></div>
       <details>
         <summary>高级采集设置</summary>
         <div className="device-controls">
@@ -367,17 +370,17 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       {!topStatus && !topPollError && <p role="status">{serial ? '正在查询 Top 状态…' : '请选择设备以查询 Top 任务。'}</p>}
       {topStatus && <div className="device-status" role="status">
         {topCleared ? <>
-          <p>Top 状态：未采集 · 设备：{topStatus.serial || '—'}</p>
-          <p>设备日志已清理，点击“开始采集”可进行新的采集。</p>
+          <p>Top 状态：设备日志已清理 · 设备：{topStatus.serial || '—'}</p>
+          <p>{topReady ? '已确认停止，可点击“开始采集”进行新的采集。' : '正在确认设备状态，确认停止后才能开始新采集。'}</p>
           {topStatus.archive && <p>已拉取的本地归档仍保留，可在“更多操作”中下载或导入分析。</p>}
         </> : <>
-        <p>Top 状态：{topLabels[topStatus.status] || topStatus.status} · 设备：{topStatus.serial || '—'} · 已采样：{topStatus.count} / {topStatus.target_count === -1 ? '持续' : topStatus.target_count} · 间隔：{topStatus.interval} 秒</p>
-        <p>开始时间：{topStatus.started_at ? new Date(topStatus.started_at * 1000).toLocaleString('zh-CN', { hour12: false }) : topStatus.id ? '未记录（旧版任务）' : '—'} · 已采集时长：{topStatus.id ? formatCaptureDuration(topStatus.elapsed_seconds) : '—'}{(!connected || !topStatus.connected || topPollError) && topStatus.id ? '（最后已知）' : ''}</p>
-        <p>{topStatus.remote_cleaned ? '设备日志已清理 · 清理前大小' : '原始文件'}：{(topStatus.bytes / 1_000_000).toFixed(2)} / {(topStatus.max_bytes / 1_000_000).toFixed(0)} MB · {topStatus.archive ? '已拉取到本地' : topStatus.remote_cleaned ? '无本地归档' : '尚未拉取到本地'}</p>
+        <p>Top 状态：{topStatus.state_corrupt ? '状态损坏' : topLabels[topStatus.status] || topStatus.status} · 设备：{topStatus.serial || '—'} · 已采样：{topStatus.count ?? '未知'} / {topStatus.target_count === -1 ? '持续' : topStatus.target_count ?? '未知'} · 间隔：{topStatus.interval ?? '未知'} 秒</p>
+        <p>开始时间：{topStatus.started_at ? new Date(topStatus.started_at * 1000).toLocaleString('zh-CN', { hour12: false }) : topStatus.state_corrupt ? '未知（状态损坏）' : topStatus.id ? '未记录（旧版任务）' : '—'} · 已采集时长：{topStatus.id ? formatCaptureDuration(topStatus.elapsed_seconds) : '—'}{(!connected || !topStatus.connected || topPollError) && topStatus.id ? '（最后已知）' : ''}</p>
+        <p>{topStatus.remote_cleaned ? '设备日志已清理 · 清理前大小' : '原始文件'}：{topStatus.bytes === null ? '未知' : (topStatus.bytes / 1_000_000).toFixed(2)} / {(topStatus.max_bytes / 1_000_000).toFixed(0)} MB · {topStatus.archive ? '已拉取到本地' : topStatus.remote_cleaned ? '无本地归档' : '尚未拉取到本地'}</p>
         {topStatus.warning && <p className="banner warning">{topStatus.warning}</p>}
         {topStatus.remote_path && <p>设备路径：{topStatus.remote_path}</p>}
         </>}
-        {(!connected || !topStatus.connected || topPollError) && <p className="error">当前状态未确认，仅展示最后已知数据；不代表设备采集已停止。同设备在线时仍可重试停止或拉取日志并分析，由后端确认任务身份与停止结果。{topStatus.connection_error}</p>}
+        {(!connected || !topStatus.connected || topPollError) && <p className="error">当前状态未确认，仅展示最后已知数据；不代表设备采集已停止。同设备在线时仍可重试停止或安全清理，由后端确认任务身份与停止结果；未确认停止不会清理，也不能开始新采集。{topStatus.connection_error}</p>}
         {!topCleared && topStatus.error && <p className="error">{topErrors[topStatus.error] || topStatus.error}{topStatus.archive ? '；已拉取样本可下载或导入。' : !topStatus.remote_cleaned && topStatus.bytes ? '；可拉取日志并分析，自动确认停止并保留已完成样本。' :''}</p>}
       </div>}
     </section>

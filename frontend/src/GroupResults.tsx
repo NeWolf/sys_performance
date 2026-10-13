@@ -1,9 +1,9 @@
 import { useState } from 'react'
-import { formatNumber, formatStatistic, formatTime, groupPath, useResource } from './api'
+import { formatNumber, formatStatistic, formatTime, scaleMetric, groupPath, useResource } from './api'
 import type { GroupAnalysis, GroupResources, ProcessGroup } from './api'
 import { SeriesChart } from './Chart'
 
-function percent(value: number, cycles: number) { return cycles ? `${formatNumber(value / cycles * 100, 2)} %` : '—' }
+function percent(value: number, cycles: number) { return cycles ? `${formatNumber(scaleMetric(value, 100, cycles))} %` : '—' }
 
 export function GroupResults({ id, groups, selected, onSelect, revision, disabled }: {
   id: string; groups: ProcessGroup[]; selected: string; onSelect: (gid: string) => void; revision: number; disabled: boolean
@@ -37,19 +37,20 @@ function ResourceResults({ id, gid, revision, disabled }: { id: string; gid: str
       <p>{data.group.name} · 实测场景：{data.group.scene} · 段 {data.group.segment} · 闭区间 {data.group.start === null ? '不限' : formatTime(data.group.start)} → {data.group.end === null ? '不限' : formatTime(data.group.end)}</p>
       <p className="muted">平台：{data.settings.cpu_platform || '未配置'} · 单核 KDMIPS 系数：{formatNumber(data.settings.kdmips_per_core)}。K = 单核 CPU 百分比 ÷ 100 × 系数。前后台需求 Y/N 不代表实测场景；未标注的场景不推断归属，未采集场景显示 —。</p>
       <div className="table-scroll"><table><thead><tr><th rowSpan={2}>模块 / 用途</th><th rowSpan={2}>进程 / PID</th><th rowSpan={2}>服务分类 / 关联服务</th><th rowSpan={2}>前 / 后台需求</th>{['前台', '后台'].map((scene) => <th key={scene} colSpan={9}>{scene}实测</th>)}</tr><tr>{['前台', '后台'].flatMap((scene) => ['CPU 样本', 'CPU P95 %', 'P95 K', 'CPU 峰值 %', '峰值 K', 'RSS 峰值', '读取峰值 / 周期', '写入峰值 / 周期', '累计读 / 写'].map((label) => <th key={`${scene}:${label}`}>{label}</th>))}</tr></thead><tbody>
-        {data.rows.map(({ member, statistics: s, kdmips: k }) => <tr key={JSON.stringify([member.pid, member.name])}>
+        {data.rows.map(({ member, statistics: s }) => <tr key={JSON.stringify([member.pid, member.name])}>
           <td className="wrap-text">{data.group.name}<small>{member.purpose || '待填写'}</small><small>{member.process_type || '待填写'}</small></td><td className="wrap-text">{member.name}<small>PID {member.pid}</small></td><td className="wrap-text">{member.service_category}<small>{member.related_service || '待填写'}</small></td><td>{member.foreground} / {member.background}</td>
-          {['前台', '后台'].map((scene) => <ResourceCells key={scene} available={data.group.scene === scene} s={s} k={k} />)}
+          {['前台', '后台'].map((scene) => <ResourceCells key={scene} available={data.group.scene === scene} s={s} factor={data.settings.kdmips_per_core} />)}
         </tr>)}
       </tbody></table></div>
       {data.group.scene === '未标注' && <p className="banner warning">已保存组未标注场景；下面保留未归属的成员实测，不能填入前台或后台列。</p>}
-      {data.group.scene === '未标注' && <div className="table-scroll"><table><thead><tr><th>进程 / PID</th><th>CPU 样本</th><th>CPU P95 %</th><th>P95 K</th><th>CPU 峰值 %</th><th>峰值 K</th><th>RSS 峰值</th><th>读取峰值 / 周期</th><th>写入峰值 / 周期</th><th>累计读 / 写</th></tr></thead><tbody>{data.rows.map((row) => <tr key={JSON.stringify([row.member.pid, row.member.name])}><td>{row.member.name} / {row.member.pid}</td><ResourceCells available s={row.statistics} k={row.kdmips} /></tr>)}</tbody></table></div>}
+      {data.group.scene === '未标注' && <div className="table-scroll"><table><thead><tr><th>进程 / PID</th><th>CPU 样本</th><th>CPU P95 %</th><th>P95 K</th><th>CPU 峰值 %</th><th>峰值 K</th><th>RSS 峰值</th><th>读取峰值 / 周期</th><th>写入峰值 / 周期</th><th>累计读 / 写</th></tr></thead><tbody>{data.rows.map((row) => <tr key={JSON.stringify([row.member.pid, row.member.name])}><td>{row.member.name} / {row.member.pid}</td><ResourceCells available s={row.statistics} factor={data.settings.kdmips_per_core} /></tr>)}</tbody></table></div>}
       <p className="muted">{data.note} 成员独立统计不要求其他成员齐全；不可相加成员峰值或分位数。下方另列严格完整周期组总量。RSS 与 dmabuf 不相加。</p>
     </>}
   </section>
 }
 
-function ResourceCells({ available, s, k }: { available: boolean; s: GroupResources['rows'][number]['statistics']; k: GroupResources['rows'][number]['kdmips'] }) {
+function ResourceCells({ available, s, factor }: { available: boolean; s: GroupResources['rows'][number]['statistics']; factor: number | null }) {
+  const k = { p95: factor == null ? null : scaleMetric(s.cpu1c.p95, factor, 100), max: factor == null ? null : scaleMetric(s.cpu1c.max, factor, 100) }
   const values = [formatNumber(s.cpu1c.count, 0), formatNumber(s.cpu1c.p95), formatNumber(k.p95), formatNumber(s.cpu1c.max), formatNumber(k.max), formatStatistic(s.rss_kb.max, 'KB'), formatStatistic(s.rd_kb.max, 'KB'), formatStatistic(s.wr_kb.max, 'KB'), `${formatStatistic(s.rd_kb.total, 'KB')} / ${formatStatistic(s.wr_kb.total, 'KB')}`]
   return <>{values.map((value, index) => <td key={index}>{available ? value : '—'}</td>)}</>
 }
@@ -75,7 +76,7 @@ function KindResults({ id, gid, kind, revision, disabled }: { id: string; gid: s
       <div className="table-scroll"><table><thead><tr><th>指标 / 原始字段</th><th>有效周期</th><th>指标覆盖率</th><th>最小</th><th>均值</th><th>P95</th><th>P99</th><th>最大</th><th>增量累计</th></tr></thead><tbody>
         {entries.map(([key, item]) => <tr key={key}><td><strong>{item.label}</strong><small>{key}</small><small>{item.note}</small></td>
           <td>{formatNumber(item.count, 0)}</td><td>{percent(item.count, data.coverage.cycles)}</td>
-          {(['min', 'avg', 'p95', 'p99', 'max'] as const).map((stat) => <td key={stat}>{formatStatistic(item[stat], item.unit)}</td>)}
+          {(['min', 'avg', 'p95', 'p99', 'max'] as const).map((stat) => <td key={stat}>{formatStatistic(item[stat], item.unit, false, stat === 'avg')}</td>)}
           <td>{formatStatistic(item.total, item.unit, true)}</td></tr>)}
       </tbody></table></div>
       <label className="metric-select">全部数值指标趋势 <select disabled={disabled || !entries.length} value={selected?.[0] ?? ''} onChange={(event) => setField(event.target.value)}>
