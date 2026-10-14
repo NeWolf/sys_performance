@@ -69,7 +69,7 @@ class AdbController:
             device = next((row for row in self.devices() if row["serial"] == serial), None)
             if not device or device["state"] != "device":
                 raise AdbError("设备未连接、离线或尚未授权，请检查设备上的 USB 调试提示", 409)
-            yield
+            yield device
         finally:
             self.lock.release()
 
@@ -261,7 +261,7 @@ class AdbController:
             return self.snapshot(serial, root)
 
     def pull(self, serial, store, title=""):
-        with self.device(serial):
+        with self.device(serial) as device:
             root = self.root_mode(serial)
             if self.properties(serial)["test"] != "0" or self.pids(serial, root):
                 self._stop(serial, root)
@@ -285,5 +285,8 @@ class AdbController:
                 raise AdbError("设备没有可拉取的性能日志")
             with ExitStack() as stack:
                 sources = [(path.name, stack.enter_context(path.open("rb"))) for path in paths]
-                result = store.import_files(sources, title or "ADB 采集 " + serial)
+                started = self._capture_timing(serial, [], False)["started_at"]
+                result = store.import_files(sources, capture_method="SysMonitor",
+                                            device_name=device.get("model") or serial,
+                                            started_at=started * 1000 if started is not None else None)
             return dict(result, archive=str(folder), files=[path.name for path in paths])

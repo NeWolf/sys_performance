@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, apiResponse, errorMessage } from './api'
+import { api, apiResponse, downloadFilename, errorMessage } from './api'
 import { useEditGuard, useMutation } from './Editing'
 
 type Device = { serial: string; state: string; model: string }
@@ -63,7 +63,6 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
   const [topPollError, setTopPollError] = useState('')
   const [topInterval, setTopInterval] = useState(1)
   const [topCount, setTopCount] = useState(-1)
-  const [topTitle, setTopTitle] = useState('')
   const topPolling = useRef<Promise<void> | null>(null)
   const topActive = Boolean(topStatus?.running || topStatus?.stopping || topStatus?.importing)
   const topCleared = Boolean(topStatus?.remote_cleaned) && !topActive
@@ -234,8 +233,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
           if (!signal.aborted) { setTopStatus(next); setTopPollError('') }
         } else if (action === 'archive') {
           const response = await apiResponse(`/api/top/archive?${new URLSearchParams({ capture_id: captureId! })}`, { signal })
-          const filename = response.headers.get('Content-Disposition')?.match(/filename="?(Top\d{14}\.txt)"?(?:;|$)/)?.[1]
-          if (!filename) throw new Error('归档文件名无效，请更新程序后重试下载。')
+          const filename = downloadFilename(response, '.txt')
           const blob = await response.blob()
           if (signal.aborted) return
           const url = URL.createObjectURL(blob)
@@ -249,7 +247,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
           setNotice('Top 原始日志已触发浏览器下载。')
         } else {
           const body = action === 'start'
-            ? { confirm: true, serial, interval: topInterval, count: topCount, title: topTitle }
+            ? { confirm: true, serial, interval: topInterval, count: topCount }
             : action === 'import' ? { confirm: true, capture_id: captureId } : { confirm: true, serial, capture_id: captureId }
           const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal }
           if (action === 'import' || action === 'pull') {
@@ -335,13 +333,12 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       <p className="muted">按本地时间及设备 PID 记录，每 5 秒随状态刷新；采集开关关闭或进程退出后停止计时。记录仅在本地服务运行期间保留，超过 24 小时在下次确认状态时清除；不会停止设备采集或删除日志。</p>
       <details><summary>设备日志文件</summary><pre>{current.files || '暂无日志文件'}</pre></details></div>}
     <section aria-label="独立 Top 采集">
-      <div className="section-heading"><div><h2>Top 采集</h2><p className="muted">自动推送脚本到设备独立运行，无需 sysmonitor；操作前会请求 ADB root；使用上方所选 ADB 设备。</p></div></div>
+      <div className="section-heading"><div><h2>Top 采集</h2><p className="muted">自动推送脚本到设备独立运行，无需 sysmonitor；操作前会请求 ADB root；使用上方所选 ADB 设备。名称自动采用 Top_设备名称_开始时间（年月日时分）。</p></div></div>
       <details>
         <summary>高级采集设置</summary>
         <div className="device-controls">
           <label>采样间隔（秒）<input type="number" min={1} max={3600} step="any" value={topInterval} disabled={locked || topActive} onChange={(event) => setTopInterval(Number(event.target.value))} /></label>
           <label>采样次数（-1 持续）<input type="number" min={-1} max={100000} step={1} value={topCount} disabled={locked || topActive} onChange={(event) => setTopCount(Number(event.target.value))} /></label>
-          <label>会话名称<input value={topTitle} maxLength={120} placeholder="选填" disabled={locked || topActive} onChange={(event) => setTopTitle(event.target.value)} /></label>
         </div>
       </details>
       {!validTopSettings && <p className="error" role="alert">采样间隔须为 1–3600 秒；次数须为 -1 或 1–100000 的整数，请在高级采集设置中修改。</p>}

@@ -23,6 +23,37 @@ _SAMPLE_METRICS = tuple(dict.fromkeys(
         "cpu_capacity", "cpu_single_core", "cpu_idle", "mem_free_mb")
 
 
+def safe_filename(value, fallback="未知设备", max_bytes=220):
+    """A UTF-8 basename bounded for common Windows/macOS/Linux filesystems."""
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]', '_', value)
+    value = value.strip().strip('.').strip()
+    value = value.encode("utf-8")[:max_bytes].decode("utf-8", "ignore").rstrip('. ')
+    if not value:
+        return fallback
+    if re.match(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)", value, re.I):
+        value = ("_" + value).encode("utf-8")[:max_bytes].decode("utf-8", "ignore").rstrip('. ')
+    return value
+
+
+def capture_naming(method="本地导入", device_name="", started_at=None, first_ts=None):
+    if method not in ("SysMonitor", "Top", "本地导入"):
+        raise ValueError("不支持的采集方式")
+    device = safe_filename(device_name, max_bytes=180)
+    stamp, timestamp, source = "未知时间", None, "unknown"
+    for value, origin in ((started_at, "capture"), (first_ts, "first_record")):
+        if value is None:
+            continue
+        try:
+            date = datetime.fromtimestamp(value / 1000)
+            stamp = f"{date.year:04d}{date.month:02d}{date.day:02d}{date.hour:02d}{date.minute:02d}"
+        except (ValueError, OverflowError, OSError, TypeError):
+            continue
+        timestamp, source = value, origin
+        break
+    return dict(name=f"{method}_{stamp}", capture_method=method,
+                device_name=device, capture_started_at=timestamp, naming_time_source=source)
+
+
 def _metric_point(raw, extra_metrics=()):
     point = json.loads(raw)
     for field in (*_SAMPLE_METRICS, *extra_metrics):
@@ -174,6 +205,28 @@ class Store(GroupStore):
                 candidate="instr(name,'tcpdump')>0")
             db.commit()
             self._migrate_metric_precision(db)
+            db.commit()
+            self._migrate_capture_names(db)
+
+    @staticmethod
+    def _migrate_capture_names(db):
+        """Strip only recognized automatic device names; preserve recorded local time."""
+        migration = "capture_names_without_device_v1"
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM store_migrations WHERE name=?", (migration,)).fetchone():
+            return
+        for row in db.execute("SELECT id,name,summary FROM sessions"):
+            summary = json.loads(row["summary"])
+            method, device = summary.get("capture_method"), summary.get("device_name")
+            if method not in ("SysMonitor", "Top", "本地导入") or not isinstance(device, str):
+                continue
+            match = re.fullmatch(re.escape(f"{method}_{device}_") + r"([0-9]{12}|未知时间)", row["name"] or "")
+            if not match:
+                continue
+            db.execute("UPDATE sessions SET name=? WHERE id=?", (f"{method}_{match[1]}", row["id"]))
+            for table in ("report_cache", "report_compact_cache"):
+                db.execute(f"DELETE FROM {table} WHERE session=?", (row["id"],))
+        db.execute("INSERT INTO store_migrations VALUES (?)", (migration,))
 
     @staticmethod
     def _migrate_metric_precision(db):
@@ -260,7 +313,21 @@ class Store(GroupStore):
         with self.connect() as db:
             return db.execute("DELETE FROM sessions WHERE id=?", (session_id,)).rowcount > 0
 
-    def import_files(self, sources, title=""):
+    def import_files(self, sources, title="", *, capture_method="本地导入", device_name="", started_at=None,
+                     naming_snapshot=None):
+        # Only internal archive imports provide a previously validated snapshot.
+        # Keep its local-time name stable even if the service timezone changes.
+        if naming_snapshot is not None:
+            naming_snapshot = dict(naming_snapshot)
+            expected_keys = {"name", "capture_method", "device_name", "capture_started_at", "naming_time_source"}
+            if (set(naming_snapshot) != expected_keys
+                    or capture_method != "Top"
+                    or naming_snapshot["capture_method"] != capture_method
+                    or naming_snapshot["device_name"] != safe_filename(device_name, max_bytes=180)
+                    or not isinstance(naming_snapshot["name"], str)
+                    or naming_snapshot["name"] != safe_filename(naming_snapshot["name"])
+                    or not re.fullmatch(r"Top_(?:[0-9]{12}|未知时间)", naming_snapshot["name"])):
+                raise ValueError("归档命名快照无效")
         sources = sorted(sources, key=lambda source: rotation_key(source[0]))
         fingerprint = hashlib.sha256()
         unique_sources, seen = [], set()
@@ -306,7 +373,7 @@ class Store(GroupStore):
                 summary["timestamp_policy"] = "UTC 标记按 UTC；旧日志无时区按导入机器本地时区（含当日夏令时）解析"
                 summary["statistics_policy"] = "沿用 nearest-rank；缺周期/缺指标为 NULL，不采用原脚本插值及补零"
             db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (
-                session_id, title[:120] or "离线采集 " + datetime.now().strftime("%m-%d %H:%M"),
+                session_id, "",
                 datetime.now(timezone.utc).isoformat(), signature, "{}"))
             last_ts = None
             boot = None
@@ -368,7 +435,12 @@ class Store(GroupStore):
             if last_ts is not None and not cycle_has_s:
                 summary["orphan_cycles"] += 1
             summary.update(segments=segment + 1, cycles=cycle, first_ts=first_ts, last_ts=last_ts)
-            db.execute("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summary, ensure_ascii=False), session_id))
+            naming = naming_snapshot if naming_snapshot is not None else capture_naming(
+                capture_method, device_name, started_at, first_ts)
+            # Legacy callers may still send title; it no longer overrides automatic names.
+            summary.update({key: value for key, value in naming.items() if key != "name"})
+            db.execute("UPDATE sessions SET name=?, summary=? WHERE id=?",
+                       (naming["name"], json.dumps(summary, ensure_ascii=False), session_id))
         return {"id": session_id, "duplicate": False}
 
     @staticmethod

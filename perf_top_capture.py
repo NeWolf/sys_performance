@@ -13,6 +13,8 @@ import time
 import uuid
 
 from perf_adb import AdbError
+from perf_store import capture_naming, safe_filename
+from perf_top_parser import iter_top_records
 
 MAX_ARCHIVE_BYTES = 1_000_000_000
 CHUNK_BYTES = 64 * 1024
@@ -35,6 +37,8 @@ class TopCapture:
         self._import_done.set()
         self._capture_error = None
         self._archives = {}
+        self._archive_names = {}
+        self._device_names = {}
         self._states = {}
         self._state = self._empty()
         self.script = Path(__file__).with_name("device_top_capture.sh")
@@ -64,7 +68,8 @@ class TopCapture:
     def _device(self, serial):
         # Root once per public operation, under the shared device lock. Internal
         # stop polling must not restart adbd or reset its confirmation deadline.
-        with self.adb.device(serial):
+        with self.adb.device(serial) as device:
+            self._device_names[serial] = (device or {}).get("model") or serial
             try:
                 self.adb.run("-s", serial, "root", timeout=30)
                 self.adb.run("-s", serial, "wait-for-device", timeout=30)
@@ -254,6 +259,10 @@ class TopCapture:
                 if (0 < size <= MAX_ARCHIVE_BYTES
                         and (size == state["bytes"] or saved_warning or state["state_corrupt"]
                              or state["id"] in self._archives)):
+                    if (path.parent.is_symlink() or path.resolve().parent not in
+                            (self.archive_root, self.archive_root / state["id"])):
+                        raise AdbError("本地归档路径无效", 409)
+                    self._archive_naming(path, state)
                     self._archives[state["id"]] = path
                     state["archive"] = "/api/top/archive?capture_id=" + state["id"]
                     state["warning"] = state["warning"] or saved_warning
@@ -460,6 +469,7 @@ class TopCapture:
                         if created:
                             pending.unlink(missing_ok=True)
                 self._archives[capture_id] = path
+                self._archive_naming(path, state)
                 self._state["archive"] = "/api/top/archive?capture_id=" + capture_id
                 self._state["warning"] = warning
                 return dict(self._state)
@@ -483,12 +493,71 @@ class TopCapture:
         with self._lock:
             return self._archive_path_locked(capture_id)
 
-    @staticmethod
-    def archive_filename(path):
-        if re.fullmatch(r"Top[0-9]{14}\.txt", path.name):
-            return path.name
-        # Preserve legacy files in place but expose a readable name.
-        return "Top" + time.strftime("%Y%m%d%H%M%S", time.localtime(path.stat().st_mtime)) + ".txt"
+    def _archive_naming(self, path, state):
+        """Persist per-archive metadata, independent of the current device task."""
+        cached = self._archive_names.get(path)
+        if cached:
+            return dict(cached)
+        marker = path.with_suffix(".name.json")
+        if marker.is_symlink():
+            raise AdbError("本地归档命名记录无效", 409)
+        if marker.exists():
+            try:
+                with marker.open("rb") as stream:
+                    naming = json.loads(stream.read(4096))
+                if (not isinstance(naming, dict)
+                        or set(naming) != {"name", "capture_method", "device_name", "capture_started_at", "naming_time_source"}
+                        or naming["capture_method"] != "Top"
+                        or not isinstance(naming["name"], str)
+                        or not isinstance(naming["device_name"], str)
+                        or naming["name"] != safe_filename(naming["name"])
+                        or naming["naming_time_source"] not in ("capture", "first_record", "unknown")
+                        or naming["device_name"] != safe_filename(naming["device_name"], max_bytes=180)
+                        or (naming["capture_started_at"] is not None
+                            and (type(naming["capture_started_at"]) not in (int, float)
+                                 or not math.isfinite(naming["capture_started_at"])))
+                        or ((naming["naming_time_source"] == "unknown") != (naming["capture_started_at"] is None))):
+                    raise ValueError()
+                match = re.fullmatch(r"Top_(?:" + re.escape(naming["device_name"]) + r"_)?([0-9]{12}|未知时间)",
+                                     naming["name"])
+                if not match:
+                    raise ValueError()
+                # Read legacy sidecars without rewriting them or recomputing local time.
+                naming["name"] = "Top_" + match[1]
+            except (OSError, ValueError, TypeError) as exc:
+                raise AdbError("本地归档命名记录无效，原日志未改动", 409) from exc
+        else:
+            started = state.get("started_at")
+            first_ts = None
+            naming = capture_naming("Top", self._device_names.get(state.get("serial")) or state.get("serial") or "",
+                                    started * 1000 if started is not None else None)
+            if naming["naming_time_source"] == "unknown":
+                with path.open("rb") as stream:
+                    for record in iter_top_records(stream):
+                        if record.kind and not record.error:
+                            first_ts = record.data["ts"]
+                            break
+                naming = capture_naming("Top", naming["device_name"], first_ts=first_ts)
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                                 suffix=".part") as stream:
+                    json.dump(naming, stream, ensure_ascii=False, allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    os.link(stream.name, marker)
+            except OSError as exc:
+                raise AdbError("归档已保留，但保存命名记录失败，请检查磁盘权限后重试", 503) from exc
+        self._archive_names[path] = naming
+        return dict(naming)
+
+    def archive_filename(self, path):
+        with self._lock:
+            identity = next((key for key, value in self._archives.items() if value == path), None)
+            if identity is None:
+                raise AdbError("没有已登记的本地归档", 404)
+            self._archive_path_locked(identity)
+            state = next((value for value in self._states.values() if value["id"] == identity), {})
+            return self._archive_naming(path, state)["name"] + ".txt"
 
     def _archive_path_locked(self, capture_id=None):
         capture_id = self._state["id"] if capture_id is None else capture_id
@@ -514,15 +583,23 @@ class TopCapture:
             path = self._archive_path_locked(capture_id)
             if self._state["session_id"] is not None:
                 return {"id": self._state["session_id"], "duplicate": True}
+            naming = self._archive_naming(path, self._state)
             if not self.import_lock.acquire(blocking=False):
                 raise AdbError("已有导入正在进行，请稍后重试", 409)
-            title = self._state["title"]
             serial = self._state["serial"]
             self._import_done.clear()
             self._state.update(importing=True, status="importing", error=self._capture_error)
         try:
             with path.open("rb") as stream:
-                result = self.store.import_files([(self.archive_filename(path), stream)], title)
+                # Legacy source labels retain their historical mtime-based name;
+                # display/download names always come from the immutable snapshot.
+                source_name = (path.name if re.fullmatch(r"Top[0-9]{14}\.txt", path.name)
+                               else "Top" + time.strftime("%Y%m%d%H%M%S", time.localtime(path.stat().st_mtime)) + ".txt")
+                result = self.store.import_files([(source_name, stream)], capture_method="Top",
+                                                 device_name=naming["device_name"],
+                                                 started_at=(naming["capture_started_at"]
+                                                             if naming["naming_time_source"] == "capture" else None),
+                                                 naming_snapshot=naming)
             with self._lock:
                 self._state.update(session_id=result["id"], duplicate=result["duplicate"],
                                    status="imported", error=self._capture_error)

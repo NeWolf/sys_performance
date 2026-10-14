@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { api, apiResponse, errorMessage, formatMemory, formatTime, sessionPath, useResource } from './api'
+import { api, apiResponse, downloadFilename, errorMessage, formatMemory, formatTime, sessionPath, useResource } from './api'
 import type { Session } from './api'
 import { Dashboard } from './Dashboard'
 import type { ReportStyle } from './Dashboard'
@@ -46,7 +46,6 @@ function Workspace() {
   // 首次列表就绪时固定选择；刷新期间保留当前会话，不通过 effect 追加渲染。
   if (selected === null && activeId) setSelected(activeId)
   const [files, setFiles] = useState<File[]>([])
-  const [title, setTitle] = useState('')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -86,7 +85,6 @@ function Workspace() {
     void perform('正在本地导入并解析…', async (signal) => {
       const form = new FormData()
       files.forEach((file) => form.append('files', file))
-      form.append('title', title.trim() || files[0]!.name)
       const result = await api<{ id: string; duplicate: boolean }>('/api/import', { method: 'POST', body: form, signal })
       if (signal.aborted) return
       setSelected(result.id)
@@ -94,7 +92,6 @@ function Workspace() {
       setRevision((value) => value + 1)
       setNotice(result.duplicate ? '这些日志已导入，已打开已有会话。' : '导入完成，日志已交由本机服务解析。')
       setFiles([])
-      setTitle('')
       if (fileInput.current) fileInput.current.value = ''
     })
   }
@@ -116,15 +113,14 @@ function Workspace() {
     void perform('正在生成 HTML 报告…', async (signal) => {
       const response = await apiResponse(`${sessionPath(activeId)}/report${reportStyle === 'compact' ? '?style=compact' : ''}`, { signal })
       if (response.headers.get('content-type')?.split(';')[0]?.trim() !== 'text/html') throw new Error('本地服务返回了无效报告格式，请重试。')
+      const filename = downloadFilename(response, '.html')
       const blob = await response.blob()
       if (signal.aborted) return
       if (!blob.size) throw new Error('本地服务返回了空报告，请重试。')
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
-      // 下载名必须去除控制字符及跨平台文件名禁用字符。
-      // eslint-disable-next-line no-control-regex
-      link.download = `${(active?.name || 'sysmonitor-report').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 100)}${reportStyle === 'compact' ? '-compact' : ''}.html`
+      link.download = filename
       document.body.append(link)
       link.click()
       link.remove()
@@ -173,8 +169,6 @@ function Workspace() {
               <h2>导入本地日志</h2><p>每次最多 5 个文件，单文件最大 1 GB，仅发送给本地分析服务。大文件解析需要较长时间及足够磁盘空间。</p>
               <label className="file-picker">选择日志文件<input ref={fileInput} type="file" multiple disabled={guard.busy} onChange={(event) => setFiles(Array.from(event.target.files || []))} /></label>
               {files.length > 0 && <div className="file-selection"><strong>已选择 {files.length} 个文件</strong><ul>{files.map((file, index) => <li key={index} title={file.name}>{file.name} · {formatMemory(file.size / 1024)}</li>)}</ul></div>}
-              <label htmlFor="session-title">会话名称（可选）</label>
-              <input id="session-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={160} placeholder="例如：冷启动 · 第一次采集" disabled={guard.busy} />
               <button className="primary" type="submit" disabled={!files.length || guard.busy}>{busy.startsWith('正在本地') ? '正在解析…' : '导入并分析'}</button>
             </form>
             </details>

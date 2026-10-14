@@ -30,7 +30,7 @@ window.setupCompactReport = function(system, shared) {
     }
     sampleIndex.set(item.id,times);
   }
-  function sampleTooltip(entries, column, unit, chart) {
+  function sampleTooltip(entries, column, unit, chart, cycleItems=[system,...processes]) {
     return {trigger:'axis',renderMode:'html',confine:false,appendToBody:true,enterable:true,displayTransition:false,transitionDuration:0,
       backgroundColor:'#ffffff',borderColor:'#dce3ed',borderWidth:1,padding:0,
       textStyle:{color:'#243247',fontSize:12},
@@ -47,7 +47,7 @@ window.setupCompactReport = function(system, shared) {
         const ts = Number(params[0]?.axisValue);
         if (!valid(ts)) return '';
         const cycles = new Set();
-        for (const item of [system,...processes]) {
+        for (const item of cycleItems) {
           sampleIndex.get(item.id).get(ts)?.forEach((_,cycle) => cycles.add(cycle));
         }
         const cycle = cycles.size === 1 ? [...cycles][0] : null;
@@ -102,9 +102,10 @@ window.setupCompactReport = function(system, shared) {
     }
     return series;
   }
-  plot('system-cpu',curves(system,'cpu_total','整机 CPU','#2878cc',1,true),'单核 %',cpuTooltip(processes,node('system-cpu')));
+  plot('system-cpu',curves(system,'cpu_total','整机 CPU','#2878cc',1,true),'单核 %',
+    sampleTooltip([{item:system,name:'整机总 CPU',color:'#2878cc'}],2,'%',node('system-cpu'),[system]));
   plot('memory',curves(system,'mem_used_mb','整机已用内存','#2e956b',1,true),'MB',
-    sampleTooltip([{item:system,name:'整机已用内存',color:'#2e956b'}],3,'MB',node('memory')));
+    sampleTooltip([{item:system,name:'整机已用内存',color:'#2e956b'}],3,'MB',node('memory'),[system]));
   function combination(role, field, systemField, unit, divisor) {
     const eligible = processes.filter(p => !/^\[.*\]$/.test(p.name.trim()));
     eligible.sort((a,b) => (metric(b,field,'avg') ?? -Infinity) -

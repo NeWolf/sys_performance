@@ -1,6 +1,7 @@
 """Device-owned Top lifecycle, wire protocol and archive safety regressions."""
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import shlex
@@ -11,11 +12,13 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
 from perf_adb import AdbController, AdbError
 from perf_api import create_app
+from perf_store import Store
 from perf_top_capture import MAX_ARCHIVE_BYTES, REMOTE_ROOT, TopCapture
 
 TOP = b"PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ ARGS\n1 root 20 0 1G 20M 1M S 12.5 1.0 0:01 app\n"
@@ -134,6 +137,276 @@ class TopCaptureTests(unittest.TestCase):
     def pulled(self):
         identity = self.finished()
         return self.top.pull("device-1", identity)
+
+    def naming_metadata(self, path):
+        return json.loads(path.with_suffix(".name.json").read_text(encoding="utf-8"))
+
+    def test_model_metadata_does_not_affect_ascii_download_name(self):
+        model = "中文车机"
+        self.adb.devices.return_value = [{"serial": "device-1", "state": "device", "model": model}]
+        identity = self.pulled()["id"]
+        path = self.top.archive_path(identity)
+        expected = "Top_202609221234.txt"
+        self.assertRegex(path.name, r"^Top[0-9]{14}\.txt$")
+        self.assertEqual(self.top.archive_filename(path), expected)
+        self.assertEqual(self.naming_metadata(path)["device_name"], model)
+        with patch("perf_api.TopCapture", return_value=self.top):
+            app = create_app(self.root / "naming-api.sqlite3")
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            client.headers["X-Session-Token"] = client.get("/api/token").json()["token"]
+            response = client.get("/api/top/archive", params={"capture_id": identity})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, RAW)
+            self.assertEqual(response.headers["content-disposition"],
+                             'attachment; filename="' + expected + '"')
+
+    def test_unknown_time_download_uses_rfc5987_header(self):
+        identity = self.finished()
+        self.device.payload = b"not a timestamp\n"
+        self.device.jobs["device-1"][5] = str(len(self.device.payload))
+        self.top.pull("device-1", identity)
+        with patch("perf_api.TopCapture", return_value=self.top):
+            app = create_app(self.root / "unknown-time-api.sqlite3")
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            client.headers["X-Session-Token"] = client.get("/api/token").json()["token"]
+            response = client.get("/api/top/archive", params={"capture_id": identity})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, self.device.payload)
+            self.assertEqual(response.headers["content-disposition"],
+                             "attachment; filename*=utf-8''" + quote("Top_未知时间.txt"))
+
+    def test_serial_fallback_for_missing_or_empty_model(self):
+        for model in (None, ""):
+            with self.subTest(model=model):
+                device = {"serial": "device-1", "state": "device"}
+                if model is not None:
+                    device["model"] = model
+                self.adb.devices.return_value = [device]
+                identity = self.pulled()["id"]
+                path = self.top.archive_path(identity)
+                self.assertEqual(self.top.archive_filename(path), "Top_202609221234.txt")
+                naming = self.naming_metadata(path)
+                self.assertEqual(naming["device_name"], "device-1")
+                self.assertEqual(naming["naming_time_source"], "first_record")
+
+    def test_real_started_at_seconds_win_and_convert_to_milliseconds(self):
+        started = 1790663405
+        identity = self.finished()
+        self.device.jobs["device-1"] += [str(started), str(started + 1), str(started + 2)]
+        self.top.pull("device-1", identity)
+        path = self.top.archive_path(identity)
+        expected = "Top_" + time.strftime("%Y%m%d%H%M", time.localtime(started))
+        naming = self.naming_metadata(path)
+        self.assertEqual(self.top.archive_filename(path), expected + ".txt")
+        self.assertEqual(naming["capture_started_at"], started * 1000)
+        self.assertEqual(naming["naming_time_source"], "capture")
+        self.top.import_capture(identity)
+        kwargs = self.store.import_files.call_args.kwargs
+        self.assertEqual(kwargs["capture_method"], "Top")
+        self.assertEqual(kwargs["device_name"], "device-1")
+        self.assertEqual(kwargs["started_at"], started * 1000)
+        self.assertEqual(kwargs.get("naming_snapshot"), naming)
+        self.assertEqual(self.store.import_files.call_args.args[0][0][0], path.name)
+
+    def test_first_record_fallback_and_unknown_time(self):
+        cases = ((RAW, "202609221234", "first_record"),
+                 (b"not a timestamp\n", "未知时间", "unknown"))
+        for payload, stamp, source in cases:
+            with self.subTest(source=source):
+                identity = self.finished()
+                self.device.payload = payload
+                self.device.jobs["device-1"][5] = str(len(payload))
+                self.top.pull("device-1", identity)
+                path = self.top.archive_path(identity)
+                naming = self.naming_metadata(path)
+                self.assertEqual(self.top.archive_filename(path), "Top_" + stamp + ".txt")
+                self.assertEqual(naming["naming_time_source"], source)
+                if source == "unknown":
+                    self.assertIsNone(naming["capture_started_at"])
+                else:
+                    first = time.mktime(time.strptime("2026-09-22 12:34:56", "%Y-%m-%d %H:%M:%S"))
+                    self.assertEqual(naming["capture_started_at"], first * 1000)
+                self.top.import_capture(identity)
+                kwargs = self.store.import_files.call_args.kwargs
+                self.assertIsNone(kwargs["started_at"])
+                self.assertEqual(kwargs.get("naming_snapshot"), naming)
+
+    def test_naming_snapshot_survives_restart_model_change_and_task_switch(self):
+        self.adb.devices.return_value = [{"serial": "device-1", "state": "device", "model": "原车机"}]
+        identity = self.pulled()["id"]
+        path = self.top.archive_path(identity)
+        marker = path.with_suffix(".name.json")
+        saved = marker.read_bytes()
+        naming = self.naming_metadata(path)
+        self.assertEqual(naming["name"], "Top_202609221234")
+        self.adb.devices.return_value[0]["model"] = "新车机"
+        self.top.status("device-1")
+        recovered = self.controller()
+        self.assertTrue(recovered.status("device-1")["archive"])
+        self.assertEqual(recovered.archive_filename(path), naming["name"] + ".txt")
+        recovered.import_capture(identity)
+        imported_snapshot = self.store.import_files.call_args.kwargs.get("naming_snapshot")
+        newer = recovered.start("device-1", count=1)["id"]
+        self.device.finish()
+        recovered.pull("device-1", newer)
+        new_path = recovered.archive_path(newer)
+        self.assertEqual(recovered.archive_filename(new_path), "Top_202609221234.txt")
+        self.adb.devices.return_value = []
+        self.assertFalse(recovered.status("device-1")["connected"])
+        self.assertEqual(recovered.archive_filename(path), naming["name"] + ".txt")
+        self.assertEqual(recovered.archive_path(identity).read_bytes(), RAW)
+        self.assertEqual(marker.read_bytes(), saved)
+        with patch("perf_api.TopCapture", return_value=recovered):
+            app = create_app(self.root / "offline-api.sqlite3")
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            client.headers["X-Session-Token"] = client.get("/api/token").json()["token"]
+            response = client.get("/api/top/archive", params={"capture_id": identity})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, RAW)
+            self.assertEqual(response.headers["content-disposition"],
+                             'attachment; filename="' + naming["name"] + '.txt"')
+        self.assertEqual(imported_snapshot, naming)
+
+    def test_naming_sidecar_corrupt_or_symlink_preserves_raw_and_retries(self):
+        for kind in ("corrupt", "symlink", "wrong_device", "invalid_name"):
+            with self.subTest(kind=kind):
+                identity = self.pulled()["id"]
+                path = self.top.archive_path(identity)
+                marker = path.with_suffix(".name.json")
+                saved = marker.read_bytes()
+                backup = marker.with_suffix(".saved")
+                marker.rename(backup)
+                if kind == "symlink":
+                    target = self.root / "untrusted-name.json"
+                    target.write_bytes(saved)
+                    marker.symlink_to(target)
+                elif kind in ("wrong_device", "invalid_name"):
+                    invalid = json.loads(saved)
+                    invalid["name"] = ("Top_other-device_202609221234" if kind == "wrong_device"
+                                       else "Top_202609221234_extra")
+                    marker.write_text(json.dumps(invalid), encoding="utf-8")
+                else:
+                    marker.write_bytes(b'{"name":')
+                untrusted = marker.read_bytes()
+                recovered = self.controller()
+                state = self.top.status()
+                self.error(409, recovered._archive_naming, path, state)
+                self.assertEqual(path.read_bytes(), RAW)
+                self.assertEqual(marker.read_bytes(), untrusted)
+                self.assertEqual(marker.is_symlink(), kind == "symlink")
+                self.assertIsNone(recovered.status("device-1")["archive"])
+                marker.rename(marker.with_suffix(".rejected"))
+                backup.rename(marker)
+                self.assertTrue(recovered.status("device-1")["archive"])
+                self.assertEqual(recovered.archive_filename(path), "Top_202609221234.txt")
+                self.assertEqual(path.read_bytes(), RAW)
+
+    def test_naming_sidecar_write_failures_keep_published_raw_for_retry(self):
+        real_dump, real_sync, real_link = json.dump, os.fsync, os.link
+        for failure in ("write", "sync", "link"):
+            with self.subTest(failure=failure):
+                identity = self.finished()
+                naming_fd = []
+
+                def dump(data, stream, **kwargs):
+                    if data.get("capture_method") == "Top":
+                        naming_fd.append(stream.fileno())
+                        if failure == "write":
+                            stream.write('{"name":')
+                            raise OSError("name write failed")
+                    return real_dump(data, stream, **kwargs)
+
+                def sync(fd):
+                    if failure == "sync" and fd in naming_fd:
+                        raise OSError("name sync failed")
+                    return real_sync(fd)
+
+                def link(source, destination, **kwargs):
+                    if failure == "link" and str(destination).endswith(".name.json"):
+                        raise OSError("name link failed")
+                    return real_link(source, destination, **kwargs)
+
+                with patch("perf_top_capture.json.dump", side_effect=dump), \
+                     patch("perf_top_capture.os.fsync", side_effect=sync), \
+                     patch("perf_top_capture.os.link", side_effect=link):
+                    self.error(503, self.top.pull, "device-1", identity)
+                directory = self.top.archive_root / identity
+                paths = list(directory.glob("*.txt"))
+                self.assertEqual(len(paths), 1)
+                path = paths[0]
+                self.assertEqual(path.read_bytes(), RAW)
+                self.assertFalse(path.with_suffix(".name.json").exists())
+                self.assertEqual(list(self.top.archive_root.rglob("*.part")), [])
+                pulls = sum(args[0] == "pull" for _, args in self.device.commands)
+                recovered = self.controller()
+                self.assertTrue(recovered.pull("device-1", identity)["archive"])
+                self.assertEqual(sum(args[0] == "pull" for _, args in self.device.commands), pulls)
+                self.assertEqual(recovered.archive_filename(path), "Top_202609221234.txt")
+                self.assertEqual(path.read_bytes(), RAW)
+                self.assertFalse(any(args[0] == "clear" for _, args in self.device.commands))
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "需要可切换本地时区")
+    def test_real_store_import_preserves_snapshot_across_timezone_change(self):
+        old_timezone = os.environ.get("TZ")
+
+        def restore_timezone():
+            if old_timezone is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_timezone
+            time.tzset()
+
+        self.addCleanup(restore_timezone)
+        for source, legacy in (("capture", False), ("first_record", False),
+                               ("capture", True), ("first_record", True)):
+            with self.subTest(source=source, legacy=legacy):
+                os.environ["TZ"] = "UTC0"
+                time.tzset()
+                identity = self.finished()
+                # Explicit UTC makes reparsing under another zone change the
+                # computed name too, so first_record cannot pass accidentally.
+                payload = RAW.replace(b"12:34:56 =", b"12:34:56 UTC =")
+                self.device.payload = payload
+                self.device.jobs["device-1"][5] = str(len(payload))
+                if source == "capture":
+                    self.device.jobs["device-1"] += ["1790663405", "1790663406", "1790663407"]
+                self.top.pull("device-1", identity)
+                path = self.top.archive_path(identity)
+                naming = self.naming_metadata(path)
+                download = self.top.archive_filename(path)
+                self.assertEqual(naming["naming_time_source"], source)
+                marker = path.with_suffix(".name.json")
+                if legacy:
+                    old_naming = dict(naming, name=naming["name"].replace(
+                        "Top_", "Top_" + naming["device_name"] + "_", 1))
+                    marker.write_text(json.dumps(old_naming), encoding="utf-8")
+                saved = marker.read_bytes()
+                os.environ["TZ"] = "JST-9"
+                time.tzset()
+                recovered = self.controller()
+                recovered.store = Store(self.root / (source + ".sqlite3"))
+                self.assertTrue(recovered.status("device-1")["archive"])
+                self.assertEqual(recovered.archive_filename(path), download)
+                with patch.object(recovered.store, "import_files", wraps=recovered.store.import_files) as imported:
+                    result = recovered.import_capture(identity)
+                session = recovered.store.session(result["id"])
+                self.assertEqual(session["name"] + ".txt", download)
+                for key, value in naming.items():
+                    if key != "name":
+                        self.assertEqual(session["summary"][key], value)
+                self.assertEqual(imported.call_args.kwargs.get("naming_snapshot"), naming)
+                self.assertEqual(path.read_bytes(), payload)
+                self.assertEqual(marker.read_bytes(), saved)
+                with patch("perf_api.TopCapture", return_value=recovered):
+                    app = create_app(self.root / "timezone-api.sqlite3")
+                with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+                    client.headers["X-Session-Token"] = client.get("/api/token").json()["token"]
+                    response = client.get("/api/top/archive", params={"capture_id": identity})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.content, payload)
+                    self.assertEqual(response.headers["content-disposition"],
+                                     'attachment; filename="' + download + '"')
+                self.assertEqual(marker.read_bytes(), saved)
 
     def test_each_device_operation_roots_once_before_task_access(self):
         calls = Mock()
@@ -561,7 +834,8 @@ class TopCaptureTests(unittest.TestCase):
             path = self.top.archive_path(identity)
             self.assertEqual(path, self.top.archive_root / identity / filename)
             self.assertEqual(path.read_bytes(), RAW)
-            self.assertEqual(self.top.archive_filename(path), filename)
+            download_name = "Top_" + time.strftime("%Y%m%d%H%M", time.localtime(started)) + ".txt"
+            self.assertEqual(self.top.archive_filename(path), download_name)
             self.top.import_capture(identity)
             self.assertEqual(self.store.import_files.call_args.args[0][0][0], filename)
             recovered = self.controller()
@@ -581,7 +855,7 @@ class TopCaptureTests(unittest.TestCase):
         self.assertTrue(recovered.status("device-1")["archive"])
         self.assertEqual(recovered.archive_path(identity), path)
         name = "Top" + time.strftime("%Y%m%d%H%M%S", time.localtime(modified)) + ".txt"
-        self.assertEqual(recovered.archive_filename(path), name)
+        self.assertEqual(recovered.archive_filename(path), "Top_202609221234.txt")
         recovered.import_capture(identity)
         self.assertEqual(self.store.import_files.call_args.args[0][0][0], name)
         self.assertEqual(path.read_bytes(), RAW)
@@ -660,8 +934,15 @@ class TopCaptureTests(unittest.TestCase):
                     return ""
 
                 self.device.action = pull
-                with patch("perf_top_capture.tempfile.TemporaryFile",
-                           side_effect=lambda **kwargs: staging_path.open("w+b")):
+                # Patch only the binary pull staging, not the parser's text spool.
+                temporary_file = tempfile.TemporaryFile
+
+                def staging_file(*args, **kwargs):
+                    if kwargs.get("dir") == self.top.archive_root:
+                        return staging_path.open("w+b")
+                    return temporary_file(*args, **kwargs)
+
+                with patch("perf_top_capture.tempfile.TemporaryFile", side_effect=staging_file):
                     state = self.top.pull("device-1", identity)
                 self.assertTrue(state["archive"])
                 self.assertEqual(self.top.archive_path().read_bytes(), payload)
@@ -734,20 +1015,34 @@ class TopCaptureTests(unittest.TestCase):
                 self.assertEqual(self.top.archive_path(identity).read_bytes(), RAW)
 
     def test_warning_metadata_failure_does_not_block_retry(self):
-        def partial_write(data, stream):
-            stream.write('{"size":')
-            raise OSError("metadata write failed")
-
-        cases = (
-            ("write", "perf_top_capture.json.dump", partial_write),
-            ("sync", "perf_top_capture.os.fsync", [None, None, OSError("sync failed")]),
-            ("link", "perf_top_capture.os.link", OSError("link failed")),
-        )
-        for name, target, failure in cases:
-            with self.subTest(case=name):
+        real_dump, real_sync, real_link = json.dump, os.fsync, os.link
+        for failure in ("write", "sync", "link"):
+            with self.subTest(case=failure):
                 identity = self.finished()
                 self.device.payload = RAW[:-1]
-                with patch(target, side_effect=failure):
+                warning_fd = []
+
+                def dump(data, stream, **kwargs):
+                    if str(stream.name).endswith(".warning.json"):
+                        warning_fd.append(stream.fileno())
+                        if failure == "write":
+                            stream.write('{"size":')
+                            raise OSError("metadata write failed")
+                    return real_dump(data, stream, **kwargs)
+
+                def sync(fd):
+                    if failure == "sync" and fd in warning_fd:
+                        raise OSError("warning sync failed")
+                    return real_sync(fd)
+
+                def link(source, destination, **kwargs):
+                    if failure == "link" and Path(destination).suffix == ".txt":
+                        raise OSError("archive link failed")
+                    return real_link(source, destination, **kwargs)
+
+                with patch("perf_top_capture.json.dump", side_effect=dump), \
+                     patch("perf_top_capture.os.fsync", side_effect=sync), \
+                     patch("perf_top_capture.os.link", side_effect=link):
                     with self.assertRaises(OSError):
                         self.top.pull("device-1", identity)
                 directory = self.top.archive_root / identity
@@ -834,7 +1129,7 @@ class TopCaptureTests(unittest.TestCase):
                     recovered.import_capture(identity)
                 self.assertEqual(recovered.archive_path(identity).read_bytes(), payload)
 
-                def imported(files, title):
+                def imported(files, title="", **kwargs):
                     self.assertEqual(files[0][1].read(), payload)
                     return {"id": "session-1", "duplicate": False}
 
@@ -885,7 +1180,7 @@ class TopCaptureTests(unittest.TestCase):
         self.assertFalse(self.import_lock.locked())
         entered, release, closed = threading.Event(), threading.Event(), threading.Event()
         self.addCleanup(release.set)
-        def blocked(*args):
+        def blocked(*args, **kwargs):
             entered.set()
             release.wait(3)
             return {"id": "done", "duplicate": False}
@@ -938,7 +1233,7 @@ class TopCaptureTests(unittest.TestCase):
 
     def test_import_survives_same_device_task_switch(self):
         identity = self.pulled()["id"]
-        def import_and_switch(*args):
+        def import_and_switch(*args, **kwargs):
             self.device.jobs["device-1"] = ["c" * 32, "running", "0", "-1", "1", "0", "none", ""]
             switched = self.top.status("device-1")
             self.assertEqual(switched["id"], "c" * 32)
@@ -1041,7 +1336,8 @@ class TopCaptureTests(unittest.TestCase):
             self.assertEqual(cleared.json()["warning"], detail)
             filename = self.top.archive_path(identity).name
             self.assertRegex(filename, r"^Top[0-9]{14}\.txt$")
-            self.assertEqual(downloaded.headers["content-disposition"], f'attachment; filename="{filename}"')
+            self.assertEqual(downloaded.headers["content-disposition"],
+                             'attachment; filename="Top_202609221234.txt"')
             imported = client.post("/api/top/import", json={"confirm": True, "capture_id": identity})
             self.assertEqual(imported.status_code, 200, imported.text)
             self.assertTrue(client.post("/api/top/import", json={"confirm": True}).json()["duplicate"])

@@ -670,8 +670,18 @@
       refreshOverlay();
     });
     const overview = overviewOptions(system);
-    draw(node('system-cpu'), overview.cpu);
-    draw(node('memory'), overview.memory);
+    for (const [role, option, fs, unit] of [
+      ['system-cpu', overview.cpu, data.system_fields.filter(f => f.startsWith('cpu')), '%'],
+      ['memory', overview.memory, ['mem_used_mb', data.system_fields.includes('mem_free_mb') ? 'mem_free_mb' : 'mem_avail_mb'], 'MB']
+    ]) {
+      const entries = fs.map(field => ({stream:systemStream,field,name:labels[field],divisor:1}));
+      const tooltip = overlayTooltip(entries, unit, node(role));
+      draw(node(role), {...option, tooltip:{...tooltip,
+        formatter(params) {
+          const visible = entries.filter(entry => params.some(p => p.seriesName === entry.name));
+          return overlayTooltip(visible, unit, node(role)).formatter(params);
+        }}});
+    }
     const thresholds = system.cpu_exceedances.thresholds.filter(t => valid(t.threshold));
     draw(node('exceed'), {tooltip:{trigger:'axis',valueFormatter:fmtCount},legend:{show:false},dataZoom:[],xAxis:{type:'category',data:thresholds.map(t => '> '+fmt(t.threshold)+'%')},
       title:thresholds.length ? undefined : {text:'暂无有效系统CPU样本',left:'center',top:'center',textStyle:{color:'#94a3b8',fontSize:14}},

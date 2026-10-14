@@ -3,6 +3,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,14 +102,22 @@ class AdbTests(unittest.TestCase):
 
     @patch("perf_adb.time.sleep")
     def test_capture_timing_start_stop_pull_and_restart(self, _sleep):
-        with patch("perf_adb.time.time", return_value=1700000000), \
+        with patch("perf_adb.time.time", return_value=1700000000.125), \
                 patch("perf_adb.time.monotonic", return_value=100):
             result = self.adb.start("unit", 2)
-        self.assertEqual(result["started_at"], 1700000000)
+        self.assertEqual(result["started_at"], 1700000000.125)
         self.assertEqual(result["elapsed_seconds"], 0)
         with patch("perf_adb.time.monotonic", return_value=145):
             self.assertEqual(self.adb.status("unit")["elapsed_seconds"], 45)
-            self.adb.pull("unit", self.store)
+            imported = self.adb.pull("unit", self.store, title="旧标题不应覆盖采集命名")
+        overview = self.store.overview(imported["id"])
+        minute = datetime.fromtimestamp(1700000000.125).strftime("%Y%m%d%H%M")
+        self.assertEqual(overview["name"], f"SysMonitor_{minute}")
+        self.assertEqual(overview["summary"]["capture_method"], "SysMonitor")
+        self.assertEqual(overview["summary"]["device_name"], "Test")
+        self.assertEqual(overview["summary"]["capture_started_at"], 1700000000125)
+        self.assertEqual(overview["summary"]["naming_time_source"], "capture")
+        self.assertEqual(overview["summary"]["first_ts"], 1000)
         with patch("perf_adb.time.monotonic", return_value=200):
             stopped = self.adb.status("unit")
             self.assertEqual(stopped["elapsed_seconds"], 45)
@@ -117,6 +126,69 @@ class AdbTests(unittest.TestCase):
                 restarted = self.adb.start("unit", 2)
             self.assertEqual(restarted["started_at"], 1700000100)
             self.assertEqual(restarted["elapsed_seconds"], 0)
+
+    @patch("perf_adb.time.sleep")
+    def test_pull_naming_falls_back_to_first_record_without_valid_start(self, _sleep):
+        for scenario in ("never_started", "observed", "expired_running", "expired_stopped"):
+            with self.subTest(scenario=scenario):
+                adb = FakeAdb(Path(self.temp.name) / scenario)
+                store = Store(Path(self.temp.name) / f"{scenario}.sqlite3")
+                tick = 145
+                with patch("perf_adb.time.time", return_value=1700000000), \
+                        patch("perf_adb.time.monotonic", return_value=100):
+                    if scenario == "observed":
+                        adb.processes = ["123"]
+                        adb.props["test"] = "1"
+                        observed = adb.status("unit")
+                        self.assertEqual(observed["observed_at"], 1700000000)
+                        self.assertIsNone(observed["started_at"])
+                    elif scenario.startswith("expired"):
+                        adb.start("unit", 2)
+                        if scenario == "expired_stopped":
+                            adb.stop("unit")
+                        tick = 86501
+                with patch("perf_adb.time.monotonic", return_value=tick):
+                    imported = adb.pull("unit", store, title="旧的自定义标题")
+                overview = store.overview(imported["id"])
+                minute = datetime.fromtimestamp(1).strftime("%Y%m%d%H%M")
+                self.assertEqual(overview["name"], f"SysMonitor_{minute}")
+                self.assertEqual(overview["summary"]["capture_method"], "SysMonitor")
+                self.assertEqual(overview["summary"]["device_name"], "Test")
+                self.assertEqual(overview["summary"]["first_ts"], 1000)
+                self.assertEqual(overview["summary"]["capture_started_at"], 1000)
+                self.assertEqual(overview["summary"]["naming_time_source"], "first_record")
+
+    def test_pull_naming_uses_serial_when_model_is_missing_or_empty(self):
+        for model in ({}, {"model": ""}):
+            with self.subTest(model=model):
+                store = Store(Path(self.temp.name) / f"model-{len(model)}.sqlite3")
+                device = {"serial": "unit", "state": "device", **model}
+                with patch.object(self.adb, "devices", return_value=[device]):
+                    imported = self.adb.pull("unit", store)
+                overview = store.overview(imported["id"])
+                minute = datetime.fromtimestamp(1).strftime("%Y%m%d%H%M")
+                self.assertEqual(overview["name"], f"SysMonitor_{minute}")
+                self.assertEqual(overview["summary"]["device_name"], "unit")
+                self.assertEqual(overview["summary"]["capture_method"], "SysMonitor")
+                self.assertEqual(overview["summary"]["naming_time_source"], "first_record")
+
+    @patch("perf_adb.time.sleep")
+    def test_pull_duplicate_preserves_original_name_and_metadata(self, _sleep):
+        imported = self.adb.pull("unit", self.store, title="首次旧标题")
+        before = self.store.overview(imported["id"])
+        with patch("perf_adb.time.time", return_value=1700000000), \
+                patch("perf_adb.time.monotonic", return_value=100):
+            self.adb.start("unit", 2)
+        device = {"serial": "unit", "state": "device", "model": "另一台设备"}
+        with patch.object(self.adb, "devices", return_value=[device]), \
+                patch("perf_adb.time.monotonic", return_value=145):
+            duplicate = self.adb.pull("unit", self.store, title="第二次旧标题")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["id"], imported["id"])
+        self.assertEqual(self.store.overview(imported["id"]), before)
+        self.assertEqual(len(self.store.sessions()), 1)
+        reopened = Store(Path(self.temp.name) / "test.sqlite3")
+        self.assertEqual(reopened.overview(imported["id"]), before)
 
     def test_capture_observation_pid_change_and_disabled_switch(self):
         self.adb.processes = ["2", "1"]

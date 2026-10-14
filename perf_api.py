@@ -27,7 +27,8 @@ from perf_metrics import resource_settings
 from perf_adb import AdbController, AdbError
 from perf_report import REPORT_CSP, render_report
 from perf_report_compact import REPORT_CSP as COMPACT_REPORT_CSP
-from perf_store import Store
+from perf_store import Store, safe_filename
+from urllib.parse import quote
 from perf_top_capture import TopCapture
 from perf_version import VERSION
 
@@ -97,7 +98,7 @@ class LocalBoundary:
 async def upload_form(request):
     """Close spooled files even on body limits, disconnects or cancellation."""
     parser = MultiPartParser(request.headers, request.stream(), max_files=5,
-                             max_fields=1, max_part_size=4096)
+                             max_fields=2, max_part_size=4096)
     try:
         yield await parser.parse()
     except MultiPartException as exc:
@@ -602,17 +603,21 @@ def create_app(database, port=8765, development=False, frontend=None):
             async with upload_form(request) as form:
                 files = form.getlist("files")
                 title = form.get("title", "")
+                device_name = form.get("device_name", "")
                 if not files or any(not isinstance(file, UploadFile) for file in files):
                     raise HTTPException(400, "请选择 1 至 5 个日志文件")
                 if not isinstance(title, str) or len(title) > 120:
                     raise HTTPException(400, "会话名称最多 120 个字符")
-                if any(key not in ("files", "title") for key in form):
+                if not isinstance(device_name, str) or len(device_name) > 120:
+                    raise HTTPException(400, "设备名称最多 120 个字符")
+                if any(key not in ("files", "title", "device_name") for key in form):
                     raise HTTPException(400, "包含不支持的表单字段")
                 if any(file.size is None or file.size > MAX_FILE_BYTES for file in files):
                     raise HTTPException(413, "每个日志文件最多 1 GB（1024 MB）")
                 sources = [(file.filename or "perf.log", file.file) for file in files]
                 try:
-                    return await run_in_threadpool(store.import_files, sources, title.strip())
+                    return await run_in_threadpool(store.import_files, sources, title.strip(),
+                                                   device_name=device_name.strip())
                 except ValueError as exc:
                     raise HTTPException(400, str(exc)) from exc
         finally:
@@ -708,10 +713,10 @@ def create_app(database, port=8765, development=False, frontend=None):
     @app.get("/api/sessions/{session_id}/report")
     def report(session_id: str, style: Literal["default", "compact"] = "default"):
         document = render_report(store, session_id, style=style) if style == "compact" else render_report(store, session_id)
-        filename = "sysmonitor-report-compact.html" if style == "compact" else "sysmonitor-report.html"
+        filename = safe_filename(store.session(session_id)["name"], fallback="report") + ".html"
         csp = COMPACT_REPORT_CSP if style == "compact" else REPORT_CSP
         return HTMLResponse(document, headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename, safe=""),
             "Content-Security-Policy": csp + "; sandbox allow-scripts",
         })
 

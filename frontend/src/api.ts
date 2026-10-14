@@ -207,6 +207,36 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试。'
 }
 
+export function downloadFilename(response: Response, extension: '.txt' | '.html'): string {
+  const disposition = response.headers.get('Content-Disposition') || ''
+  const invalid = () => new Error('下载文件名缺失或无效，请更新程序后重试下载。')
+  const names = new Map<string, string>()
+  // 按完整参数读取，避免把引号内的分号误认成新的 filename 参数。
+  for (const match of disposition.matchAll(/;\s*([^\s;=]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^;]*)(?=\s*(?:;|$))/g)) {
+    const key = match[1]!.toLowerCase()
+    if (key !== 'filename' && key !== 'filename*') continue
+    if (names.has(key)) throw invalid()
+    const value = match[2]!.trim()
+    names.set(key, value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value)
+  }
+  let filename = names.get('filename') || ''
+  // 扩展参数优先；存在但编码无效时拒绝下载，不回退掩盖异常。
+  if (names.has('filename*')) {
+    const encoded = /^UTF-8'[^']*'(.*)$/i.exec(names.get('filename*')!)
+    if (!encoded) throw invalid()
+    try { filename = decodeURIComponent(encoded[1]!) }
+    catch { throw invalid() }
+  }
+  // 保留服务端名称，不改写路径、不补扩展名；阻止控制字符及跨平台禁用字符。
+  // eslint-disable-next-line no-control-regex
+  const unsafe = /[\\/:*?"<>|\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/
+  if (!filename || filename !== filename.trim() || unsafe.test(filename)
+    || filename.startsWith('.') || /[. ]$/.test(filename)
+    || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(filename)
+    || !filename.toLowerCase().endsWith(extension) || filename.length <= extension.length) throw invalid()
+  return filename
+}
+
 async function check(response: Response): Promise<Response> {
   if (response.ok) return response
   let message = `请求失败（HTTP ${response.status}）`

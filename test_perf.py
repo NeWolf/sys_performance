@@ -5,11 +5,13 @@ import json
 import re
 import tempfile
 import unittest
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from perf_parser import iter_records, parse_line, rotation_key
-from perf_store import Store
+from perf_store import Store, capture_naming, safe_filename
 
 SAMPLE = """S,946684800123,7,42.04,25.09,14.17,0.00,3.25,9326,14725,5399
 P,946684800123,5589,14.54,116.30,14.54,0.52,CFS,2,S,45,247120,4292,0,0,156,469,184,246,585,com.desaysv.engmode
@@ -406,6 +408,74 @@ for (const [process,expected] of cases) {
         self.run_report_script(self.shared_script(checks))
 
 
+class CaptureNamingTests(unittest.TestCase):
+    def test_methods_milliseconds_and_capture_time_priority(self):
+        started = 1700000000123
+        stamp = datetime.fromtimestamp(started / 1000).strftime("%Y%m%d%H%M")
+        for method in ("本地导入", "SysMonitor", "Top"):
+            with self.subTest(method=method):
+                self.assertEqual(capture_naming(method, "车机 A", started, 946684800123), {
+                    "name": f"{method}_{stamp}", "capture_method": method,
+                    "device_name": "车机 A", "capture_started_at": started,
+                    "naming_time_source": "capture",
+                })
+        with self.assertRaises(ValueError):
+            capture_naming("unsupported")
+
+    def test_local_timezone_not_utc_and_minute_precision(self):
+        import os
+        import time
+        from unittest.mock import patch
+        if not hasattr(time, "tzset"):
+            self.skipTest("平台不支持切换本地时区")
+        try:
+            for zone, stamp in (("UTC0", "200001010000"), ("CST-8", "200001010800")):
+                with self.subTest(zone=zone), patch.dict(os.environ, TZ=zone):
+                    time.tzset()
+                    self.assertEqual(capture_naming(first_ts=946684800123)["name"],
+                                     f"本地导入_{stamp}")
+        finally:
+            time.tzset()
+
+    def test_missing_invalid_time_falls_back_without_using_current_time(self):
+        for invalid in (None, "bad", float("nan"), float("inf"), -float("inf"), 10**100):
+            with self.subTest(invalid=invalid):
+                fallback = capture_naming(started_at=invalid, first_ts=0)
+                self.assertEqual(fallback["capture_started_at"], 0)
+                self.assertEqual(fallback["naming_time_source"], "first_record")
+                unknown = capture_naming(device_name=" . ", started_at=invalid, first_ts=invalid)
+                self.assertEqual(unknown["name"], "本地导入_未知时间")
+                self.assertIsNone(unknown["capture_started_at"])
+                self.assertEqual(unknown["naming_time_source"], "unknown")
+        self.assertEqual(capture_naming(started_at=0, first_ts=1000)["naming_time_source"], "capture")
+
+    def test_safe_filename_paths_controls_and_reserved_names(self):
+        unsafe = '../车机\\路径/:*?"<>|\r\n\x00\x1f\x7f\x85\u202e\u2066. '
+        safe = safe_filename(unsafe)
+        self.assertIn("车机", safe)
+        self.assertNotRegex(safe, r'[\\/:*?"<>|\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]')
+        self.assertEqual(safe, safe.strip(". "))
+        self.assertEqual(safe_filename(" . "), "未知设备")
+        self.assertEqual(safe_filename("", fallback="report"), "report")
+        for name in ("CON", "nul.txt", "COM1", "Lpt9.log"):
+            with self.subTest(name=name):
+                self.assertEqual(safe_filename(name), "_" + name)
+        self.assertEqual(safe_filename("normal.name"), "normal.name")
+
+    def test_utf8_byte_limits_do_not_split_characters(self):
+        for limit in (1, 2, 3, 4, 179, 180, 220):
+            with self.subTest(limit=limit):
+                safe = safe_filename("A" + "车😀" * 100, max_bytes=limit)
+                self.assertLessEqual(len(safe.encode("utf-8")), limit)
+                self.assertNotIn("\ufffd", safe)
+        for value in ("CON." + "x" * 300, "NUL." + "车" * 120):
+            with self.subTest(reserved=value[:4]):
+                self.assertLessEqual(len(safe_filename(value).encode("utf-8")), 220)
+        naming = capture_naming(device_name="车" * 120, first_ts=0)
+        self.assertEqual(naming["device_name"], "车" * 60)
+        self.assertLessEqual(len((naming["name"] + ".html").encode("utf-8")), 255)
+
+
 class StoreTests(ReportAssertions, unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -429,6 +499,69 @@ class StoreTests(ReportAssertions, unittest.TestCase):
                     db.executemany('INSERT INTO observations VALUES (?)', [(v,) for v in values])
                     self.assertEqual(tuple(db.execute(
                         'SELECT metric_sum(value),metric_avg(value) FROM observations').fetchone()), expected)
+
+    def test_capture_name_migration_preserves_data_and_is_idempotent(self):
+        from perf_report import render_report
+        sid = self.import_sample()["id"]
+        marker = "capture_names_without_device_v1"
+        cases = [
+            ("SysMonitor", "车机_A", "202609221234"),
+            ("Top", "device-1", "未知时间"),
+            ("本地导入", "未知设备", "200001010000"),
+        ]
+        expected = {}
+        with self.store.connect() as db:
+            original = dict(db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone())
+            for index, (method, device, stamp) in enumerate(cases):
+                identity = sid if index == 0 else f"legacy-{index}"
+                summary = json.loads(original["summary"])
+                summary.update(capture_method=method, device_name=device)
+                old_name = f"{method}_{device}_{stamp}"
+                if index == 0:
+                    db.execute("UPDATE sessions SET name=?,summary=? WHERE id=?",
+                               (old_name, json.dumps(summary), identity))
+                else:
+                    db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                               (identity, old_name, original["created"], identity, json.dumps(summary)))
+                expected[identity] = f"{method}_{stamp}"
+            for identity, name, summary in (
+                    ("custom", "自定义报告", {"capture_method": "Top", "device_name": "车机"}),
+                    ("missing", "Top_车机_202609221234", {}),
+                    ("mismatch", "Top_其他车机_202609221234", {"capture_method": "Top", "device_name": "车机"})):
+                db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                           (identity, name, original["created"], identity, json.dumps(summary)))
+                expected[identity] = name
+            for identity in expected:
+                for table in ("report_cache", "report_compact_cache"):
+                    db.execute(f"INSERT INTO {table} VALUES (?,?,?)", (identity, "old", b"old report"))
+                db.execute("INSERT INTO analysis_cache VALUES (?,?,?)", (identity, "S", "{}"))
+            before = {row["id"]: dict(row) for row in db.execute("SELECT * FROM sessions")}
+            records = [tuple(row) for row in db.execute("SELECT * FROM records ORDER BY id")]
+            analysis = [tuple(row) for row in db.execute("SELECT * FROM analysis_cache ORDER BY session")]
+            db.execute("DELETE FROM store_migrations WHERE name=?", (marker,))
+        reopened = Store(self.store.path)
+        with reopened.connect() as db:
+            for row in db.execute("SELECT * FROM sessions"):
+                self.assertEqual(dict(row), dict(before[row["id"]], name=expected[row["id"]]))
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM records ORDER BY id")], records)
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM analysis_cache ORDER BY session")], analysis)
+            for table in ("report_cache", "report_compact_cache"):
+                self.assertEqual({row[0] for row in db.execute(f"SELECT session FROM {table}")},
+                                 {"custom", "missing", "mismatch"})
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM store_migrations WHERE name=?",
+                                        (marker,)).fetchone()[0], 1)
+        self.assertEqual(reopened.import_files([("perf.log", io.BytesIO(SAMPLE.encode()))]),
+                         {"id": sid, "duplicate": True})
+        for style in ("default", "compact"):
+            render_report(reopened, sid, style=style)
+        with reopened.connect() as db:
+            caches = {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY session")]
+                      for table in ("report_cache", "report_compact_cache")}
+        again = Store(self.store.path)
+        with again.connect() as db:
+            for table, rows in caches.items():
+                self.assertEqual([tuple(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY session")], rows)
+        self.assertEqual(again.session(sid)["name"], expected[sid])
 
     def test_precision_migration_invalidates_all_caches_once(self):
         from perf_metrics import PRECISION_VERSION
@@ -462,7 +595,7 @@ class StoreTests(ReportAssertions, unittest.TestCase):
             for table in tables:
                 self.assertEqual(snapshot(db, table), [], table)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM store_migrations WHERE name=?',
-                                        (marker,)).fetchone()[0], 1)
+                                         (marker,)).fetchone()[0], 1)
         populate(reopened)
         with reopened.connect() as db:
             rebuilt = {table: snapshot(db, table) for table in tables}
@@ -1491,6 +1624,35 @@ const memory=overlayTooltip([{stream,field:'rss_kb',name:'内存',divisor:1024}]
 assert.equal(tooltipRows(memory.formatter([{axisValue:601000}]))[0],'内存：1.00 MB');
 assert.equal(tooltipRows(overlayTooltip([{stream,field:'cpu1c',name:'零',divisor:1}],'%')
   .formatter([{axisValue:1000}]))[0],'零：0.00 %');
+const overviewRows = (role, ts, names) => option(role).tooltip.formatter(
+  names.map(seriesName=>({axisValue:ts,seriesName})));
+const originalPoints = system.full_points;
+const processRows = data.processes[0].full_cycles;
+const samplePoint = {...originalPoints[0],cycle:7,ts:1234,cpu_single_core:0,mem_used_mb:123};
+system.full_points = [samplePoint,{...samplePoint,cycle:8,ts:2234,cpu_single_core:null,mem_used_mb:null}];
+data.processes[0].full_cycles = [...processRows,row(9999,1234,{cpu1c:999}),row(9999,1234,{cpu1c:999})];
+setupSegment(system);
+for (const [role,name,value] of [['system-cpu','CPU 总占用','0.00 %'],['memory','已使用内存','123.00 MB']]) {
+  const box = overviewRows(role,1234,[name,'伪造进程']);
+  assert.deepEqual(tooltipRows(box),[name+'：'+value]);
+  assert.equal(box.children[0].textContent,'1970-01-01 08:00:01.234 · 周期 7');
+  assert.deepEqual(tooltipRows(overviewRows(role,2234,[name])),[name+'：缺失或冲突']);
+}
+assert.deepEqual(tooltipRows(overviewRows('memory',1234,['已使用内存','空闲内存'])),
+  ['已使用内存：123.00 MB','空闲内存：'+fmt(samplePoint.mem_avail_mb)+' MB']);
+for (const conflictingCycle of [7,99]) {
+  system.full_points = [samplePoint,{...samplePoint,cycle:conflictingCycle}];
+  setupSegment(system);
+  for (const [role,name] of [['system-cpu','CPU 总占用'],['memory','已使用内存']]) {
+    const box = overviewRows(role,1234,[name]);
+    assert.deepEqual(tooltipRows(box),[name+'：缺失或冲突']);
+    assert.ok(box.children[0].textContent.endsWith(' · 周期 '+(conflictingCycle === 7 ? '7' : '冲突')));
+  }
+}
+system.full_points = originalPoints;
+data.processes[0].full_cycles = processRows;
+setupSegment(system);
+assert.equal(JSON.stringify(data),snapshot);
 document.createElement=create;
 const visibleWrap=root.querySelector('[data-table="all"]');
 visibleWrap.querySelectorAll=()=>data.processes.map(p=>({hidden:p.dp_only,dataset:{process:p.id}}));
@@ -1753,6 +1915,24 @@ assert.equal(tags.children.length,selectedCount);
         for field, expected in (("cpu_total", [760, 792, 800]), ("mem_used_mb", [5399] * 3)):
             self.assertEqual(metrics[field]["count"], 100)
             self.assertEqual([metrics[field][key] for key in ("p95", "p99", "max")], expected)
+
+    def test_import_naming_metadata_legacy_title_and_duplicate_are_immutable(self):
+        started = 1700000000123
+        result = self.store.import_files([("perf.log", io.BytesIO(SAMPLE.encode()))],
+                                         "旧标题<script>ignored</script>", capture_method="SysMonitor",
+                                         device_name="车机/主机", started_at=started)
+        sid = result["id"]
+        before = self.store.session(sid)
+        expected = capture_naming("SysMonitor", "车机/主机", started)
+        self.assertEqual(before["name"], expected.pop("name"))
+        self.assertEqual({key: before["summary"][key] for key in expected}, expected)
+        self.assertEqual(before["summary"]["first_ts"], 946684800123)
+        duplicate = self.store.import_files([("renamed.log", io.BytesIO(SAMPLE.encode()))],
+                                            "另一个标题", capture_method="Top",
+                                            device_name="其他设备", started_at=started + 60000)
+        self.assertEqual(duplicate, {"id": sid, "duplicate": True})
+        self.assertEqual(self.store.session(sid), before)
+        self.assertEqual(Store(self.store.path).session(sid), before)
 
     def test_import_duplicate_query_delete(self):
         result = self.import_sample()
@@ -2231,12 +2411,12 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '完整整机采样'):
             render_document(build_report_data(self.store, sid))
         js = (Path(__file__).parent / 'report_assets/report_compact.js').read_text()
-        prefix = js[:js.index("  plot('system-cpu'")]
+        prefix = js[:js.index("  function combination(")]
         harness = """
 const assert = require('node:assert/strict');
 global.window = {};
 global.document = {
-  getElementById: () => ({textContent:JSON.stringify(data)}),
+  getElementById: id => ({id,textContent:JSON.stringify(data)}),
   createElement: () => ({textContent:'',style:{},children:[],append(...nodes){this.children.push(...nodes);}}),
   documentElement:{clientWidth:900,clientHeight:420,classList:{add(){}}}
 };
@@ -2250,6 +2430,9 @@ const rows = box => box.children[1].children.map(row => row.children.slice(1).ma
         script += prefix + '\nreturn {curves,cpuTooltip,sampleTooltip}; };\n'
         script += """
 const system = window.shared.data.systems[0], process = window.shared.data.processes[0];
+const options = new Map();
+window.shared.draw = (node, option) => options.set(node.id,option);
+const overview = (role, ts) => options.get(system.id+'-'+role).tooltip.formatter([{axisValue:ts}]);
 const api = window.setupCompactReport(system,window.shared);
 const lines = api.curves(process,'cpu1c','test','red');
 assert.equal(lines.flatMap(s => s.data).length,720);
@@ -2281,12 +2464,40 @@ assert.equal(rows(memory.formatter([{axisValue:missing[1]}]))[1],process.name+'�
 assert.equal(memory.formatter([{axisValue:present[1]}]).children[1].children[1].children[0].style.backgroundColor,'#2e956b');
 const zero = process.chart_samples.find(row=>row[2]===0);
 assert.equal(rows(show(zero[1]))[1],window.shared.processLabel(process)+'：0.00 %');
+const assertOverview = sample => {
+  assert.deepEqual(rows(overview('system-cpu',sample[1])),['整机总 CPU：'+window.shared.fmt(sample[2])+' %']);
+  assert.deepEqual(rows(overview('memory',sample[1])),['整机已用内存：'+window.shared.fmt(sample[3])+' MB']);
+  for (const role of ['system-cpu','memory']) {
+    assert.equal(overview(role,sample[1]).children[0].textContent,
+      new Date(sample[1]).toLocaleString()+'.'+String(new Date(sample[1]).getMilliseconds()).padStart(3,'0')+' · 周期 '+sample[0]);
+  }
+};
+assertOverview(missing); // Missing process sample does not affect the overview.
+assertOverview(system.chart_samples[601]);
+process.chart_samples.push([9999,present[1],999,999]);
+window.setupCompactReport(system,window.shared);
+assertOverview(system.chart_samples[601]); // A process's different cycle is irrelevant here.
+assert.ok(rows(window.setupCompactReport(system,window.shared).cpuTooltip([process])
+  .formatter([{axisValue:present[1]}])).every(text=>text.endsWith('缺失或冲突')));
+process.chart_samples.pop();
 process.chart_samples.push([...present]);
 const duplicate = window.setupCompactReport(system,window.shared).cpuTooltip([process]);
 assert.equal(rows(duplicate.formatter([{axisValue:present[1]}]))[1],window.shared.processLabel(process)+'：缺失或冲突');
+assertOverview(system.chart_samples[601]);
+system.chart_samples.push([...system.chart_samples[601]]);
+window.setupCompactReport(system,window.shared);
+for (const role of ['system-cpu','memory']) {
+  assert.ok(rows(overview(role,present[1]))[0].endsWith('缺失或冲突'));
+  assert.ok(overview(role,present[1]).children[0].textContent.endsWith(' · 周期 '+present[0]));
+}
+system.chart_samples.pop();
 system.chart_samples.push([9999,present[1],20,100]);
 const conflict = window.setupCompactReport(system,window.shared).cpuTooltip([process]);
 assert.equal(rows(conflict.formatter([{axisValue:present[1]}]))[0],'整机总 CPU：缺失或冲突');
+for (const role of ['system-cpu','memory']) {
+  assert.ok(rows(overview(role,present[1]))[0].endsWith('缺失或冲突'));
+  assert.ok(overview(role,present[1]).children[0].textContent.endsWith(' · 周期 不明确'));
+}
 """
         self.run_report_script(script)
 
@@ -3574,9 +3785,63 @@ class ApiTests(ReportAssertions, unittest.TestCase):
         self.addCleanup(self.client.close)
         self.headers = {"X-Session-Token": self.client.get("/api/token").json()["token"]}
 
-    def upload(self, text=SAMPLE, title="接口测试"):
+    def upload(self, text=SAMPLE, title="接口测试", device_name=None):
+        data = {} if title is None else {"title": title}
+        if device_name is not None:
+            data["device_name"] = device_name
         return self.client.post("/api/import", headers=self.headers,
-                                files=[("files", ("perf.log", text.encode(), "text/plain"))], data={"title": title})
+                                files=[("files", ("perf.log", text.encode(), "text/plain"))], data=data)
+
+    def test_import_accepts_device_name_with_legacy_title(self):
+        response = self.upload(title='<script>alert("old")</script>', device_name="车机")
+        self.assertEqual(response.status_code, 200, response.text)
+        name = self.app.state.store.session(response.json()["id"])["name"]
+        self.assertRegex(name, r"^本地导入_[0-9]{12}$")
+        self.assertNotIn("script", name)
+
+    def test_import_device_name_legacy_title_and_duplicate(self):
+        response = self.upload(title=None, device_name="  车机/主机\\A  ")
+        self.assertEqual(response.status_code, 200, response.text)
+        sid = response.json()["id"]
+        before = self.client.get(f"/api/sessions/{sid}", headers=self.headers).json()
+        stamp = datetime.fromtimestamp(946684800.123).strftime("%Y%m%d%H%M")
+        self.assertEqual(before["name"], f"本地导入_{stamp}")
+        summary = before["summary"]
+        self.assertEqual(summary["capture_method"], "本地导入")
+        self.assertEqual(summary["device_name"], "车机_主机_A")
+        self.assertEqual(summary["capture_started_at"], 946684800123)
+        self.assertEqual(summary["naming_time_source"], "first_record")
+        for changes in ({"title": "新标题"}, {"title": None, "device_name": "新设备"}):
+            with self.subTest(changes=changes):
+                duplicate = self.upload(**changes)
+                self.assertEqual(duplicate.json(), {"id": sid, "duplicate": True})
+                self.assertEqual(self.client.get(f"/api/sessions/{sid}", headers=self.headers).json(), before)
+
+    def test_import_device_name_validation_and_utf8_boundary(self):
+        self.assertEqual(self.upload(title=None, device_name="车" * 121).status_code, 400)
+        invalid = self.client.post("/api/import", headers=self.headers, files=[
+            ("files", ("perf.log", SAMPLE.encode())), ("device_name", ("device.txt", b"unit")),
+        ])
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(self.app.state.store.sessions(), [])
+        response = self.upload(title=None, device_name="车" * 120)
+        self.assertEqual(response.status_code, 200, response.text)
+        session = self.app.state.store.session(response.json()["id"])
+        self.assertEqual(session["summary"]["device_name"], "车" * 60)
+        self.assertLessEqual(len((session["name"] + ".html").encode()), 255)
+
+    def test_local_top_source_remains_local_import(self):
+        text = ("========== Top 采集 #1 时间: 2026-07-01 12:00:00 UTC ==========\n"
+                "800%cpu 160%user 0%nice 80%sys 520%idle 16%iow 8%irq 16%sirq\n")
+        response = self.upload(text, title=None, device_name="本地车机")
+        self.assertEqual(response.status_code, 200, response.text)
+        session = self.app.state.store.session(response.json()["id"])
+        summary = session["summary"]
+        self.assertEqual(summary["source_format"], "top")
+        self.assertEqual(summary["capture_method"], "本地导入")
+        self.assertEqual(summary["naming_time_source"], "first_record")
+        self.assertEqual(summary["capture_started_at"], summary["first_ts"])
+        self.assertEqual(session["name"], capture_naming(first_ts=summary["first_ts"])["name"])
 
     def test_app_version(self):
         from perf_version import VERSION
@@ -3597,7 +3862,9 @@ class ApiTests(ReportAssertions, unittest.TestCase):
         response = self.client.get(base + '?style=compact', headers=self.headers)
         self.assertEqual(response.status_code, 200, response.text[:500])
         self.assertIn('text/html', response.headers['content-type'])
-        self.assertIn('sysmonitor-report-compact.html', response.headers['content-disposition'])
+        name = self.app.state.store.session(sid)['name'] + '.html'
+        self.assertEqual(response.headers['content-disposition'],
+                         "attachment; filename*=UTF-8''" + quote(name, safe=""))
         self.assertEqual(response.headers['content-security-policy'], REPORT_CSP + '; sandbox allow-scripts')
         self.assertIn('data-report-style="compact"', response.text)
         stream = self.client.get(base + '/stream?style=compact', headers=self.headers)
@@ -3610,6 +3877,35 @@ class ApiTests(ReportAssertions, unittest.TestCase):
         default = self.client.get(base, headers=self.headers)
         self.assertEqual(default.status_code, 200)
         self.assertNotIn('data-report-style="compact"', default.text)
+
+    def test_report_download_names_are_safe_for_both_styles(self):
+        imported = self.upload(title=None, device_name="车机 A")
+        self.assertEqual(imported.status_code, 200, imported.text)
+        sid = imported.json()["id"]
+        store = self.app.state.store
+        original = store.session(sid)["name"]
+        # Legacy persisted names bypass import sanitization and must still be safe.
+        for name in (original, '../车机\\路径";\r\nX-Injected: yes\x00\u202e', "车😀" * 120, " . "):
+            with store.connect() as db:
+                db.execute("UPDATE sessions SET name=? WHERE id=?", (name, sid))
+            headers = []
+            for style in ("default", "compact"):
+                with self.subTest(name=name, style=style):
+                    response = self.client.get(f"/api/sessions/{sid}/report",
+                                               params={"style": style}, headers=self.headers)
+                    self.assertEqual(response.status_code, 200)
+                    disposition = response.headers["content-disposition"]
+                    prefix = "attachment; filename*=UTF-8''"
+                    self.assertTrue(disposition.startswith(prefix))
+                    disposition.encode("ascii")
+                    filename = unquote(disposition[len(prefix):], errors="strict")
+                    self.assertEqual(filename, safe_filename(name, fallback="report") + ".html")
+                    self.assertEqual(disposition, prefix + quote(filename, safe=""))
+                    self.assertNotRegex(filename, r'[\\/:*?"<>|\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]')
+                    self.assertLessEqual(len(filename.encode("utf-8")), 255)
+                    self.assertNotIn("x-injected", response.headers)
+                    headers.append(disposition)
+            self.assertEqual(headers[0], headers[1])
 
     def test_compare_api_validation(self):
         a = self.upload().json()["id"]
@@ -4064,7 +4360,9 @@ const compile = source => ts.transpileModule(source, {compilerOptions: {
         self.assertEqual(report.status_code, 200)
         self.assertEqual(report.headers["content-security-policy"], REPORT_CSP + "; sandbox allow-scripts")
         data = self.assert_report(report.text)
-        self.assertEqual(data["session"]["name"], payload)
+        expected = capture_naming(first_ts=946684800123)["name"]
+        self.assertEqual(data["session"]["name"], expected)
+        self.assertNotIn(payload, data["session"]["name"])
         self.assertIn(payload, [p["name"] for p in data["processes"]])
 
     def test_chunked_limit_closes_files_and_releases_lock(self):
@@ -4116,11 +4414,11 @@ const compile = source => ts.transpileModule(source, {compilerOptions: {
         entered, release = threading.Event(), threading.Event()
         original = self.app.state.store.import_files
 
-        def blocked(*args):
+        def blocked(*args, **kwargs):
             entered.set()
             if not release.wait(5):
                 raise RuntimeError("import test timed out")
-            return original(*args)
+            return original(*args, **kwargs)
 
         with patch.object(self.app.state.store, "import_files", blocked), ThreadPoolExecutor(max_workers=1) as pool:
             first = pool.submit(self.upload)
