@@ -159,11 +159,36 @@ class AdmissionJobsTests(unittest.TestCase):
         self.assertEqual(self.manager.get(S, D2)["state"], "unknown")
         self.publisher.assert_not_called()
 
-    def test_preview_never_allows_data_images(self):
+    def test_preview_rejects_invalid_data_images(self):
         source = '<p>text</p><img src="data:image/png;base64,iVBORw0KGgo=">'
         preview = jobs._preview(source)
         self.assertNotIn("<img", preview)
-        self.assertIn("img-src 'none'", preview)
+        self.assertIn("img-src data:", preview)
+
+    def test_preview_safe_charts_and_untrusted_attributes(self):
+        from test_joyspace import chart_fixture
+        chart = chart_fixture()
+        self.blocks += [chart, chart_fixture(color=6)]
+        self.report_json = json.dumps(self.blocks)
+        self.create()
+        self.wait()
+        preview = self.manager.preview(S, D)
+        self.assertEqual(preview.count('<img '), 2)
+        self.assertIn(chart["src"], preview)
+        self.assertIn('width="1200" height="400"', preview)
+        self.assertIn('max-width:1200px;height:auto', preview)
+        self.assertIn('display:block;width:100%', preview)
+        self.assertIn('img-src data:', preview)
+        safe = f'<img src="{chart["src"]}" width="1200" height="400"'
+        preview = jobs._preview(safe + ' onerror="bad()" srcset="https://evil/a" style="display:none">')
+        self.assertEqual(preview.count('<img '), 1)
+        for forbidden in ('onerror', 'srcset', 'https://evil', 'display:none'):
+            self.assertNotIn(forbidden, preview)
+        for source in (safe + ' src="https://evil/a">',
+                       '<img src="https://evil/a" width="1200" height="400">',
+                       '<img src="data:image/svg+xml;base64,AAAA" width="1200" height="400">',
+                       safe.replace('width="1200"', 'width="1199"') + '>'):
+            self.assertNotIn('<img ', jobs._preview(source))
 
     def test_concurrent_create_and_configuration_conflicts(self):
         gate = self.gate()

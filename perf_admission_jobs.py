@@ -85,6 +85,22 @@ class _Preview(HTMLParser):
             return
         if tag in self.BLOCK:
             self.blocked.append(tag)
+        elif tag == "img":
+            values = dict(attrs)
+            # Rebuild the element: never retain event handlers, styles, srcset,
+            # duplicate attributes, external URLs or unvalidated image content.
+            if len(values) != len(attrs):
+                return
+            try:
+                perf_slate.validate_image({
+                    "type": "image", "src": values.get("src"),
+                    "width": int(values.get("width", "")),
+                    "height": int(values.get("height", "")), "children": [{"text": ""}],
+                })
+            except (perf_slate.SlateError, ValueError, TypeError):
+                return
+            self.parts.append('<img class="admission-chart" src="' + values["src"]
+                              + '" width="1200" height="400" alt="资源占用趋势图">')
         elif tag in self.TAGS:
             self.parts.append("<" + tag + self._attrs(tag, attrs) + ">")
 

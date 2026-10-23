@@ -8,6 +8,8 @@ template survive into the published page unchanged.
 from __future__ import annotations
 
 from copy import deepcopy
+import base64
+import io
 import json
 import math
 from pathlib import Path
@@ -100,6 +102,93 @@ def _statistics(processes, schema, scene, windows, factor, plain=()):
     return [p95, k(p95), peak, k(peak),
             max(memory) if memory else None,
             max(reads) if reads else None, max(writes) if writes else None]
+
+
+def _chart_runs(points, field, divisor=1):
+    """Full-sample ordinal axis; missing data and discontinuities never connect."""
+    runs, run, previous = [], [], None
+    for index, point in enumerate(points):
+        value = scale_metric(point.get(field), divisor=divisor)
+        ts, cycle = point.get("ts"), point.get("cycle")
+        valid = value is not None and _valid(ts) and _valid(cycle)
+        continuous = (valid and previous is not None and run and
+                      point.get("segment") == previous.get("segment") and
+                      cycle == previous.get("cycle") + 1 and ts > previous.get("ts"))
+        if not continuous and run:
+            runs.append(run)
+            run = []
+        if valid:
+            run.append((index, value))
+        previous = point if valid else None
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _chart_image(points, field, divisor, title, color):
+    # Pillow's bundled font keeps offline builds independent of system CJK fonts.
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (perf_slate.CHART_WIDTH, perf_slate.CHART_HEIGHT), "white")
+    draw = ImageDraw.Draw(image)
+    font, heading = ImageFont.load_default(size=16), ImageFont.load_default(size=23)
+    draw.text((80, 18), title, fill="#172b4d", font=heading)
+    runs = _chart_runs(points, field, divisor)
+    values = [value for run in runs for _, value in run]
+    # Normalise before subtraction to keep finite extreme values drawable.
+    magnitude = max([1.0] + [abs(value) for value in values])
+    low = min([0.0] + [value / magnitude for value in values])
+    high = max([1.0 / magnitude] + [value / magnitude for value in values])
+    left, top, right, bottom = 80, 65, 1160, 325
+    for tick in range(6):
+        y = bottom - (bottom - top) * tick / 5
+        value = (low + (high - low) * tick / 5) * magnitude
+        draw.line((left, y, right, y), fill="#e5eaf1")
+        draw.text((left - 10, y), f"{value:.3g}", fill="#526479", font=font, anchor="rm")
+    denominator = max(1, len(points) - 1)
+    position = lambda index, value: (
+        left + (right - left) * index / denominator,
+        bottom - (bottom - top) * (value / magnitude - low) / (high - low))
+    for run in runs:
+        coordinates = [position(index, value) for index, value in run]
+        if len(coordinates) > 1:
+            draw.line(coordinates, fill=color, width=2)
+        else:
+            x, y = coordinates[0]
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
+    for index in sorted({round(denominator * tick / 5) for tick in range(6)}):
+        if index >= len(points):
+            continue
+        x = left + (right - left) * index / denominator
+        draw.text((x, bottom + 10), str(index + 1), fill="#526479", font=font, anchor="mt")
+    if not values:
+        draw.text((620, 190), "No valid samples", fill="#526479", font=heading, anchor="mm")
+    draw.text((620, 372), "Sample order (all segments; gaps are not connected)",
+              fill="#526479", font=font, anchor="mm")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return dict(type="image", src=perf_slate.PNG_PREFIX + base64.b64encode(buffer.getvalue()).decode("ascii"),
+                width=perf_slate.CHART_WIDTH, height=perf_slate.CHART_HEIGHT, children=[{"text": ""}])
+
+
+def _with_charts(layout, points):
+    charts = [
+        _chart_image(points, "cpu_single_core", 1, "Total CPU - single-core (%)", "#2563eb"),
+        _chart_image(points, "mem_used_mb", 1024, "System used memory (GB)", "#079669"),
+    ]
+    placeholders = {"【折线图占位】各进程 CPU 占用 + 总 CPU 折线图", "【折线图占位】内存占用折线图"}
+    result, inside = [], False
+    for block in layout.blocks:
+        if (block.get("type") == "list" and block.get("header") == 2 and
+                perf_slate.label(perf_slate.text_of(block)) == perf_slate.label(perf_slate.H_PROCESS)):
+            inside = False
+        if inside and block.get("type") == "p" and perf_slate.text_of(block).strip() in placeholders:
+            continue
+        result.append(block)
+        if block is layout.overall:
+            result.extend(charts)
+            inside = True
+    return result
 
 
 def _write(path, content):
@@ -232,8 +321,10 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     if missing:
         warnings.append("未可靠采集：" + "、".join(missing))
 
-    blocks = list(layout.blocks) + perf_slate.note_blocks(warnings)
-    perf_slate.validate_tree(blocks)
+    warnings.append("5.1趋势图依次为总CPU（单核%，可超过100%）和整机已用内存（MB÷1024，GB）；"
+                    "横轴为跨段全量系统样本顺序，非等间隔时间轴；缺值、缺周期、时间不递增及段间断线，不补零。")
+    blocks = _with_charts(layout, full) + perf_slate.note_blocks(warnings)
+    perf_slate.validate_tree(blocks, allow_images=True)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     _write(output_dir / "report.json",

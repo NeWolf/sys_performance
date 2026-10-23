@@ -6,14 +6,18 @@ straight into that tree, and the very same tree is uploaded and rendered
 locally.  The published page and the local preview therefore share the
 template's own layout.
 
-Only the template's own block vocabulary is accepted.  An image, a file, an
-embed or any unknown block is refused rather than republished, which is what
-keeps the "no images" guarantee of this feature.
+Templates accept only their own image-free block vocabulary. Generated reports
+may opt into strictly validated local PNG charts; files, embeds, external images
+and unknown blocks remain forbidden.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import html
 import re
+import struct
+import zlib
 
 HEADER_BG = "#F86560"
 NOTE_COLOR = "#F5222D"
@@ -133,12 +137,99 @@ def _check(node, path):
         _check(child, f"{path}.{index}")
 
 
-def validate_tree(blocks):
-    """Reject any block the template never produces; guarantees image freedom."""
+PNG_PREFIX = "data:image/png;base64,"
+MAX_PNG_BYTES = 2 * 1024 * 1024
+CHART_WIDTH, CHART_HEIGHT = 1200, 400
+
+
+def validate_png(src):
+    """Decode only bounded, complete 8-bit RGB/RGBA non-interlaced PNG charts."""
+    def invalid():
+        raise SlateError("图表必须是完整、安全的 1200×400 PNG 内嵌图片。")
+
+    if (not isinstance(src, str) or not src.startswith(PNG_PREFIX)
+            or len(src) > len(PNG_PREFIX) + 4 * ((MAX_PNG_BYTES + 2) // 3)):
+        invalid()
+    encoded = src[len(PNG_PREFIX):]
+    try:
+        png = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        invalid()
+    if (len(png) > MAX_PNG_BYTES or not png.startswith(b"\x89PNG\r\n\x1a\n")
+            or base64.b64encode(png).decode("ascii") != encoded):
+        invalid()
+    offset, channels, ended, idat_closed = 8, 0, False, False
+    compressed = bytearray()
+    while offset + 12 <= len(png):
+        length = struct.unpack_from(">I", png, offset)[0]
+        kind = png[offset + 4:offset + 8]
+        stop = offset + 8 + length
+        if stop + 4 > len(png):
+            invalid()
+        data = png[offset + 8:stop]
+        crc = struct.unpack_from(">I", png, stop)[0]
+        if zlib.crc32(kind + data) & 0xffffffff != crc:
+            invalid()
+        if offset == 8:
+            if kind != b"IHDR" or length != 13:
+                invalid()
+            width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", data)
+            if ((width, height) != (CHART_WIDTH, CHART_HEIGHT) or depth != 8
+                    or color not in (2, 6) or compression or filtering or interlace):
+                invalid()
+            channels = 3 if color == 2 else 4
+        elif kind == b"IDAT":
+            if idat_closed:
+                invalid()
+            compressed.extend(data)
+        elif kind == b"IEND":
+            if length or stop + 4 != len(png):
+                invalid()
+            ended = True
+        elif kind not in (b"tEXt", b"pHYs", b"sRGB", b"gAMA", b"cHRM"):
+            invalid()
+        if compressed and kind != b"IDAT":
+            idat_closed = True
+        offset = stop + 4
+    if not ended or not compressed:
+        invalid()
+    stride = CHART_WIDTH * channels + 1
+    expected = stride * CHART_HEIGHT
+    try:
+        decoder = zlib.decompressobj()
+        pixels = decoder.decompress(compressed, expected + 1)
+    except zlib.error:
+        invalid()
+    if (len(pixels) != expected or not decoder.eof or decoder.unused_data
+            or decoder.unconsumed_tail or any(pixels[i] > 4 for i in range(0, expected, stride))):
+        invalid()
+    return png
+
+
+def validate_image(block):
+    if (not isinstance(block, dict)
+            or set(block) != {"type", "src", "width", "height", "children"}
+            or block.get("type") != "image"
+            or type(block.get("width")) is not int or block["width"] != CHART_WIDTH
+            or type(block.get("height")) is not int or block["height"] != CHART_HEIGHT
+            or block.get("children") != [{"text": ""}]):
+        raise SlateError("图表结构无效，仅允许固定尺寸的顶级 PNG 图表。")
+    return validate_png(block["src"])
+
+
+def validate_tree(blocks, allow_images=False):
+    """Templates are image-free; generated reports may opt into safe PNGs."""
     if not isinstance(blocks, list) or not blocks:
         raise SlateError("模板内容为空或格式无效。")
+    images = 0
     for index, block in enumerate(blocks):
-        _check(block, f"blocks[{index}]")
+        if allow_images and isinstance(block, dict) and block.get("type") == "image":
+            validate_image(block)
+            images += 1
+            if images > 2:
+                raise SlateError("报告最多允许两张 PNG 图表。")
+        else:
+            _check(block, f"blocks[{index}]")
     return blocks
 
 
@@ -352,9 +443,14 @@ def _table_html(table):
 
 def to_html(blocks):
     """Render the block tree the way JoySpace shows it, for a faithful preview."""
+    validate_tree(blocks, allow_images=True)
     parts, counters = [], [0, 0]
     for block in blocks:
         kind = block.get("type")
+        if kind == "image":
+            parts.append('<img class="admission-chart" src="' + block["src"]
+                         + '" width="1200" height="400" alt="资源占用趋势图">')
+            continue
         if kind == "table":
             parts.append(_table_html(block))
             continue
@@ -382,6 +478,7 @@ PREVIEW_CSS = (
     "h3{font-size:16px;margin:18px 0 8px}"
     ".num{margin-right:6px;color:#8c8c8c}"
     "p{margin:8px 0}"
+    "img.admission-chart{display:block;width:100%;max-width:1200px;height:auto;margin:12px 0}"
     ".note{color:#F5222D}"
     ".budget-low{color:#389E0D}"
     ".muted{color:#8c8c8c}"
@@ -398,7 +495,7 @@ _PREVIEW_SHELL = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none';"
-    " script-src 'none'; img-src 'none'; style-src 'unsafe-inline';"
+    " script-src 'none'; img-src data:; style-src 'unsafe-inline';"
     " base-uri 'none'; form-action 'none'\">"
     "<title>性能准入报告预览</title><style>{css}</style></head><body>{body}</body></html>"
 )

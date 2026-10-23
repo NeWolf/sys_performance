@@ -389,11 +389,22 @@ class NodeRuntimePackagingTests(unittest.TestCase):
             required = ("SKILL.md", "skills/shared-auth.mjs",
                         "skills/hioffice-auth/scripts/hioffice-auth.mjs",
                         "skills/joyspace-read-doc/scripts/read_joyspace_doc.js",
-                     "skills/markdown-to-joyspace/scripts/import_markdown_doc.js")
+                        "skills/markdown-to-joyspace/scripts/import_markdown_doc.js",
+                        "skills/markdown-to-joyspace/scripts/import_slate_doc.mjs",
+                        "skills/markdown-to-joyspace/scripts/chart_browser.mjs",
+                        "skills/joyspace-list/scripts/list_joyspace.mjs")
             for name in required:
                 target = skill / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text("mock resource", encoding="utf-8")
+            self.assertEqual(node_runtime.verify_skill(root), skill)
+            real_is_file = Path.is_file
+            for missing in required:
+                def is_file(path, missing=missing):
+                    return path != skill / missing and real_is_file(path)
+                with self.subTest(missing=missing), patch.object(Path, "is_file", is_file):
+                    with self.assertRaisesRegex(RuntimeError, "skill resources missing"):
+                        node_runtime.verify_skill(root)
             self.assertEqual(node_runtime.verify_skill(Path(__file__).parent),
                              Path(__file__).parent / "joyspace_assets/joyspace-kit")
             with patch.object(node_runtime, "verify_node") as verify:

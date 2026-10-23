@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import perf_slate
-from perf_admission import build_admission
+from perf_admission import _chart_image, _chart_runs, build_admission
 from perf_parser import SCHEMAS
 from perf_report_data import KDMIPS_PER_CORE, REQUIRED_PROCESSES, build_report_data
 from perf_report_ui import EXCEL_BUDGETS
@@ -134,7 +134,7 @@ class AdmissionTests(unittest.TestCase):
 
     def assert_preserved(self, before, blocks):
         # Compare every property except the measured text leaves we may replace.
-        restored = deepcopy(blocks[:len(before)])
+        restored = deepcopy([block for block in blocks if block.get("type") != "image"][:len(before)])
         for name in ("overall", "process"):
             old_table = table_named(before, name)
             new_table = table_named(restored, name)
@@ -466,7 +466,68 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(variant=index):
                 self.assert_rejected_before_read(source)
 
-    def test_safe_image_free_preview(self):
+    def assert_safe_charts(self, tags):
+        images = [attrs for tag, attrs in tags if tag == "img"]
+        self.assertEqual(len(images), 2)
+        for attrs in images:
+            perf_slate.validate_png(attrs["src"])
+            self.assertEqual(attrs["width"], "1200")
+            self.assertEqual(attrs["height"], "400")
+
+    def test_chart_units_full_samples_and_discontinuities(self):
+        points = [dict(segment=0, cycle=i, ts=i * 1000, cpu_single_core=800,
+                       mem_used_mb=4096) for i in range(1000)]
+        self.assertEqual(len(_chart_runs(points, "cpu_single_core")[0]), 1000)
+        self.assertEqual(_chart_runs(points, "cpu_single_core")[0][0], (0, 800))
+        self.assertEqual(_chart_runs(points, "mem_used_mb", 1024)[0][-1], (999, 4))
+        # Missing values split only their own metric; missing timestamp splits both.
+        points[2]["cpu_single_core"] = None
+        points[4]["cycle"] = 99
+        points[6]["ts"] = points[5]["ts"]
+        points[8]["segment"] = 1
+        points[10]["ts"] = None
+        points[12]["cpu_single_core"] = float("nan")
+        runs = _chart_runs(points, "cpu_single_core")
+        links = {(a[0], b[0]) for run in runs for a, b in zip(run, run[1:])}
+        self.assertIn((0, 1), links)
+        for link in ((1, 3), (3, 4), (4, 5), (5, 6), (7, 8), (8, 9), (9, 11), (11, 13)):
+            self.assertNotIn(link, links)
+        self.assertIn((1, 2), {(a[0], b[0]) for run in _chart_runs(points, "mem_used_mb", 1024)
+                             for a, b in zip(run, run[1:])})
+        extremes = [dict(segment=0, cycle=i, ts=i, cpu_single_core=value)
+                    for i, value in enumerate((0, -1e308, 1e308))]
+        for samples in ([], points[:1], points, extremes):
+            perf_slate.validate_image(_chart_image(samples, "cpu_single_core", 1, "CPU (%)", "blue"))
+        self.assertNotEqual(_chart_image(points[:1], "cpu_single_core", 1, "CPU", "blue")["src"],
+                            _chart_image([], "cpu_single_core", 1, "CPU", "blue")["src"])
+
+    def test_charts_replace_only_exact_overall_placeholders(self):
+        cpu = "【折线图占位】各进程 CPU 占用 + 总 CPU 折线图"
+        memory = "【折线图占位】内存占用折线图"
+        source = template()
+        source[4:4] = [paragraph(cpu), paragraph(memory), paragraph(cpu + " 人工备注")]
+        source.insert(0, paragraph(cpu))  # Same text outside 5.1 must survive.
+        before = deepcopy(source)
+        result = self.build(s(1, cpu=80) + p(1) + s(2, cpu=90) + p(2), source=source)
+        self.assertEqual(source, before)
+        blocks = result["blocks"]
+        overall = blocks.index(table_named(blocks, "overall"))
+        self.assertEqual([block["type"] for block in blocks[overall + 1:overall + 3]], ["image", "image"])
+        self.assertEqual(sum(perf_slate.text_of(block) == cpu for block in blocks), 1)
+        self.assertFalse(any(perf_slate.text_of(block) == memory for block in blocks))
+        self.assertIn(cpu + " 人工备注", result["html"])
+        self.assertIn("人工折线图占位说明需保留", result["html"])
+        self.assert_safe_charts(Tags(result["html"]).tags)
+        from perf_admission_jobs import _preview
+        from perf_joyspace import report_snapshot
+        snapshot, digest = report_snapshot(self.output / "report.json")
+        self.assertEqual(snapshot, blocks)
+        self.assertEqual(len(digest), 64)
+        self.assert_safe_charts(Tags(_preview(perf_slate.to_html(snapshot))).tags)
+        self.assertEqual(json.loads((self.output / "report.json").read_text()), blocks)
+        self.assertEqual(self.rows(blocks)[1], [["CPU(%)", "720.00", "720.00"], ["内存(GB)", "4.00", "4.00"]])
+
+    def test_safe_inline_chart_preview(self):
         attack = '<script>alert(1)</script><img src="https://bad/x" onerror="bad()">\n'
         attack += '![remote](https://bad/image.png)\n![local](/etc/passwd)\n[x](javascript:bad)\n'
         source = [paragraph(attack)] + template()
@@ -477,13 +538,13 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("a", [tag for tag, _ in tags])
         self.assertIn(html.escape(attack, quote=True).replace("\n", "<br>"), preview)
         self.assertNotIn(str(self.output), preview)
-        self.assertFalse(any(tag == "img" for tag, _ in tags))
+        self.assert_safe_charts(tags)
         self.assertFalse(any(key.lower().startswith("on") for _, attrs in tags for key in attrs))
         self.assertEqual([p.name for p in self.output.iterdir()], ["report.json"])
         self.assertEqual(perf_slate.text_of(result["blocks"][0]), attack)
         self.assertIn("人工折线图占位说明需保留", preview)
         self.assertTrue(any("default-src 'none'" in attrs.get("content", "") and
-                            "img-src 'none'" in attrs.get("content", "") for _, attrs in tags))
+                            "img-src data:" in attrs.get("content", "") for _, attrs in tags))
 
     def test_image_and_embed_blocks_rejected_everywhere(self):
         for kind in ("image", "img", "picture", "svg", "file", "embed", "iframe", "unknown"):
@@ -518,7 +579,8 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(perf_slate.text_of(result["blocks"][0]), text)
         self.assertEqual(self.rows(result["blocks"])[0][0][4], text)
         self.assertEqual(result["html"].count(html.escape(text, quote=True).replace("\n", "<br>")), 4)
-        self.assertFalse(any(tag in ("img", "image", "a") for tag, _ in Tags(result["html"]).tags))
+        self.assert_safe_charts(Tags(result["html"]).tags)
+        self.assertFalse(any(tag in ("image", "a") for tag, _ in Tags(result["html"]).tags))
 
     def test_literal_image_syntax_is_not_deleted(self):
         literals = ('注意 ![未通过] 请复查', '注意 ![a][missing] 后',
@@ -539,7 +601,8 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(perf_slate.text_of(result["blocks"][index]), text)
                 self.assertIn(html.escape(text, quote=True).replace("\n", "<br>"), result["html"])
-        self.assertFalse(any(tag in ("img", "image", "picture", "svg", "a")
+        self.assert_safe_charts(Tags(result["html"]).tags)
+        self.assertFalse(any(tag in ("image", "picture", "svg", "a")
                              for tag, _ in Tags(result["html"]).tags))
 
     def test_malformed_slate_rejected_before_store_read(self):

@@ -160,6 +160,9 @@ def verify_skill(root):
         "skills/hioffice-auth/scripts/hioffice-auth.mjs",
         "skills/joyspace-read-doc/scripts/read_joyspace_doc.js",
         "skills/markdown-to-joyspace/scripts/import_markdown_doc.js",
+        "skills/markdown-to-joyspace/scripts/import_slate_doc.mjs",
+        "skills/markdown-to-joyspace/scripts/chart_browser.mjs",
+        "skills/joyspace-list/scripts/list_joyspace.mjs",
     )
     if any(not (skill / name).is_file() for name in required):
         raise RuntimeError(f"JoySpace skill resources missing: {skill}")

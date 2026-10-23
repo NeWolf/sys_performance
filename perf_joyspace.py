@@ -1,13 +1,19 @@
 """Safe bridge to the bundled JoySpace read/import tools (no npm dependency)."""
+from contextlib import closing
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from urllib.parse import urlsplit
 
 import perf_slate
@@ -27,6 +33,8 @@ LIST_SCRIPT = "skills/joyspace-list/scripts/list_joyspace.mjs"
 PAGE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
 MARKDOWN_PAGE = 13
+CHARTS_UNSUPPORTED = ("含图报告发布需要可启动的 Chrome 或 Edge 浏览器，请安装后再试。"
+                      "本次未认证、创建页面或上传图片；本地报告保持不变。")
 PUBLISH_UNKNOWN = "发布结果未知，远端可能存在文档、临时页或图片残留；请先在 JoySpace 人工确认，不要自动重试。"
 PUBLISH_RECOVERED = ("发布结果未收到确认，但在最近文档中找到同名页面；"
                      "该链接未经内容校验，请人工核对正文后再使用。")
@@ -35,6 +43,10 @@ PROBE = "console.log(JSON.stringify({version:process.version,platform:process.pl
 
 class JoySpaceError(RuntimeError):
     """An intentionally safe message suitable for display to the user."""
+
+
+class _ChartsUnavailable(JoySpaceError):
+    """A confirmed local preflight rejection, not an unknown publish outcome."""
 
 
 def _root():
@@ -47,6 +59,7 @@ def _runtime():
     root = _root()
     skill = root / "joyspace_assets/joyspace-kit"
     for name in ("SKILL.md", READ_SCRIPT, IMPORT_SCRIPT, SLATE_SCRIPT, LIST_SCRIPT,
+                "skills/markdown-to-joyspace/scripts/chart_browser.mjs",
                 "skills/shared-auth.mjs",
                 "skills/hioffice-auth/scripts/hioffice-auth.mjs"):
         if not (skill / name).is_file():
@@ -76,13 +89,325 @@ def _environment(probe=False):
     return env
 
 
+# Never run the publishing module before Windows has assigned the gated Node
+# process to its private, non-breakaway Job. No browser/auth code runs in the gate.
+_WINDOWS_PUBLISH_GATE = r"""
+process.on('SIGBREAK', () => {
+  if (!process.emit('SIGTERM')) process.exit(1);
+});
+process.stdin.once('data', async chunk => {
+  process.stdin.removeAllListeners('end');
+  process.stdin.destroy();
+  if (chunk.toString() !== '1') process.exit(1);
+  try {
+    const {pathToFileURL} = await import('node:url');
+    await import(pathToFileURL(process.argv[1]).href);
+  } catch { process.exitCode = 1; }
+});
+process.stdin.once('end', () => process.exit(1));
+"""
+_PUBLISH_GRACE = 2.0
+_PUBLISH_OUTPUT_LIMIT = 8 * 1024 * 1024
+
+
+class _WindowsPublishJob:
+    """Own only this launch and descendants, never enumerate/kill browser names."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes as w
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                        ("flags", w.DWORD), ("min_ws", ctypes.c_size_t),
+                        ("max_ws", ctypes.c_size_t), ("active_limit", w.DWORD),
+                        ("affinity", ctypes.c_size_t), ("priority", w.DWORD),
+                        ("scheduling", w.DWORD)]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in
+                        ("read_ops", "write_ops", "other_ops", "read", "write", "other")]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("basic", BasicLimits), ("io", IoCounters),
+                        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                        ("peak_process", ctypes.c_size_t), ("peak_job", ctypes.c_size_t)]
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_int64) for name in
+                        ("user", "kernel", "period_user", "period_kernel")] + [
+                            (name, w.DWORD) for name in
+                            ("faults", "total", "active", "terminated")]
+
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "CreateJobObjectW": ([ctypes.c_void_p, w.LPCWSTR], w.HANDLE),
+            "SetInformationJobObject": ([w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD], w.BOOL),
+            "QueryInformationJobObject": ([w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.c_void_p], w.BOOL),
+            "AssignProcessToJobObject": ([w.HANDLE, w.HANDLE], w.BOOL),
+            "TerminateJobObject": ([w.HANDLE, w.UINT], w.BOOL),
+            "CloseHandle": ([w.HANDLE], w.BOOL),
+        }
+        for name, (argtypes, restype) in signatures.items():
+            function = getattr(api, name)
+            function.argtypes, function.restype = argtypes, restype
+        self.api, self.ctypes, self.accounting = api, ctypes, Accounting
+        self.handle = api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise OSError("Cannot create private publish job")
+        limits = ExtendedLimits()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no breakaway.
+        try:
+            self._check(api.SetInformationJobObject(
+                self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)))
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _check(ok):
+        if not ok:
+            raise OSError("Private publish job operation failed")
+
+    def assign(self, process):
+        self._check(self.api.AssignProcessToJobObject(self.handle, int(process._handle)))
+
+    def active(self):
+        info = self.accounting()
+        self._check(self.api.QueryInformationJobObject(
+            self.handle, 1, self.ctypes.byref(info), self.ctypes.sizeof(info), None))
+        return info.active
+
+    def terminate(self):
+        self._check(self.api.TerminateJobObject(self.handle, 1))
+
+    def close(self):
+        if self.handle:
+            handle, self.handle = self.handle, None
+            self._check(self.api.CloseHandle(handle))
+
+
+def _macos_publish_group_exited(pgid):
+    """Prove the pinned private group contains no live members, or fail closed."""
+    if sys.platform != "darwin":
+        return False
+    import ctypes
+
+    # Unlike a system-wide process scan, PROC_PGRP_ONLY selects only our group.
+    api = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    api.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32,
+                                 ctypes.c_void_p, ctypes.c_int]
+    api.proc_listpids.restype = ctypes.c_int
+    api.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                ctypes.c_void_p, ctypes.c_int]
+    api.proc_pidinfo.restype = ctypes.c_int
+
+    class BsdShortInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint32) for name in
+                    ("pid", "ppid", "pgid", "status")] + [
+                        ("comm", ctypes.c_char * 16)] + [
+                            (name, ctypes.c_uint32) for name in
+                            ("flags", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")]
+
+    size = api.proc_listpids(2, pgid, None, 0)  # PROC_PGRP_ONLY
+    if size <= 0:
+        return False  # The unreaped leader must still be present.
+    for _ in range(3):
+        members = (ctypes.c_int * (size // ctypes.sizeof(ctypes.c_int) + 32))()
+        capacity = ctypes.sizeof(members)
+        used = api.proc_listpids(2, pgid, members, capacity)
+        if used <= 0 or used % ctypes.sizeof(ctypes.c_int):
+            return False
+        if used < capacity:
+            break
+        size = capacity * 2  # Never accept a potentially truncated snapshot.
+    else:
+        return False
+    pids = list(members)[:used // ctypes.sizeof(ctypes.c_int)]
+    if pgid not in pids or any(pid <= 0 for pid in pids):
+        return False
+    for pid in pids:
+        info = BsdShortInfo()
+        ctypes.set_errno(0)
+        used = api.proc_pidinfo(pid, 13, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if used == 0 and ctypes.get_errno() == errno.ESRCH:
+            # Darwin proc_pidinfo excludes zombies; a reaped member is also gone.
+            # Never use these snapshot PIDs as signal targets (they can recycle).
+            continue
+        if (used != ctypes.sizeof(info) or info.pid != pid or info.pgid != pgid
+                or info.status != 5):  # SZOMB; EPERM and unknown states fail closed.
+            return False
+    # A live member could have forked and exited while we inspected the first
+    # snapshot. Accept only unchanged membership after every member proved dead;
+    # any new/missing PID or truncation is uncertainty, not permission to ignore.
+    used = api.proc_listpids(2, pgid, members, capacity)
+    return (0 < used < capacity and used % ctypes.sizeof(ctypes.c_int) == 0
+            and set(list(members)[:used // ctypes.sizeof(ctypes.c_int)]) == set(pids))
+
+
+def _signal_publish_group(process, sig):
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # macOS killpg can return EPERM when every member is already a zombie.
+        # Keep the leader unreaped during verification, pinning the group ID.
+        if not _macos_publish_group_exited(process.pid):
+            raise
+        return False
+    return True
+
+
+def _stop_publish_group(process):
+    # start_new_session makes this PID the exclusive process group leader.
+    # Never signal after reaping it, or after observing the group's removal.
+    if process.returncode is not None or process.pid <= 1 or process.pid == os.getpgrp():
+        raise OSError("Invalid private publish group")
+    if not _signal_publish_group(process, signal.SIGTERM):
+        return
+    deadline = time.monotonic() + _PUBLISH_GRACE
+    while time.monotonic() < deadline:
+        if not _signal_publish_group(process, 0):
+            return
+        time.sleep(0.05)
+    _signal_publish_group(process, signal.SIGKILL)
+
+
+def _stop_publish_tree(process, job=None):
+    """Bounded cleanup, including descendants left behind by a successful Node."""
+    try:
+        if job is not None:
+            try:
+                if job.active():
+                    if process.returncode is None:
+                        try:
+                            process.send_signal(signal.CTRL_BREAK_EVENT)
+                        except OSError:
+                            pass  # No console: Job termination remains authoritative.
+                    deadline = time.monotonic() + _PUBLISH_GRACE
+                    while job.active() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    job.terminate()
+                    deadline = time.monotonic() + _PUBLISH_GRACE
+                    while job.active() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if job.active():
+                        raise OSError("Private publish job did not terminate")
+            finally:
+                job.close()  # KILL_ON_JOB_CLOSE also covers exceptions in cleanup.
+        else:
+            _stop_publish_group(process)
+    finally:
+        # Even a genuine permission/query/Job error must not strand the leader.
+        # All group operations are over before wait/kill can reap its pinned PID.
+        try:
+            process.wait(timeout=_PUBLISH_GRACE)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()  # Only our direct Popen child; never a snapshot PID.
+            finally:
+                process.wait(timeout=_PUBLISH_GRACE)
+
+
+def _wait_publish(process, timeout):
+    if os.name == "nt":
+        process.wait(timeout=timeout)
+        return
+    # Keep the session leader unreaped until group cleanup. This pins its PID,
+    # preventing a recycled group ID from ever targeting an unrelated process.
+    if not all(hasattr(os, name) for name in ("waitid", "P_PID", "WNOWAIT")):
+        # macOS Python may not expose waitid; kqueue observes exit without reaping.
+        if not hasattr(select, "kqueue"):
+            raise OSError("Private publish exit observation unavailable")
+        with closing(select.kqueue()) as queue:
+            event = select.kevent(process.pid, filter=select.KQ_FILTER_PROC,
+                                 flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                 fflags=select.KQ_NOTE_EXIT)
+            try:
+                events = queue.control([event], 1, timeout)
+            except ProcessLookupError:
+                return  # Already exited before registration; still unreaped.
+            if not events:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for event in events:
+                if event.flags & select.KQ_EV_ERROR:
+                    if event.data == errno.ESRCH:
+                        return
+                    raise OSError("Private publish exit observation failed")
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        time.sleep(min(0.05, remaining))
+
+
+def _run_publish(node, args, skill, *, timeout, probe=False):
+    """Use files, not inherited output pipes: EOF cannot stall the timeout path."""
+    command = [str(node), *args]
+    job = None
+    process = None
+    assigned = False
+    # Only these handles are ours. Do not scan/remove browser profile directories.
+    with tempfile.TemporaryFile(mode="w+b") as stdout:
+        try:
+            options = {"start_new_session": True}
+            if os.name == "nt":
+                job = _WindowsPublishJob()
+                options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                command = [str(node), "--input-type=module", "-e", _WINDOWS_PUBLISH_GATE, *args]
+            process = subprocess.Popen(
+                command, cwd=str(skill), env=_environment(probe), shell=False,
+                stdin=subprocess.PIPE if job else subprocess.DEVNULL,
+                stdout=stdout, stderr=subprocess.DEVNULL, close_fds=True, **options,
+            )
+            if job is not None:
+                job.assign(process)
+                assigned = True
+                process.stdin.write(b"1")
+                process.stdin.flush()
+                process.stdin.close()
+            _wait_publish(process, timeout)
+        finally:
+            try:
+                if process is not None:
+                    if job is not None and not assigned:
+                        # Gate never opened: no publisher/browser has executed.
+                        try:
+                            process.kill()
+                        finally:
+                            process.wait(timeout=_PUBLISH_GRACE)
+                    else:
+                        _stop_publish_tree(process, job)
+            finally:
+                try:
+                    if job is not None:
+                        job.close()
+                finally:
+                    if process is not None and process.stdin is not None:
+                        process.stdin.close()
+        stdout.seek(0)
+        output = stdout.read(_PUBLISH_OUTPUT_LIMIT + 1)
+        if len(output) > _PUBLISH_OUTPUT_LIMIT:
+            raise ValueError("Publish output too large")
+        # Strict decode happens only after all owned processes have been cleaned.
+        return subprocess.CompletedProcess(command, process.returncode, output.decode("utf-8"), "")
+
+
 def _invoke(node, args, skill, *, timeout, publish=False, probe=False, shape=dict):
     try:
-        result = subprocess.run(
-            [str(node), *args], cwd=str(skill), env=_environment(probe),
-            shell=False, capture_output=True, text=True, encoding="utf-8",
-            timeout=timeout, check=False,
-        )
+        if publish:
+            result = _run_publish(node, args, skill, timeout=timeout, probe=probe)
+        else:
+            result = subprocess.run(
+                [str(node), *args], cwd=str(skill), env=_environment(probe),
+                shell=False, capture_output=True, text=True, encoding="utf-8",
+                timeout=timeout, check=False,
+            )
         if result.returncode:
             raise ValueError("script failed")
         data = json.loads(result.stdout)
@@ -158,17 +483,23 @@ def read_template():
     raise JoySpaceError(str(failure) if failure else "JoySpace 模板内容为空或格式无效。")
 
 
+def _has_charts(blocks):
+    detector = getattr(perf_slate, "has_charts", None)
+    if callable(detector):
+        return detector(blocks)
+    return isinstance(blocks, list) and any(
+        isinstance(block, dict) and block.get("type") == "image" for block in blocks)
+
+
 def report_snapshot(file_path):
-    """Read and validate one image-free draft block tree without remote I/O."""
+    """Validate a draft and hash its original bytes without changing it or doing I/O remotely."""
     try:
         content = Path(file_path).read_bytes()
         blocks = json.loads(content.decode("utf-8"))
     except (OSError, UnicodeError, ValueError):
         raise JoySpaceError("无法读取报告，请重新生成并预览。") from None
     try:
-        # The allow-list refuses images, files and embeds along with anything
-        # else the template never produces.
-        perf_slate.validate_tree(blocks)
+        perf_slate.validate_tree(blocks, allow_images=True)
     except perf_slate.SlateError as exc:
         raise JoySpaceError(f"报告内容不受支持，暂不支持发布：{exc}"
                             "请检查完整正文后重新生成并预览。") from None
@@ -251,20 +582,28 @@ def publish_slate(file_path, title, placement="personal", parent_page=None, *, e
     blocks, source_sha256 = report_snapshot(path)
     if expected_sha256 is not None and source_sha256 != expected_sha256:
         raise JoySpaceError("报告内容已变化，请重新生成并预览后再发布。")
+    with_charts = _has_charts(blocks)
     node, skill = _check_runtime()
     args = [str(skill / SLATE_SCRIPT), "--file", str(path), "--title", title.strip(),
-            "--image-free", "--source-sha256", source_sha256]
+            "--inline-charts" if with_charts else "--image-free", "--source-sha256", source_sha256]
     if placement == "child":
         args.extend(["--parent-page-id", target])
     elif placement == "sibling":
         args.extend(["--page-url", "https://joyspace.jd.com/pages/" + target])
     try:
         data = _invoke(node, args, skill, timeout=180, publish=True)
+        # This exact response is emitted only before auth or any remote action.
+        if with_charts and data == {"status": "unsupported", "reason": "chart-browser-unavailable",
+                                   "remoteAttempted": False}:
+            raise _ChartsUnavailable(CHARTS_UNSUPPORTED)
         page_id = data.get("pageId")
-        if (data.get("verified") is not True or data.get("imageFree") is not True
+        marker = "chartsVerified" if with_charts else "imageFree"
+        if (data.get("verified") is not True or data.get(marker) is not True
                 or data.get("title") != title.strip() or data.get("sourceSha256") != source_sha256
                 or not isinstance(page_id, str) or not PAGE_ID.fullmatch(page_id)):
             raise JoySpaceError(PUBLISH_UNKNOWN)
+    except _ChartsUnavailable:
+        raise JoySpaceError(CHARTS_UNSUPPORTED) from None
     except JoySpaceError:
         # The document may exist despite a lost confirmation; look it up instead of
         # republishing, and mark the link as not content-verified.

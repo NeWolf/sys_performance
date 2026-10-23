@@ -115,6 +115,22 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertEqual(self.publisher.call_count, 2)
         self.assert_error(self.client.get(BASE.replace(S, "d" * 32) + f"/{D}"), 404, False)
 
+    def test_preview_safe_pngs_and_response_csp(self):
+        from test_joyspace import chart_fixture
+        charts = [chart_fixture(), chart_fixture(color=6)]
+        self.blocks += charts
+        self.ready()
+        response = self.client.get(f"{BASE}/{D}/preview")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("img-src data:", response.headers["content-security-policy"])
+        self.assertIn("script-src 'none'", response.headers["content-security-policy"])
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.text.count('<img '), 2)
+        for chart in charts:
+            self.assertIn(chart["src"], response.text)
+        self.assertNotIn("untrusted alternate preview", response.text)
+        self.publisher.assert_not_called()
+
     def test_auth_all_routes_before_lazy_initialization(self):
         for method, path, body in [("GET", BASE, None), ("POST", BASE, CREATE),
                                    ("GET", f"{BASE}/{D}", None), ("GET", f"{BASE}/{D}/preview", None),
