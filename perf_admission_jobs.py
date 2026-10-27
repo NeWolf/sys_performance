@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timezone
 import html
 from html.parser import HTMLParser
 import json
@@ -11,7 +12,13 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
+import sys
 import threading
+
+from perf_version import VERSION
+
+_DIAGNOSTIC_MAX_BYTES = 256 * 1024
 
 import perf_slate
 from perf_admission import build_admission
@@ -129,6 +136,50 @@ def _preview(source):
     return perf_slate.wrap_preview("".join(parser.parts))
 
 
+def _generation_error(stage, exc):
+    # Only fixed labels and numeric OS codes may reach metadata/the journal.
+    # Redacting exception strings is insufficient: they may contain bare tokens.
+    labels = {
+        "prepare": "准备草稿目录失败，请检查数据目录权限和磁盘空间。",
+        "template": "读取 JoySpace 模板失败，请检查内网、HiOffice 登录和模板访问权限。",
+        "build": "构建报告失败，请检查会话数据、模板结构及图表依赖。",
+        "snapshot": "校验报告文件失败，请检查文件是否完整及数据目录权限。",
+        "preview": "生成报告预览失败，请检查报告结构及图表内容。",
+        "sync": "保存报告失败，请检查数据目录写入权限、磁盘空间及安全软件拦截。",
+    }
+    # These locally defined runtime errors are safe to show verbatim. Never
+    # forward arbitrary JoySpaceError text (template validation includes data).
+    runtime_errors = {
+        "内置 JoySpace 资源不完整，请重新安装应用。",
+        "内置 Node 运行时缺失，请重新安装应用。",
+        "开发环境需要 Node 22.7 或更高版本。",
+        "Node 运行时不可执行，请重新安装应用。",
+        "Node 运行时版本、平台或架构不兼容，请重新安装应用。",
+        "JoySpace 读取超时，请检查内网连接和 HiOffice 登录状态。",
+        "JoySpace 操作失败，请检查内网连接和 HiOffice 登录状态。",
+    }
+    hint = labels[stage]
+    if stage == "template" and isinstance(exc, JoySpaceError) and str(exc) in runtime_errors:
+        hint = "读取 JoySpace 模板失败：" + str(exc)
+    code = _generation_code(stage, exc)
+    return (f"草稿生成失败：{hint}诊断：{code}。"
+            "此草稿不可重试；排除问题后可新建草稿。")
+
+
+def _generation_code(stage, exc):
+    category = next((kind.__name__ for kind in (
+        PermissionError, FileNotFoundError, TimeoutError, OSError,
+        ImportError, ValueError, TypeError, JoySpaceError, perf_slate.SlateError,
+    ) if isinstance(exc, kind)), "UnexpectedError")
+    code = f"{stage}/{category}"
+    if isinstance(exc, OSError):
+        for name in ("errno", "winerror"):
+            value = getattr(exc, name, None)
+            if type(value) is int:
+                code += f"/{name}={value}"
+    return code
+
+
 def _sync_directory(path):
     if os.name != "nt":
         fd = os.open(path, os.O_RDONLY)
@@ -231,7 +282,7 @@ class AdmissionJobs:
     @staticmethod
     def _meta(record):
         return deepcopy({key: record[key] for key in
-                         ("draft_id", "state", "title", "warnings", "error", "link") if key in record})
+                         ("draft_id", "state", "title", "warnings", "error", "link", "diagnostic") if key in record})
 
     def _find(self, session_id, draft_id):
         record = self._records.get(draft_id)
@@ -323,6 +374,51 @@ class AdmissionJobs:
                     record.update(state="failed", error="草稿日志写入失败；请安全重启。")
                 self._records[record["draft_id"]] = record
 
+    def _write_diagnostic(self, diagnostic):
+        # Short-lived handles work on Windows; the manager's root lock excludes
+        # other processes and the mutex serializes workers and rotation.
+        line = (json.dumps(diagnostic, ensure_ascii=True, allow_nan=False) + "\n").encode("utf-8")
+        with self._mutex:
+            path = self._root / "admission-errors.jsonl"
+            backup = self._root / "admission-errors.jsonl.1"
+            for candidate in (path, backup):
+                try:
+                    info = candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or getattr(info, "st_file_attributes", 0) & 0x400):
+                    raise OSError("unsafe diagnostic log")
+            if path.exists() and path.stat().st_size + len(line) > _DIAGNOSTIC_MAX_BYTES:
+                os.replace(path, backup)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags, 0o600)
+            with os.fdopen(fd, "ab") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise OSError("unsafe diagnostic log")
+                stream.write(line)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    def _generation_diagnostic(self, record, stage, exc):
+        diagnostic = {
+            "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "draft_id": record["draft_id"],
+            "stage": stage,
+            "code": _generation_code(stage, exc),
+            "app_version": VERSION,
+            "platform": sys.platform if sys.platform in {"win32", "darwin", "linux"} else "other",
+            "python_version": ".".join(str(n) for n in sys.version_info[:3]),
+        }
+        record["diagnostic"] = diagnostic
+        try:
+            self._write_diagnostic(diagnostic)
+            diagnostic["local_log"] = "written"
+        except Exception:
+            # Logging must never replace the original failure or skip _finish.
+            diagnostic["local_log"] = "unavailable"
+
     def _directory(self, record):
         path = self._root / record["draft_id"]
         if path.is_symlink():
@@ -330,16 +426,23 @@ class AdmissionJobs:
         return path
 
     def _generate(self, record):
+        stage = "prepare"
         try:
             directory = self._directory(record)
             directory.mkdir(exist_ok=True)
             scenes = record["config"]["scenes"]
-            result = build_admission(self._store, record["session_id"], read_template(), directory,
+            stage = "template"
+            template = read_template()
+            stage = "build"
+            result = build_admission(self._store, record["session_id"], template, directory,
                                      None if scenes is None else dict(scenes),
                                      record["config"]["factor"])
+            stage = "snapshot"
             blocks, record["source_sha256"] = report_snapshot(directory / "report.json")
+            stage = "preview"
             record["preview"] = _preview(perf_slate.to_html(blocks))
             record["warnings"] = [_text(w) for w in result["warnings"]]
+            stage = "sync"
             # Flush every generated artifact before committing the ready state.
             if not (directory / "report.json").is_file():
                 raise ValueError("missing report")
@@ -352,8 +455,9 @@ class AdmissionJobs:
             _sync_directory(directory)
             _sync_directory(self._root)
             record["state"] = "ready"
-        except BaseException:
-            record.update(state="failed", error="草稿生成失败，请检查会话、关注进程场景标注及模板；此草稿不可重试。")
+        except BaseException as exc:
+            record.update(state="failed", error=_generation_error(stage, exc))
+            self._generation_diagnostic(record, stage, exc)
         self._finish(record)
 
     def _checked_slate(self, record):

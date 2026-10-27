@@ -364,6 +364,108 @@ class AdmissionJobsTests(unittest.TestCase):
         self.wait(state="published")
         self.assertEqual(self.publisher.call_args.args[2:], ("child", "Page"))
 
+    def test_generation_stage_diagnostics_are_safe_durable_and_not_retried(self):
+        cases = (
+            (self.manager, "_directory", "prepare", "准备草稿目录"),
+            (jobs, "read_template", "template", "读取 JoySpace 模板"),
+            (jobs, "build_admission", "build", "构建报告"),
+            (jobs, "report_snapshot", "snapshot", "校验报告文件"),
+            (jobs, "_preview", "preview", "生成报告预览"),
+            (jobs, "_sync_directory", "sync", "保存报告"),
+        )
+        errors = {}
+        for index, (target, attribute, stage, label) in enumerate(cases, 1):
+            draft = f"{index:032x}"
+            with self.subTest(stage=stage):
+                failure = PermissionError(13, "SECRET token https://host/?token=SECRET", r"C:\Users\SECRET")
+                failure.winerror = 5
+                with patch.object(target, attribute, side_effect=failure) as failing:
+                    self.create(draft)
+                    result = self.wait(draft, state="failed")
+                    self.assertEqual(self.create(draft)["state"], "failed")
+                    self.assertEqual(failing.call_count, 1)
+                errors[draft] = result["error"]
+                diagnostic = result["diagnostic"]
+                self.assertEqual(diagnostic["draft_id"], draft)
+                self.assertEqual(diagnostic["stage"], stage)
+                self.assertEqual(diagnostic["code"], f"{stage}/PermissionError/errno=13/winerror=5")
+                self.assertEqual(diagnostic["local_log"], "written")
+                self.assertTrue(diagnostic["time_utc"].endswith("+00:00"))
+                self.assertIn(label, result["error"])
+                self.assertIn(f"{stage}/PermissionError/errno=13/winerror=5", result["error"])
+                self.assertIn("新建草稿", result["error"])
+                for secret in ("SECRET", "https://", "C:", "token"):
+                    self.assertNotIn(secret, str(result))
+                self.error(409, self.publish, draft)
+        self.manager.close()
+        reopened = self.open()
+        for draft, message in errors.items():
+            self.assertEqual(reopened.get(S, draft)["error"], message)
+            self.assertEqual(reopened.get(S, draft)["diagnostic"]["local_log"], "written")
+        log = self.root.joinpath("admission-errors.jsonl").read_text(encoding="utf-8")
+        entries = [json.loads(line) for line in log.splitlines()]
+        self.assertEqual(len(entries), len(cases))
+        self.assertEqual({entry["draft_id"] for entry in entries}, set(errors))
+        for secret in ("SECRET", "https://", "C:", "token", "safe report", "报告"):
+            self.assertNotIn(secret, log)
+        self.publisher.assert_not_called()
+        # Fixing the cause permits a new draft, not replaying a failed ID.
+        self.create(D2, manager=reopened)
+        self.wait(D2, manager=reopened)
+
+    def test_diagnostic_log_rotates_and_survives_write_failure(self):
+        self.builder.side_effect = ValueError("SECRET report body")
+        with patch.object(jobs, "_DIAGNOSTIC_MAX_BYTES", 512):
+            for index in range(10, 14):
+                draft = f"{index:032x}"
+                self.create(draft)
+                self.wait(draft, state="failed")
+        for name in ("admission-errors.jsonl", "admission-errors.jsonl.1"):
+            path = self.root / name
+            self.assertLessEqual(path.stat().st_size, 512)
+            self.assertNotIn("SECRET", path.read_text())
+        self.assertFalse((self.root / "admission-errors.jsonl.2").exists())
+        with patch.object(self.manager, "_write_diagnostic", side_effect=PermissionError("SECRET")):
+            self.create()
+            result = self.wait(state="failed")
+        self.assertEqual(result["diagnostic"]["local_log"], "unavailable")
+        self.assertIn("build/ValueError", result["error"])
+        self.manager.close()
+        reopened = self.open()
+        self.assertEqual(reopened.get(S, D)["diagnostic"], result["diagnostic"])
+        self.assertEqual(self.create(manager=reopened)["state"], "failed")
+
+    def test_diagnostic_log_rejects_links_without_touching_target(self):
+        target = self.root / "private.txt"
+        target.write_text("SECRET", encoding="utf-8")
+        log = self.root / "admission-errors.jsonl"
+        try:
+            log.symlink_to(target)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+        self.builder.side_effect = ValueError("SECRET")
+        self.create()
+        result = self.wait(state="failed")
+        self.assertEqual(result["diagnostic"]["local_log"], "unavailable")
+        self.assertEqual(target.read_text(encoding="utf-8"), "SECRET")
+        self.assertTrue(log.is_symlink())
+
+    def test_template_diagnostics_only_forward_fixed_safe_messages(self):
+        safe = "内置 Node 运行时缺失，请重新安装应用。"
+        self.assertIn(safe, jobs._generation_error("template", JoySpaceError(safe)))
+        for failure in (
+            JoySpaceError(safe + " SECRET"),
+            JoySpaceError("SECRET /Users/private/password"),
+            type("SECRET", (Exception,), {})("SECRET"),
+            KeyboardInterrupt("SECRET"),
+        ):
+            with self.subTest(kind=type(failure).__name__):
+                message = jobs._generation_error("template", failure)
+                self.assertIn("读取 JoySpace 模板失败", message)
+                self.assertNotIn("SECRET", message)
+                self.assertNotIn("/Users", message)
+        self.assertIn("build/ImportError", jobs._generation_error("build", ModuleNotFoundError("SECRET")))
+
     def test_generation_failures_are_safe_and_never_retried(self):
         self.builder.side_effect = ValueError("SECRET /Users/private/password")
         self.create()

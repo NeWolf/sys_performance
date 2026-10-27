@@ -9,7 +9,28 @@ import './AdmissionReport.css'
 type Scene = 'background' | 'foreground' | 'unknown'
 type Placement = 'personal' | 'child' | 'sibling'
 type State = 'generating' | 'ready' | 'publishing' | 'published' | 'unknown' | 'failed'
-type Draft = { draft_id: string; state: State; title: string; warnings: string[]; error?: string; link?: string }
+type Diagnostic = { time_utc: string; draft_id: string; stage: string; code: string; app_version: string; platform: string; python_version: string; local_log: string }
+type Draft = { draft_id: string; state: State; title: string; warnings: string[]; error?: string; link?: string; diagnostic?: Diagnostic }
+function safeDiagnostic(draft?: Draft): Diagnostic | null {
+  const value = draft?.diagnostic
+  if (!value || typeof value !== 'object') return null
+  const patterns: Record<keyof Diagnostic, RegExp> = {
+    time_utc: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/,
+    draft_id: /^[a-f0-9]{32}$/,
+    stage: /^(prepare|template|build|snapshot|preview|sync)$/,
+    code: /^(prepare|template|build|snapshot|preview|sync)\/(PermissionError|FileNotFoundError|TimeoutError|OSError|ImportError|ValueError|TypeError|JoySpaceError|SlateError|UnexpectedError)(\/errno=-?\d{1,10})?(\/winerror=-?\d{1,10})?$/,
+    app_version: /^\d{1,4}\.\d{1,4}\.\d{1,4}$/,
+    platform: /^(win32|darwin|linux|other)$/,
+    python_version: /^\d{1,4}\.\d{1,4}\.\d{1,4}$/,
+    local_log: /^(written|unavailable)$/,
+  }
+  const result = {} as Diagnostic
+  for (const key of Object.keys(patterns) as (keyof Diagnostic)[]) {
+    if (typeof value[key] !== 'string' || !patterns[key].test(value[key])) return null
+    result[key] = value[key]
+  }
+  return result.draft_id === draft?.draft_id && result.code.startsWith(`${result.stage}/`) ? result : null
+}
 type Recovery = { draft_id: string; attempted: boolean; unknown: boolean }
 const states: Record<State, string> = { generating: '本地生成中', ready: '可预览 / 待发布', publishing: '发布中', published: '已发布', unknown: '发布结果未知', failed: '失败' }
 const validId = (value: string) => /^[a-f0-9]{32}$/.test(value)
@@ -96,6 +117,16 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
   const guardKey = useId()
   const headingId = useId()
   const draft = drafts.find((item) => item.draft_id === selected)
+  const diagnostic = safeDiagnostic(draft)
+  const diagnosticDownload = useRef<HTMLAnchorElement>(null)
+  const diagnosticText = diagnostic ? JSON.stringify(diagnostic, null, 2) + '\n' : ''
+  useEffect(() => {
+    const link = diagnosticDownload.current
+    if (!diagnosticText || !link) return
+    const url = URL.createObjectURL(new Blob([diagnosticText], { type: 'application/json;charset=utf-8' }))
+    link.href = url
+    return () => { link.removeAttribute('href'); URL.revokeObjectURL(url) }
+  }, [diagnosticText, open])
   const active = drafts.some((item) => item.state === 'generating' || item.state === 'publishing')
   const busy = requesting || active
   // The same session may be generated and published repeatedly. Only in-flight
@@ -380,7 +411,7 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
                 </td></tr>)}
               </tbody></table>
             </div>
-            <div className="actions config-actions"><button className="primary" type="submit" disabled={blocked || !listed || !segments.length}>仅生成本地草稿</button><span>{dirty ? '配置尚未生成' : '未选择场景的时间段按关注进程的前台/后台标注统计'}</span></div>
+            <div className="actions config-actions"><button className="primary" type="submit" disabled={blocked || !listed || !segments.length}>仅生成本地草稿</button><span>{dirty ? '配置已修改，尚未用于新草稿（非错误提示）' : '未选择场景的时间段按关注进程的前台/后台标注统计'}</span></div>
           </fieldset>
         </form>
         <section className="admission-section" aria-label="已建草稿">
@@ -400,6 +431,12 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
           {error && <p className="banner error" role="alert">{error}</p>}
           {draft && <p role="status">当前状态：<strong>{states[draft.state]}</strong> · {draft.title}</p>}
           {draft?.error && <p className="banner error" role="alert">{draft.error}</p>}
+          {diagnostic && <div className="banner info">
+            <p>失败时间（UTC）：{diagnostic.time_utc} · 阶段：{diagnostic.stage} · 诊断码：{diagnostic.code}</p>
+            <a ref={diagnosticDownload} download={`admission-diagnostic-${diagnostic.draft_id}.json`}>下载该草稿诊断日志</a>
+            <p>{diagnostic.local_log === 'written' ? '已写入本地轮转日志。' : '本地轮转日志写入失败，请下载此诊断信息。'}下载仅包含时间、草稿编号、阶段、诊断码及版本环境，不包含报告正文、路径或凭据。</p>
+          </div>}
+          {draft?.state === 'failed' && !diagnostic && <p className="muted">此草稿没有可用的详细诊断记录（旧版本或生成中断）。原始异常无法补录；排除问题后请新建草稿，不会自动重试。</p>}
           {!!draft?.warnings.length && <ul className="banner info">{draft.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
           {unknown && <p className="banner error admission-unknown" role="alert"><strong>发布结果未知。</strong> 请先到 JoySpace 人工确认是否已创建页面，再决定是否再次发布；再次发布会新建页面，可能产生重复页面。关闭窗口不会撤回。</p>}
           {draft?.state === 'unknown' && !!safeLink(draft.link) && <p className="banner info">查询到同名页面，但正文未经校验：<a href={safeLink(draft.link)} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">打开待人工确认的 JoySpace 页面</a>。确认无误后无需再次发布。</p>}

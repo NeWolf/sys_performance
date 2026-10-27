@@ -83,6 +83,25 @@ class AdmissionApiTests(unittest.TestCase):
         self.assertEqual(response.json()["state"], "generating")
         return self.wait()
 
+    def test_failed_draft_exposes_only_safe_download_diagnostics(self):
+        self.reader.side_effect = PermissionError(13, "SECRET https://private/?token=SECRET")
+        self.assertEqual(self.client.post(BASE, json=CREATE).status_code, 200)
+        result = self.wait("failed")
+        diagnostic = result["diagnostic"]
+        self.assertEqual(diagnostic["stage"], "template")
+        self.assertEqual(diagnostic["code"], "template/PermissionError/errno=13")
+        self.assertEqual(diagnostic["draft_id"], D)
+        self.assertEqual(diagnostic["local_log"], "written")
+        response = self.client.get(f"{BASE}/{D}")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        for secret in ("SECRET", "https://private", "token", str(self.root)):
+            self.assertNotIn(secret, response.text)
+        self.assertEqual(self.client.get(BASE).json()["drafts"][0]["diagnostic"], diagnostic)
+        other = BASE.replace(S, D2)
+        self.assertEqual(self.client.get(f"{other}/{D}").status_code, 404)
+        self.builder.assert_not_called()
+        self.publisher.assert_not_called()
+
     def test_five_routes_idempotency_and_html(self):
         self.assertEqual(self.client.get(BASE).json(), {"drafts": []})
         self.ready()
