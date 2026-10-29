@@ -8,6 +8,8 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
+import { authProcess } from "./safe-diagnostics.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,21 +21,31 @@ const authScript = path.join(__dirname, "hioffice-auth", "scripts", "hioffice-au
  * @returns {{ meToken: string, me_token: string }}
  */
 export function getMeToken() {
-  const res = spawnSync(process.execPath, [authScript], { encoding: "utf8", shell: false, timeout: 45000 });
-  if (res.status !== 0) {
-    throw new Error("hioffice-auth failed: " + (res.stderr || res.stdout));
-  }
-  let tok;
+  let started;
+  let status = "error";
   try {
-    tok = JSON.parse(res.stdout);
+    started = performance.now();
+    authProcess("begin");
+  } catch { /* Diagnostic timing must not prevent authentication. */ }
+  try {
+    const res = spawnSync(process.execPath, [authScript], { encoding: "utf8", shell: false, timeout: 45000 });
+    if (res.error?.code === "ETIMEDOUT") status = "timeout";
+    if (res.error || res.status !== 0) throw new Error("auth_process_error");
+    const tok = JSON.parse(res.stdout);
+    const meToken = tok?.meToken || tok?.me_token;
+    if (typeof meToken !== "string" || !meToken.trim()) {
+      throw new Error("auth_process_error");
+    }
+    status = "ok";
+    return { meToken, me_token: meToken };
   } catch {
-    throw new Error("hioffice-auth returned non-JSON: " + res.stdout.slice(0, 300));
+    // Never forward subprocess output, parsed values, paths or raw exceptions.
+    throw new Error(status === "timeout" ? "timeout" : "auth_process_error");
+  } finally {
+    try {
+      if (Number.isFinite(started)) authProcess(status, performance.now() - started);
+    } catch { /* Final diagnostics must preserve the result or sanitized error. */ }
   }
-  const meToken = tok.meToken || tok.me_token;
-  if (!meToken) {
-    throw new Error("hioffice-auth response missing meToken: " + JSON.stringify(tok));
-  }
-  return { meToken, me_token: meToken };
 }
 
 export const JOYSPACE_API_BASE = "https://apijoyspace.jd.com";

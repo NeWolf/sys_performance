@@ -7,6 +7,8 @@ import { createHash } from "node:crypto";
 import { blocksToMarkdown } from "../../joyspace-read-doc/scripts/read_joyspace_doc.js";
 
 const DEFAULT_JOYSPACE_API_BASE = "https://apijoyspace.jd.com";
+import { diagnosticFetch as fetch, diagnosticBody, safeError, authBranch, gatewayResult } from "../../safe-diagnostics.mjs";
+
 const DEFAULT_COLOR_GATEWAY_BASE = "https://api.m.jd.com";
 const DEFAULT_TENANT_CODE = "CN.JD.GROUP";
 const DEFAULT_APP_ID = "JDME_DESKTOP";
@@ -136,10 +138,12 @@ async function callColorGateway(functionId, body) {
   });
 
   if (!response.ok) {
-    throw new Error(`${functionId} HTTP ${response.status} ${response.statusText}`);
+    throw new Error("http_error");
   }
 
-  return response.json();
+  const result = await diagnosticBody(response, "json");
+  gatewayResult(functionId, result);
+  return result;
 }
 
 async function exchangeMeTokenFromStartupToken({ startupToken, tenantCode, deviceId }) {
@@ -153,7 +157,7 @@ async function exchangeMeTokenFromStartupToken({ startupToken, tenantCode, devic
   });
 
   if (response?.code !== 0 || !response?.data?.accessToken) {
-    throw new Error(response?.msg || "desk.agent.auth.tokenGrant failed");
+    throw new Error("remote_error");
   }
 
   return response.data.accessToken.trim();
@@ -173,7 +177,7 @@ async function getLegacyEncryptPayload(ddAppId) {
   });
 
   if (response?.code !== 0 || !response?.data?.aesKey || !response?.data?.content) {
-    throw new Error(response?.msg || "desk.agent.auth.encrypt failed");
+    throw new Error("remote_error");
   }
 
   return {
@@ -206,7 +210,7 @@ async function queryHiOfficeAppToken({ aesKey, content }) {
         throw new Error(`HiOffice ${port}: missing X-AES-Key`);
       }
       return {
-        appToken: await response.text(),
+        appToken: await diagnosticBody(response, "text"),
         xAesKey,
       };
     } catch (error) {
@@ -228,13 +232,14 @@ async function exchangeLegacyWebToken({ appToken, xAesKey, tenantCode, deviceId 
   });
 
   if (response?.code !== 0 || !response?.data?.accessToken) {
-    throw new Error(response?.msg || "desk.agent.auth.getWebToken failed");
+    throw new Error("remote_error");
   }
 
   return response.data.accessToken.trim();
 }
 
 async function exchangeMeTokenViaHiOffice({ tenantCode, deviceId }) {
+  authBranch("legacy");
   const { ddAppId } = requireTenantConfig(tenantCode);
   const encrypt = await getLegacyEncryptPayload(ddAppId);
   const hiOffice = await queryHiOfficeAppToken(encrypt);
@@ -250,6 +255,7 @@ async function resolveAuth(options) {
   const envMeToken = process.env.ME_TOKEN || process.env.me_token || "";
   const envSsoToken = process.env.SSO_TOKEN || process.env.sso_token || "";
   if (envMeToken || envSsoToken) {
+    authBranch("env");
     return {
       mode: "env",
       meToken: envMeToken,
@@ -261,6 +267,7 @@ async function resolveAuth(options) {
     options.configPath || path.join(process.env.HOME || process.env.USERPROFILE || os.homedir(), ".joyclaw", "openclaw.json"),
   );
   if (configTokens.meToken || configTokens.ssoToken) {
+    authBranch("config");
     return {
       mode: "config",
       ...configTokens,
@@ -268,6 +275,7 @@ async function resolveAuth(options) {
   }
 
   if (options.startupToken) {
+    authBranch("tokenGrant");
     const meToken = await exchangeMeTokenFromStartupToken({
       startupToken: options.startupToken,
       tenantCode: options.tenantCode,
@@ -310,26 +318,22 @@ async function requestJoySpaceJson({ method, url, cookieHeader, teamHeaderId, bo
   });
 
   if (!response.ok) {
-    const errText = await response.text().catch(() => "");
-    throw new Error(`${url} HTTP ${response.status} ${response.statusText} — ${errText.slice(0, 300)}`);
+    throw new Error("http_error");
   }
 
-  const json = await response.json();
-  if (process.env.DEBUG_JOYSPACE) {
-    process.stderr.write(`API ${method} ${url} => ${JSON.stringify(json).slice(0, 400)}\n`);
-  }
+  const json = await diagnosticBody(response, "json");
   if (json?.status === "success" || json?.status === "0" || json?.status === 0) {
     return json.data;
   }
   if (json?.errorCode && json.errorCode !== "0") {
-    throw new Error(`${url} — ${json.errorCode}: ${json.errorMsg || json.errMsg || 'unknown'}`);
+    throw new Error("remote_error");
   }
   // Some APIs return {code:0, msg:'success', data:{...}}
   if (json?.code === 0 || json?.code === "0") {
     return json.data;
   }
-  // 未知失败：把整个 json 抛出，方便排错
-  throw new Error(`${url} — unexpected response: ${JSON.stringify(json).slice(0, 300)}`);
+  // Unknown responses must not expose remote content.
+  throw new Error("remote_error");
 }
 
 function extractPageIdFromUrl(pageUrl) {
@@ -337,7 +341,7 @@ function extractPageIdFromUrl(pageUrl) {
     /joyspace\.jd\.com\/(?:pages|doc|sheets?|table|ppt|board|mind|meeting)\/([A-Za-z0-9_-]+)/i,
   );
   if (!match?.[1]) {
-    throw new Error(`Unable to extract JoySpace page id from URL: ${pageUrl}`);
+    throw new Error("invalid_page_url");
   }
   return match[1];
 }
@@ -635,9 +639,9 @@ async function createScratchPageForUpload({ cookieHeader, teamHeaderId }) {
   if (!response.ok) {
     throw new Error(`scratch page create failed: ${response.status}`);
   }
-  const json = await response.json();
+  const json = await diagnosticBody(response, "json");
   if (json.status !== "success" || !json.data?.id) {
-    throw new Error(`scratch page create returned: ${JSON.stringify(json).slice(0, 200)}`);
+    throw new Error("remote_error");
   }
   return json.data.id;
 }
@@ -669,10 +673,10 @@ async function uploadOneImage({ filePath, hostPageId, cookieHeader, teamHeaderId
     },
     body: form,
   });
-  const text = await response.text();
+  const text = await diagnosticBody(response, "text");
   let json = null; try { json = JSON.parse(text); } catch (_) {}
   if (!response.ok || !json || json.status !== "success" || !json.data?.imgUrl) {
-    throw new Error(`upload failed for ${filename}: HTTP ${response.status} ${text.slice(0, 200)}`);
+    throw new Error("image_upload_error");
   }
   const imageUrl = new URL(json.data.imgUrl);
   if (imageUrl.protocol !== "https:" || imageUrl.username || imageUrl.password ||
@@ -718,7 +722,7 @@ export async function preprocessLocalImages({ markdown, markdownFilePath, cookie
       if (!stat.isFile()) throw new Error("not a file");
       items.push({ abs, rawUrl: meta.rawUrl, alt: meta.alt, sizeBytes: stat.size });
     } catch (e) {
-      throw new Error(`local image not found or not a file: ${meta.rawUrl} (resolved: ${abs}) — ${e.message}`);
+      throw new Error("local_image_error");
     }
   }
 
@@ -843,7 +847,7 @@ function isMainModule() {
 
 if (isMainModule()) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(safeError(error));
     process.exitCode = 1;
   });
 }

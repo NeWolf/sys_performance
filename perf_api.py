@@ -261,7 +261,10 @@ def _admission_json_pairs(pairs):
 
 
 def create_app(database, port=8765, development=False, frontend=None):
+    from perf_diagnostics import configure, flush
+
     store = Store(database)
+    configure(Path(database).resolve().parent / "diagnostics")
     token = secrets.token_urlsafe(32)
     import_lock = threading.Lock()
     compare_slots = threading.BoundedSemaphore(2)
@@ -295,7 +298,10 @@ def create_app(database, port=8765, development=False, frontend=None):
             if jobs is not None:
                 jobs.close()  # Wait for durable workers before releasing the root lock.
         finally:
-            top.close()
+            try:
+                top.close()
+            finally:
+                flush()
 
     @asynccontextmanager
     async def lifespan(_app):

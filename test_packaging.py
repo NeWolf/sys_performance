@@ -387,6 +387,7 @@ class NodeRuntimePackagingTests(unittest.TestCase):
                 node_runtime.verify_skill(root)
             skill = root / "joyspace_assets/joyspace-kit"
             required = ("SKILL.md", "skills/shared-auth.mjs",
+                        "skills/safe-diagnostics.mjs",
                         "skills/hioffice-auth/scripts/hioffice-auth.mjs",
                         "skills/joyspace-read-doc/scripts/read_joyspace_doc.js",
                         "skills/markdown-to-joyspace/scripts/import_markdown_doc.js",

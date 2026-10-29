@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 
+from perf_diagnostics import span, measured
+
 REMOTE_BIN = "/data/local/tmp/sysmonitor_test"
 PERF_DIR = "/log/sys/perf"
 LOG_NAME_PATTERN = re.compile(r"perf(?:\.[0-9]+)?\.log", re.ASCII)
@@ -219,6 +221,7 @@ class AdbController:
             self._stop(serial, root)
             return self.snapshot(serial, root)
 
+    @measured("adb.stop")
     def _stop(self, serial, root):
         """Caller holds the device lock throughout stop, pull or deletion."""
         self.setprop(serial, "test", "0", root)
@@ -260,6 +263,7 @@ class AdbController:
             self.capture_times.pop(serial, None)
             return self.snapshot(serial, root)
 
+    @measured("adb.pull")
     def pull(self, serial, store, title=""):
         with self.device(serial) as device:
             root = self.root_mode(serial)
@@ -270,17 +274,21 @@ class AdbController:
             folder = self.archive / uuid.uuid4().hex
             folder.mkdir(parents=True)
             paths = []
-            for name in self._log_names(serial, root):
-                remote = PERF_DIR + "/" + name
-                exists = self.shell(serial, f'if [ -f {remote} ]; then echo yes; fi', root)
-                if exists != "yes":
-                    continue
-                path = folder / name
-                with path.open("wb") as output:
-                    self.shell(serial, f"head -c {MAX_FILE_BYTES + 1} {remote}", root, output)
-                if path.stat().st_size > MAX_FILE_BYTES:
-                    raise AdbError("设备日志超过单文件 1 GB 限制；本次未导入", 413)
-                paths.append(path)
+            with span("adb.transfer", files=0, bytes=0) as transfer:
+                for name in self._log_names(serial, root):
+                    remote = PERF_DIR + "/" + name
+                    exists = self.shell(serial, f'if [ -f {remote} ]; then echo yes; fi', root)
+                    if exists != "yes":
+                        continue
+                    path = folder / name
+                    with path.open("wb") as output:
+                        self.shell(serial, f"head -c {MAX_FILE_BYTES + 1} {remote}", root, output)
+                    size = path.stat().st_size
+                    transfer["bytes"] += size
+                    transfer["files"] += 1
+                    if size > MAX_FILE_BYTES:
+                        raise AdbError("设备日志超过单文件 1 GB 限制；本次未导入", 413)
+                    paths.append(path)
             if not paths:
                 raise AdbError("设备没有可拉取的性能日志")
             with ExitStack() as stack:

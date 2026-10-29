@@ -388,6 +388,54 @@ for (const [a,b,c,expected] of scales) assert.equal(scaleMetric(a,b,c),expected,
 """
         self.run_report_script(self.shared_script(checks))
 
+    def test_io_auto_units_across_python_javascript_and_frontend(self):
+        from perf_report_ui import io_number, grid
+        cases = [(None, '—'), (0, '0.00 KB'), (-0.004, '0.00 KB'),
+                 (1.005, '1.01 KB'), (-1.005, '-1.01 KB'),
+                 (1023.99, '1,023.99 KB'), (1024, '1.00 MB'),
+                 (-1536, '-1.50 MB'), (1024 ** 2, '1.00 GB'),
+                 (1024 ** 3, '1.00 TB'), (1024 ** 4, '1.00 PB'),
+                 (1200 * 1024 ** 4, '1,200.00 PB')]
+        for value, expected in cases:
+            self.assertEqual(io_number(value), expected)
+            self.assertEqual(io_number(value, True), expected)
+        for value in (float('nan'), float('inf'), -float('inf')):
+            self.assertEqual(io_number(value, True), '—')
+        html = grid(['物理读峰值 KB/周期', '累计读 KB'], [[1536, 1024 ** 2], [None, 0]])
+        self.assertIn('<th scope="col">物理读峰值</th>', html)
+        self.assertNotIn('自动单位', html)
+        stats_html = grid(['指标', '单位', '有效样本', '峰值'], [['物理读', 'KB/周期', 1, 1536]])
+        self.assertNotIn('自动单位', stats_html)
+        self.assertIn('data-sort="KB/周期"></td>', stats_html)
+        self.assertIn('>1.50 MB</td>', stats_html)
+        self.assertIn('data-io-unit="cycle" data-sort="1536.0">1.50 MB</td>', html)
+        self.assertIn('data-io-unit="total" data-sort="1048576.0">1.00 GB', html)
+        self.assertIn('data-sort="">—', html)
+        checks = 'const cases = ' + json.dumps(cases) + ';\n' + r'''
+for (const [value, expected] of cases) {
+  assert.equal(fmtIO(value), expected);
+  assert.equal(fmtIO(value, true), expected);
+}
+for (const value of [NaN, Infinity, -Infinity]) assert.equal(fmtIO(value, true), '—');
+const fs = require('node:fs'), ts = require('./frontend/node_modules/typescript');
+const source = fs.readFileSync('frontend/src/api.ts', 'utf8');
+const compiled = ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
+const api = {};
+new Function('exports','require',compiled)(api, name => {
+  assert.equal(name,'react'); return {};
+});
+for (const [value, expected] of cases) {
+  for (const unit of ['KB/周期', 'KB / 周期']) {
+    assert.equal(api.formatStatistic(value,unit,true),expected);
+    assert.equal(api.formatStatistic(value,unit),expected);
+  }
+}
+for (const value of [undefined, NaN, Infinity, -Infinity]) assert.equal(api.formatStatistic(value,'KB/周期'),'—');
+assert.equal(api.formatStatistic(1.005,'%'),'1.01 %');
+assert.equal(api.formatStatistic(-1.005,'百分点'),'-1.01 百分点');
+'''
+        self.run_report_script(self.shared_script(checks))
+
     def test_python_pid_labels(self):
         from perf_metrics import pid_label
         self.assertIsNone(pid_label({'pids': []}))
@@ -913,12 +961,12 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         header = html.split('<header>', 1)[1].split('</header>', 1)[0]
         self.assertIn('性能分析报告</h1><div class="collection-times">', header)
         self.assertIn("开始采集时间：" + start, header)
-        self.assertIn("结束采集时间：" + end, header)
+        self.assertIn("结束采集时间：" + end + "</span><span>采集时长：0h49m30s", header)
         self.assertEqual(html.count("开始采集时间："), 1)
         self.assertNotIn('<nav', html)
         self.assertNotIn('class="report-notes"', header)
         for removed in ('SYSMONITOR · OFFLINE PERFORMANCE', 'class="subtitle"',
-                        'class="segment-heading"', '采集时长', '采集0小时'):
+                        'class="segment-heading"', '采集0小时'):
             self.assertNotIn(removed, html)
         self.assertNotIn("开始采集时间：", section)
         for removed in ("独立时段 · 时间回拨隔离", "全部周期", "系统样本", "进程名称（含 DP-only）", "存在活跃周期"):
@@ -929,13 +977,17 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         self.assertEqual(total_row.count('>—</td>'), 1)
         epoch = datetime.fromtimestamp(0).strftime("%Y年%m月%d日 %H:%M:%S")
         self.assertEqual(time_label({"cycle_axis": [[0, 0]]}),
-                         f"开始采集时间：{epoch} · 结束采集时间：{epoch}")
-        missing = "开始采集时间：— · 结束采集时间：—"
+                         f"开始采集时间：{epoch} · 结束采集时间：{epoch} · 采集时长：0h00m00s")
+        missing = "开始采集时间：— · 结束采集时间：— · 采集时长：—"
         self.assertEqual(time_label({"cycle_axis": [[0, None], [1, float('inf')]]}), missing)
         self.assertEqual(time_label({"cycle_axis": []}), missing)
         end_long = datetime.fromtimestamp(90061.999).strftime("%Y年%m月%d日 %H:%M:%S")
         self.assertEqual(time_label({"cycle_axis": [[1, 90061999], [0, 0]]}),
-                         f"开始采集时间：{epoch} · 结束采集时间：{end_long}")
+                         f"开始采集时间：{epoch} · 结束采集时间：{end_long} · 采集时长：25h01m01s")
+        capture_start = datetime(2026, 10, 25, 23, 3, 52).timestamp() * 1000
+        capture_end = datetime(2026, 10, 26, 0, 17, 45).timestamp() * 1000
+        self.assertEqual(time_label({"cycle_axis": [[0, capture_start], [1, capture_end]]}),
+                         "开始采集时间：2026年10月25日 23:03:52 · 结束采集时间：2026年10月26日 00:17:45 · 采集时长：1h13m53s")
         from copy import deepcopy
         from perf_report_ui import render_document
         multiple = deepcopy(raw)
@@ -1268,7 +1320,7 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
                 '序号', '原始进程名', 'PID', '活跃周期', '活跃均值 %',
                 '活跃P95 %', '活跃峰值 %', '活跃P95K KDMIPS',
                 '活跃峰值K KDMIPS', '内存均值 MB', '内存 P95 MB', '内存峰值 MB', 'PID变化']
-            self.assertEqual(headers, expected_headers)
+            self.assertEqual(headers, [h.replace('KB/周期', '').replace('KB', '').strip() if 'KB' in h else h for h in expected_headers])
             body_rows = re.findall(r'<tr\b[^>]*>(.*?)</tr>', table.split('<tbody>', 1)[1])
             self.assertEqual(len(body_rows), len(processes))
             for n, (p, row_html) in enumerate(zip(processes, body_rows), 1):
@@ -1316,6 +1368,11 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
         payload = ReportMarkup(html).payload()
         self.assertIn('</section><details class="panel" open><summary>全进程分析</summary>', html)
         self.assertLess(html.index('<div class="data-table" data-table="all"'), html.index("<summary>关注进程</summary>"))
+        clear_buttons = [attrs for tag, attrs in ReportMarkup(html).tags
+                         if tag == 'button' and attrs.get('class') == 'clear-selection']
+        self.assertEqual(len(clear_buttons), len(payload['systems']))
+        self.assertTrue(all(attrs.get('type') == 'button' for attrs in clear_buttons))
+        self.assertIn('>取消全部勾选</button>', html)
         for role in ("overlay-cpu", "overlay-rss", "overlay-io"):
             self.assertLess(html.index('data-chart="' + role + '"'), html.index('<div class="data-table" data-table="all"'))
         self.assertEqual(PROCESS_HEADERS[:2], ["序号", "原始进程名"])
@@ -1429,6 +1486,9 @@ for (const mode of ['overlay','merge']) {
   assert.equal(option(mode+'-cpu').series[0].data[0][1],42.04*8);
   assert.equal(option(mode+'-rss').series[0].data[0][1],5399);
   assert.equal(option(mode+'-io').series.length,4);
+  assert.equal(option(mode+'-io').yAxis.name,'');
+  assert.equal(option(mode+'-io').yAxis.axisLabel.formatter(1536),'1.50 MB');
+  assert.equal(option(mode+'-io').tooltip.valueFormatter(1048576),'1.00 GB');
 }
 const root=document.getElementById(system.id);
 const searchWrap = new Node(), searchInput = searchWrap.querySelector('.table-search');
@@ -1455,6 +1515,45 @@ precisionTable.tBodies=[{rows:[precisionRow]}];
 normalizeTable(precisionWrap);
 assert.deepEqual(precisionRow.cells.map(cell=>cell.textContent),['5589','0','1','116.30','241.33']);
 assert.ok(precisionRow.dataset.search.includes('5589'));
+const ioHeaders=['物理读峰值','累计读'];
+precisionTable.tHead.rows[0].cells=ioHeaders.map(text=>{const cell=new Node();cell.textContent=text;return cell;});
+const ioProcess=data.processes.find(p=>p.id===precisionRow.dataset.process);
+const oldIO=ioProcess.metrics.rd_kb;
+ioProcess.metrics.rd_kb={max:1536,total:1048576};
+precisionRow.cells=ioHeaders.map((_,cellIndex)=>{const cell=new Node();cell.cellIndex=cellIndex;cell.dataset.sort='stale';return cell;});
+normalizeTable(precisionWrap);
+assert.deepEqual(precisionRow.cells.map(cell=>cell.textContent),['1.50 MB','1.00 GB']);
+assert.deepEqual(precisionRow.cells.map(cell=>cell.dataset.sort),['1536','1048576']);
+// Static statistics keep their unit annotations on the final normalization pass.
+delete precisionRow.dataset.process;
+normalizeTable(precisionWrap);
+assert.deepEqual(precisionRow.cells.map(cell=>cell.textContent),['1.50 MB','1.00 GB']);
+// Focus table sort remains MB; display uses KB to avoid rounding small increments to zero.
+precisionRow.cells[0].dataset={sort:'0',ioUnit:'cycle',ioKb:'0.01'};
+normalizeTable(precisionWrap);
+assert.equal(precisionRow.cells[0].textContent,'0.01 KB');
+assert.equal(precisionRow.cells[0].dataset.sort,'0');
+const focusGroup=new Node();
+precisionRow.className='measured';
+precisionRow.dataset.process=ioProcess.id;
+precisionRow.closest=()=>focusGroup;
+precisionRow.cells=Array.from({length:7},(_,i)=>{const cell=new Node();cell.cellIndex=i+1;cell.dataset.sort='stale';return cell;});
+precisionRow.querySelectorAll=()=>precisionRow.cells;
+const oldWriteIO=ioProcess.metrics.wr_kb;
+for (const [read,write,sorts,displays] of [
+  [0.01,1536,['0','1.5'],['0.01 KB','1.50 MB']],
+  [null,0,['','0'],['—','0.00 KB']],
+  [1048576,null,['1024',''],['1.00 GB','—']],
+]) {
+  ioProcess.metrics.rd_kb={max:read}; ioProcess.metrics.wr_kb={max:write};
+  normalizeTable(precisionWrap);
+  const cells=precisionRow.cells.slice(-2);
+  assert.deepEqual(cells.map(cell=>cell.dataset.sort),sorts);
+  assert.deepEqual(cells.map(cell=>cell.textContent),displays);
+  assert.deepEqual(cells.map(cell=>cell.dataset.ioUnit),['cycle','cycle']);
+}
+ioProcess.metrics.rd_kb=oldIO;
+ioProcess.metrics.wr_kb=oldWriteIO;
 const allWrap = new Node(); allWrap.dataset.table='all';
 const allInput=allWrap.querySelector('.table-search'), systemToggle=allWrap.querySelector('.show-system-processes');
 systemToggle.checked=false;
@@ -1655,7 +1754,15 @@ setupSegment(system);
 assert.equal(JSON.stringify(data),snapshot);
 document.createElement=create;
 const visibleWrap=root.querySelector('[data-table="all"]');
-visibleWrap.querySelectorAll=()=>data.processes.map(p=>({hidden:p.dp_only,dataset:{process:p.id}}));
+const selectionRows=data.processes.filter(p=>p.segment===system.segment).map(p=>{
+  const row=new Node(); row.dataset.process=p.id; row.hidden=p.dp_only;
+  row.classList.toggle=(name,value)=>{ if(name==='selected') row.selected=value; };
+  row.setAttribute=(name,value)=>{ if(name==='aria-selected') row.ariaSelected=value; };
+  return row;
+});
+const rootQueryAll=root.querySelectorAll.bind(root);
+root.querySelectorAll=selector=>selector==='tr[data-process]' ? selectionRows : rootQueryAll(selector);
+visibleWrap.querySelectorAll=()=>selectionRows;
 visibleWrap.querySelector('.select-top15').events.click();
 const tags=root.querySelector('.selection-tags');
 const selectedCount=data.processes.filter(p=>!p.dp_only && valid(p.active.metrics.cpu1c.avg)).length;
@@ -1665,6 +1772,33 @@ assert.equal(tags.children.length,selectedCount);
 visibleWrap.querySelectorAll=()=>[];
 visibleWrap.querySelector('.select-top15').events.click();
 assert.equal(tags.children.length,selectedCount);
+assert.ok(selectedCount>0);
+assert.equal(selectionRows.filter(row=>row.selected).length,selectedCount);
+// Clear all selections, even when every selected row is hidden by filters.
+selectionRows.forEach(row=>{row.hidden=true;});
+const mergeBefore=JSON.stringify(option('merge-cpu'));
+const clearSelection=visibleWrap.querySelector('.clear-selection');
+const assertCleared=()=>{
+  assert.equal(tags.children.length,0);
+  assert.ok(selectionRows.every(row=>!row.selected && row.ariaSelected==='false'));
+  assert.equal(option('overlay-cpu').series.length,1);
+  assert.equal(option('overlay-rss').series.length,1);
+  assert.equal(option('overlay-io').series.length,4);
+  assert.equal(JSON.stringify(option('merge-cpu')),mergeBefore);
+};
+clearSelection.events.click(); assertCleared();
+clearSelection.events.click(); assertCleared();
+// Re-select after clearing, then remove one process and finally clear again.
+selectionRows.forEach(row=>{row.hidden=data.processes.find(p=>p.id===row.dataset.process).dp_only;});
+visibleWrap.querySelectorAll=()=>selectionRows;
+visibleWrap.querySelector('.select-top15').events.click();
+assert.equal(tags.children.length,selectedCount);
+assert.equal(selectionRows.filter(row=>row.selected).length,selectedCount);
+tags.children[0].events.click();
+assert.equal(tags.children.length,selectedCount-1);
+assert.equal(selectionRows.filter(row=>row.selected).length,selectedCount-1);
+clearSelection.events.click(); assertCleared();
+assert.equal(JSON.stringify(data),snapshot);
 })();
 """
         self.run_report_script(harness + prefix + checks)
@@ -3104,8 +3238,8 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                         wr_kb=dict(avg=1024, p95=2048, max=4096, sum=16384),
                         rchar_kb=dict(max=32768), wchar_kb=dict(max=65536)))])
         html = required_table(data, 0)
-        self.assertIn("物理 IO 读<br>实测峰值 MB/周期<br>标准 MB/s", html)
-        self.assertIn("物理 IO 写<br>实测峰值 MB/周期<br>标准 MB/s", html)
+        self.assertIn("物理 IO 读<br>实测峰值<br>标准 MB/s", html)
+        self.assertIn("物理 IO 写<br>实测峰值<br>标准 MB/s", html)
         rows = re.findall(r'<tr\b.*?</tr>', html)[-3:]
         source = EXCEL_BUDGETS[7]
         for row, columns in zip(rows[:2], ("KL", "RS")):
@@ -3114,6 +3248,7 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                                        number(source.get(c))) for c in columns])
         for read, write, expected in ((2048, 4096, ["2.0", "4.0"]),
                                       (0, 0, ["0.0", "0.0"]),
+                                      (0.01, 1536, ["0.0", "1.5"]),
                                       (None, 4096, ["", "4.0"]),
                                       (2048, None, ["2.0", ""])):
             with self.subTest(read=read, write=write):
@@ -3123,6 +3258,12 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 measured = re.search(r'<tr class="measured".*?</tr>', required_table(data, 0))[0]
                 cells = [attrs for tag, attrs in ReportMarkup(measured).tags if tag == "td"][-2:]
                 self.assertEqual([cell["data-sort"] for cell in cells], expected)
+                self.assertEqual([cell["data-io-unit"] for cell in cells], ["cycle", "cycle"])
+                self.assertEqual([cell["data-io-kb"] for cell in cells],
+                                 ["" if value is None else str(float(value)) for value in (read, write)])
+                if read == 0.01:
+                    self.assertIn('>0.01 KB</td>', measured)
+                    self.assertIn('>1.50 MB</td>', measured)
                 for cell in cells:
                     self.assertNotIn("class", cell)
                     self.assertNotIn("title", cell)
@@ -3224,7 +3365,7 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 values = re.findall(r'<td data-sort="([^"]*)">([^<]*)</td>', row)
                 self.assertEqual(values, [(str(source[c]) if source.get(c) is not None else "",
                                            number(source.get(c))) for c in columns])
-            self.assertEqual(re.findall(r'<td data-sort="([^"]*)">', rows[2]), [""] * 7)
+            self.assertEqual(re.findall(r'<td data-sort="([^"]*)"[^>]*>', rows[2]), [""] * 7)
         self.assertEqual(data["required_source"]["file"], "8255内部-资源分布策略.xlsx")
         self.assertEqual(data["required_source"]["sheet"], "Sheet1")
         self.assertEqual(data["required_source"]["rows"], [[7, 37], [39, 56]])

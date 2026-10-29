@@ -13,6 +13,7 @@ import time
 import uuid
 
 from perf_adb import AdbError
+from perf_diagnostics import span, measured
 from perf_store import capture_naming, safe_filename
 from perf_top_parser import iter_top_records
 
@@ -336,6 +337,7 @@ class TopCapture:
             raise AdbError("Top 任务已切换，请刷新状态后重试", 409)
         return state
 
+    @measured("top.stop")
     def _stop_confirmed(self, serial, capture_id):
         # Send the marker before status: a legacy recovery scan may itself fail.
         # The device validates identity; never signal a guessed process/PID.
@@ -382,6 +384,7 @@ class TopCapture:
                 self._command(serial, "clear", capture_id)
                 return self._query(serial)
 
+    @measured("top.pull")
     def pull(self, serial, capture_id):
         self._serial(serial)
         self._identity(capture_id)
@@ -405,69 +408,72 @@ class TopCapture:
                     return dict(self._state)
                 # Anonymous staging is never exposed through the archive API.
                 with tempfile.TemporaryFile(dir=self.archive_root) as staging:
-                    self._command(serial, "pull", capture_id, output=staging)
-                    # A child's writes need not advance the parent's stream position.
-                    # Measure bytes on disk, including any buffered test/wrapper writes.
-                    staging.flush()
-                    size = os.fstat(staging.fileno()).st_size
-                    if size > MAX_ARCHIVE_BYTES:
-                        raise AdbError("Top 原始归档超过 1GB（1000000000 字节）", 413)
-                    after = self._current(serial, capture_id)
-                    if after["running"] or after["remote_cleaned"]:
-                        # Only validated protocol fields and the on-disk size: never
-                        # expose archive contents, host paths or command output.
-                        raise AdbError(
-                            "设备归档长度或状态变化，未发布本地文件；"
-                            f"本地实际={size} 字节，拉取前={state['bytes']} 字节，"
-                            f"拉取后={after['bytes']} 字节；"
-                            f"拉取前状态={state['status']}，拉取后状态={after['status']}；"
-                            f"拉取后仍运行={'是' if after['running'] else '否'}，"
-                            f"拉取后已清理={'是' if after['remote_cleaned'] else '否'}。"
-                            "请保留设备日志，并反馈此完整错误信息。", 502)
-                    if size == 0:
-                        raise AdbError("拉取到的 Top 日志为空，未发布本地文件，请重试拉取", 502)
-                    warning = None
-                    if size != state["bytes"] or size != after["bytes"]:
-                        warning = self._size_warning(size, state["bytes"], after["bytes"])
-                    os.fsync(staging.fileno())
-                    staging.seek(0)
-                    # Hard-link publication is atomic and never overwrites a success.
-                    pending = self.archive_root / (capture_id + "." + uuid.uuid4().hex + ".part")
-                    created = False
-                    marker_created = False
-                    published = False
-                    marker = path.with_suffix(".warning.json")
-                    try:
-                        with pending.open("xb") as output:
-                            created = True
-                            for block in iter(lambda: staging.read(CHUNK_BYTES), b""):
-                                self._write_all(output, block)
-                            output.flush()
-                            os.fsync(output.fileno())
-                        if warning:
-                            # Persist validated numeric diagnostics before publishing
-                            # the archive, so restart recovery can identify it.
-                            if marker.exists() or marker.is_symlink():
-                                if self._saved_warning(path, size) != warning:
-                                    raise AdbError("本地归档提示记录已存在，拒绝覆盖", 409)
-                            else:
-                                with marker.open("x", encoding="utf-8") as metadata:
-                                    marker_created = True
-                                    json.dump({"size": size, "before": state["bytes"],
-                                               "after": after["bytes"]}, metadata)
-                                    metadata.flush()
-                                    os.fsync(metadata.fileno())
+                    with span("top.transfer", files=0, bytes=0) as transfer:
+                        self._command(serial, "pull", capture_id, output=staging)
+                        # A child's writes need not advance the parent's stream position.
+                        # Measure bytes on disk, including any buffered test/wrapper writes.
+                        staging.flush()
+                        size = os.fstat(staging.fileno()).st_size
+                        transfer.update(files=1, bytes=size)
+                        if size > MAX_ARCHIVE_BYTES:
+                            raise AdbError("Top 原始归档超过 1GB（1000000000 字节）", 413)
+                        after = self._current(serial, capture_id)
+                        if after["running"] or after["remote_cleaned"]:
+                            # Only validated protocol fields and the on-disk size: never
+                            # expose archive contents, host paths or command output.
+                            raise AdbError(
+                                "设备归档长度或状态变化，未发布本地文件；"
+                                f"本地实际={size} 字节，拉取前={state['bytes']} 字节，"
+                                f"拉取后={after['bytes']} 字节；"
+                                f"拉取前状态={state['status']}，拉取后状态={after['status']}；"
+                                f"拉取后仍运行={'是' if after['running'] else '否'}，"
+                                f"拉取后已清理={'是' if after['remote_cleaned'] else '否'}。"
+                                "请保留设备日志，并反馈此完整错误信息。", 502)
+                        if size == 0:
+                            raise AdbError("拉取到的 Top 日志为空，未发布本地文件，请重试拉取", 502)
+                        warning = None
+                        if size != state["bytes"] or size != after["bytes"]:
+                            warning = self._size_warning(size, state["bytes"], after["bytes"])
+                    with span("top.archive", files=1, bytes=size):
+                        os.fsync(staging.fileno())
+                        staging.seek(0)
+                        # Hard-link publication is atomic and never overwrites a success.
+                        pending = self.archive_root / (capture_id + "." + uuid.uuid4().hex + ".part")
+                        created = False
+                        marker_created = False
+                        published = False
+                        marker = path.with_suffix(".warning.json")
                         try:
-                            os.link(pending, path)
-                            published = True
-                        except FileExistsError as exc:
-                            raise AdbError("本地归档目标已存在，拒绝覆盖", 409) from exc
-                    finally:
-                        # Never remove pre-existing metadata or published archives.
-                        if marker_created and not published:
-                            marker.unlink(missing_ok=True)
-                        if created:
-                            pending.unlink(missing_ok=True)
+                            with pending.open("xb") as output:
+                                created = True
+                                for block in iter(lambda: staging.read(CHUNK_BYTES), b""):
+                                    self._write_all(output, block)
+                                output.flush()
+                                os.fsync(output.fileno())
+                            if warning:
+                                # Persist validated numeric diagnostics before publishing
+                                # the archive, so restart recovery can identify it.
+                                if marker.exists() or marker.is_symlink():
+                                    if self._saved_warning(path, size) != warning:
+                                        raise AdbError("本地归档提示记录已存在，拒绝覆盖", 409)
+                                else:
+                                    with marker.open("x", encoding="utf-8") as metadata:
+                                        marker_created = True
+                                        json.dump({"size": size, "before": state["bytes"],
+                                                   "after": after["bytes"]}, metadata)
+                                        metadata.flush()
+                                        os.fsync(metadata.fileno())
+                            try:
+                                os.link(pending, path)
+                                published = True
+                            except FileExistsError as exc:
+                                raise AdbError("本地归档目标已存在，拒绝覆盖", 409) from exc
+                        finally:
+                            # Never remove pre-existing metadata or published archives.
+                            if marker_created and not published:
+                                marker.unlink(missing_ok=True)
+                            if created:
+                                pending.unlink(missing_ok=True)
                 self._archives[capture_id] = path
                 self._archive_naming(path, state)
                 self._state["archive"] = "/api/top/archive?capture_id=" + capture_id
@@ -573,6 +579,7 @@ class TopCapture:
             raise AdbError("没有可用的本地 Top 归档，请先显式拉取", 404)
         return path
 
+    @measured("top.import")
     def import_capture(self, capture_id=None):
         with self._lock:
             self._available()

@@ -46,6 +46,22 @@ def number(value):
     return str(value)
 
 
+def io_number(value, per_cycle=False):
+    """Format KB increments only; retain original values for statistics and sorting."""
+    value = round_metric(value)
+    if value is None:
+        return "—"
+    units = ("KB", "MB", "GB", "TB", "PB")
+    index = 0
+    while abs(value) >= 1024 ** (index + 1) and index < len(units) - 1:
+        index += 1
+    return number(scale_metric(value, 1, 1024 ** index)) + " " + units[index]
+
+
+def io_header(header):
+    return "KB" in header and any(label in header for label in ("物理读", "物理写", "逻辑读", "逻辑写", "累计读", "累计写", "累计"))
+
+
 def integer(value):
     if value is None or isinstance(value, float) and not math.isfinite(value):
         return "—"
@@ -139,14 +155,20 @@ def time_label(system):
     times = [row[1] for row in system["cycle_axis"]
              if isinstance(row[1], (int, float)) and math.isfinite(row[1])]
     if not times:
-        return "开始采集时间：— · 结束采集时间：—"
+        return "开始采集时间：— · 结束采集时间：— · 采集时长：—"
     start, end = min(times), max(times)
     def formatted(value):
         try:
             return datetime.fromtimestamp(value / 1000).strftime("%Y年%m月%d日 %H:%M:%S")
         except (OverflowError, OSError, ValueError):
             return "—"
-    return f"开始采集时间：{formatted(start)} · 结束采集时间：{formatted(end)}"
+    elapsed = (end - start) / 1000
+    duration = "—"
+    if math.isfinite(elapsed):
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration = f"{hours}h{minutes:02d}m{seconds:02d}s"
+    return f"开始采集时间：{formatted(start)} · 结束采集时间：{formatted(end)} · 采集时长：{duration}"
 
 
 def metric(item, field, key="avg", active=False):
@@ -164,10 +186,11 @@ def grid(headers, rows, identities=None, searchable=False, role="", search_terms
     out = ['<div class="data-table" data-table="' + esc(role) + '">']
     if searchable:
         system_toggle = ('<label><input type="checkbox" class="show-system-processes">显示系统进程</label>'
-                         '<button type="button" class="select-top15" title="按当前筛选范围内活跃 CPU 均值降序添加前15，保留已有选择">勾选前15（活跃CPU均值）</button>') if role == "all" else ''
+                         '<button type="button" class="select-top15" title="按当前筛选范围内活跃 CPU 均值降序添加前15，保留已有选择">勾选前15（活跃CPU均值）</button>'
+                         '<button type="button" class="clear-selection" title="取消当前采集段全部进程的勾选，包括被搜索或系统进程筛选隐藏的选择">取消全部勾选</button>') if role == "all" else ''
         out.append('<div class="controls js-only"><label>搜索 <input type="search" class="table-search" placeholder="名称、PID、状态；点击表头排序" aria-label="搜索表格"></label>' + system_toggle + '<span class="table-count" aria-live="polite"></span></div>')
     out.append('<div class="scroll"><table><thead><tr>')
-    out.extend('<th scope="col">' + esc(h) + '</th>' for h in headers)
+    out.extend('<th scope="col">' + esc(h.replace('KB/周期', '').replace('KB', '').strip() if io_header(h) else h) + '</th>' for h in headers)
     out.append('</tr></thead><tbody>')
     for index, row in enumerate(rows):
         identity = identities[index] if identities else None
@@ -190,7 +213,14 @@ def grid(headers, rows, identities=None, searchable=False, role="", search_terms
             is_count = headers[column] in {"序号", "PID", "有效样本", "有效周期", "CPU有效周期", "内存有效周期", "活跃周期", "PID变化", "样本数", "记录ID", "周期", "行号"}
             if not is_count and isinstance(value, (int, float)):
                 value = round_metric(value)
-            out.append('<td' + cls + title + ' data-sort="' + esc('' if value is None else value) + '">' + esc(integer(value) if is_count else number(value)) + '</td>')
+            row_io = len(headers) > 1 and headers[1] == "单位" and row[1] == "KB/周期"
+            is_io = io_header(headers[column]) or (row_io and column >= 3 and not is_count)
+            per_cycle = "周期" in headers[column] or (row_io and "累计" not in headers[column])
+            display = io_number(value, per_cycle) if is_io else integer(value) if is_count else number(value)
+            if row_io and column == 1:
+                display = ""
+            io_attr = (' data-io-unit="' + ('cycle' if per_cycle else 'total') + '"') if is_io else ''
+            out.append('<td' + cls + title + io_attr + ' data-sort="' + esc('' if value is None else value) + '">' + esc(display) + '</td>')
         out.append('</tr>')
     return ''.join(out) + '</tbody></table></div></div>'
 
@@ -345,7 +375,7 @@ def required_table(data, segment):
     lookup = {p["id"]: p for p in data["processes"]}
     states = {"collected": "已匹配 / P实测", "dp_only": "DP-only / 无P", "missing": "缺失", "pending_confirmation": "候选 / 待确认"}
     headers = ["进程 / 模块 / 作用", "数据类型", "CPU P95\n%", "P95 K\nKDMIPS",
-               "CPU 峰值\n%", "峰值 K\nKDMIPS", "内存峰值\nMB", "物理 IO 读\n实测峰值 MB/周期\n标准 MB/s", "物理 IO 写\n实测峰值 MB/周期\n标准 MB/s"]
+               "CPU 峰值\n%", "峰值 K\nKDMIPS", "内存峰值\nMB", "物理 IO 读\n实测峰值\n标准 MB/s", "物理 IO 写\n实测峰值\n标准 MB/s"]
     out = ['<div class="data-table" data-table="excel"><div class="controls js-only">'
            '<label>搜索 <input type="search" class="table-search" placeholder="进程、模块、作用、状态或 PID" aria-label="搜索关注进程"></label>'
            '<label><input type="checkbox" class="show-standards" checked>显示标准值</label>'
@@ -387,7 +417,10 @@ def required_table(data, segment):
                     value = round_metric(value)
                 color, hint = budget_comparison(value, source, column) if index == 2 else ("", "")
                 comparison = (' class="' + color + '" title="' + esc(hint) + '"') if color else ''
-                out.append('<td data-sort="' + esc('' if value is None else value) + '"' + comparison + '>' + esc(number(value)) + '</td>')
+                io_value = metric(p, ("rd_kb", "wr_kb")[column - 5], "max") if index == 2 and column >= 5 else None
+                io_attrs = (' data-io-unit="cycle" data-io-kb="' + esc('' if io_value is None else io_value) + '"') if index == 2 and column >= 5 else ''
+                display = io_number(io_value, True) if index == 2 and column >= 5 else number(value)
+                out.append('<td data-sort="' + esc('' if value is None else value) + '"' + io_attrs + comparison + '>' + esc(display) + '</td>')
             out.append('</tr>')
         out.append('</tbody>')
     return ''.join(out) + '</table></div></div>'
@@ -433,7 +466,7 @@ def segment_html(data, system):
             (process_row(p, n) for n, p in enumerate(processes, 1))]
     out.append(grid(headers, rows, [p["id"] for p in processes], True, "all", search_terms=[', '.join(map(str, p["pids"])) for p in processes]))
     out.append('</details>')
-    out.append('<details class="panel" open><summary>关注进程</summary><details class="report-notes"><summary>查看说明</summary><p class="note">独立核对全部49项；每个进程前两行为后台标准（蓝色）、前台标准（紫色），第三行为当前实测，可通过开关隐藏标准值。标准值照录源表预算，仅比较需求为Y的场景：仅前台或仅后台需求时按对应标准，双Y时仅按前台标准比较；高于适用标准标红、低于适用标准标绿。相等或标准不足以判断时保持原色，缺失实测不着色；颜色仅表示数值对比，不判定场景达标；点击指标表头按当前实测排序，点击实测行可叠加曲线。实测为当前完整时段，日志没有前后台场景标记，不推断场景。候选与截断名称不计入实测，DP-only不等于P采集成功。实测K固定按28.75 KDMIPS/核换算；源预算K照录，不修正源表不一致。RSS峰值不等同于源表所有内存口径。IO实测取当前时段有效物理读、写周期增量各自的峰值，按1024 KB = 1 MB换算，单位MB/周期，缺失不补零；源表IO标准仍为MB/s。两者单位不同，IO不做红绿比较，不推算速率。</p></details>' + required_table(data, segment) + '</details>')
+    out.append('<details class="panel" open><summary>关注进程</summary><details class="report-notes"><summary>查看说明</summary><p class="note">独立核对全部49项；每个进程前两行为后台标准（蓝色）、前台标准（紫色），第三行为当前实测，可通过开关隐藏标准值。标准值照录源表预算，仅比较需求为Y的场景：仅前台或仅后台需求时按对应标准，双Y时仅按前台标准比较；高于适用标准标红、低于适用标准标绿。相等或标准不足以判断时保持原色，缺失实测不着色；颜色仅表示数值对比，不判定场景达标；点击指标表头按当前实测排序，点击实测行可叠加曲线。实测为当前完整时段，日志没有前后台场景标记，不推断场景。候选与截断名称不计入实测，DP-only不等于P采集成功。实测K固定按28.75 KDMIPS/核换算；源预算K照录，不修正源表不一致。RSS峰值不等同于源表所有内存口径。IO实测取当前时段有效物理读、写周期增量各自的峰值，源值为KB，按1024自适应显示KB/MB/GB/TB/PB，每项保留两位小数与千分位，单位为每周期增量，缺失不补零；源表IO标准仍为MB/s。两者单位不同，IO不做红绿比较，不推算速率。</p></details>' + required_table(data, segment) + '</details>')
     out.append('<details class="panel" open><summary>关联进程分析</summary><details class="report-notes"><summary>查看说明</summary><p class="note">仅同段合并，按本段全部周期对齐。任一成员行或字段缺失，则对应合计缺失；全量重算最近秩分位数。不会相加分位数。可选及已选列表各显示4行，其余滚动查看。默认隐藏系统进程（与全进程分析一致：名称以 android、com.android、.、vendor、/apex/com.android、/system/、/vendor/ 开头、以方括号包裹或不含英文句点；以 jkc 开头的名称除外），可通过开关展示；搜索和隐藏不移除已选成员。</p>' + reference_note + '</details>')
     for role, title in (("merge-cpu", "合并 CPU"), ("merge-rss", "合并 内存 MB"), ("merge-io", "合并 IO 增量")):
         if role == "merge-io" and not has_io:

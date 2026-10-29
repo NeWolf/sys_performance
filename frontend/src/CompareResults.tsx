@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { formatNumber, formatPid, roundMetric, subtractMetric, scaleMetric } from './api'
+import { formatNumber, formatStatistic, formatPid, roundMetric, subtractMetric, scaleMetric } from './api'
 import type { Session } from './api'
 import { ComparisonBars } from './Chart'
 import type { ComparisonBarItem } from './Chart'
@@ -34,7 +34,7 @@ function Coverage({ title, data }: { title: string; data: Snapshot }) {
 function MetricCells({ field, metric, stat }: { field: string; metric: Metric; stat: Stat }) {
   const diff = difference(metric, stat)
   const suffix = unit(field, stat, metric)
-  return <><td>{formatNumber(diff?.baseline, 2)} {suffix}</td><td>{formatNumber(diff?.target, 2)} {suffix}</td><td className={diff?.delta == null ? '' : diff.delta > 0 ? 'compare-up' : diff.delta < 0 ? 'compare-down' : ''}>{signed(diff?.delta)} {diff?.delta == null ? '' : suffix === '%' ? '百分点' : suffix}</td><td>{signed(diff?.percent)}{diff?.percent == null ? '' : '%'}</td><td>{metric.baseline_count} / {metric.target_count}{!metric.comparable && <small>口径不同，不计算差值</small>}</td></>
+  return <><td>{formatStatistic(diff.baseline, suffix)}</td><td>{formatStatistic(diff.target, suffix)}</td><td className={diff?.delta == null ? '' : diff.delta > 0 ? 'compare-up' : diff.delta < 0 ? 'compare-down' : ''}>{diff.delta != null && diff.delta > 0 ? '+' : ''}{formatStatistic(diff.delta, suffix === '%' ? '百分点' : suffix)}</td><td>{signed(diff?.percent)}{diff?.percent == null ? '' : '%'}</td><td>{metric.baseline_count} / {metric.target_count}{!metric.comparable && <small>口径不同，不计算差值</small>}</td></>
 }
 
 function barItem(name: string, metric: Metric, stat: Stat): ComparisonBarItem {

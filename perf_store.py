@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from perf_diagnostics import span
 from perf_parser import iter_records, rotation_key
 from perf_top_parser import detect_source_format, iter_top_records
 from perf_groups import GroupStore
@@ -283,14 +284,19 @@ class Store(GroupStore):
         db.execute("INSERT INTO store_migrations VALUES (?)", (migration,))
 
     @contextmanager
-    def connect(self):
+    def connect(self, *, import_commit=False):
         db = sqlite3.connect(str(self.path), timeout=30)
         db.row_factory = sqlite3.Row
         register_metric_sql(db)
         db.execute("PRAGMA foreign_keys=ON")
         try:
             yield db
-            db.commit()
+            # Only the import-owned connection labels this original commit site.
+            if import_commit and db.in_transaction:
+                with span("import.commit"):
+                    db.commit()
+            else:
+                db.commit()
         except Exception:
             db.rollback()
             raise
@@ -315,133 +321,152 @@ class Store(GroupStore):
 
     def import_files(self, sources, title="", *, capture_method="本地导入", device_name="", started_at=None,
                      naming_snapshot=None):
-        # Only internal archive imports provide a previously validated snapshot.
-        # Keep its local-time name stable even if the service timezone changes.
-        if naming_snapshot is not None:
-            naming_snapshot = dict(naming_snapshot)
-            expected_keys = {"name", "capture_method", "device_name", "capture_started_at", "naming_time_source"}
-            if (set(naming_snapshot) != expected_keys
-                    or capture_method != "Top"
-                    or naming_snapshot["capture_method"] != capture_method
-                    or naming_snapshot["device_name"] != safe_filename(device_name, max_bytes=180)
-                    or not isinstance(naming_snapshot["name"], str)
-                    or naming_snapshot["name"] != safe_filename(naming_snapshot["name"])
-                    or not re.fullmatch(r"Top_(?:[0-9]{12}|未知时间)", naming_snapshot["name"])):
-                raise ValueError("归档命名快照无效")
-        sources = sorted(sources, key=lambda source: rotation_key(source[0]))
-        fingerprint = hashlib.sha256()
-        unique_sources, seen = [], set()
-        for name, stream in sources:
-            digest = hashlib.sha256()
-            stream.seek(0)
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-            value = digest.digest()
-            if value in seen:
-                continue
-            seen.add(value)
-            fingerprint.update(value)
-            stream.seek(0)
-            unique_sources.append((Path(name.replace("\\", "/")).name, stream))
-        formats = set()
-        for name, stream in unique_sources:
-            try:
-                detected = detect_source_format(stream)
-            except ValueError as exc:
-                raise ValueError(name + ": " + str(exc)) from exc
-            if detected:
-                formats.add(detected)
-        if len(formats) > 1:
-            raise ValueError("同一导入不能混合 Top/sysmonitor")
-        source_format = next(iter(formats), "sysmonitor")
-        parser = iter_top_records if source_format == "top" else iter_records
-        signature = fingerprint.hexdigest()
-        with self.connect() as db:
-            # Serialize imports before checking duplicates.
-            db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT id FROM sessions WHERE fingerprint=?", (signature,)).fetchone()
-            if existing:
-                return {"id": existing["id"], "duplicate": True}
-            session_id = uuid.uuid4().hex
-            summary = {"counts": {k: 0 for k in ("S", "P", "D", "DE", "DP")},
-                       "errors": 0, "unknown": 0, "issues": [], "events": [], "event_count": 0,
-                       "files": [name for name, _ in unique_sources], "segments": 0,
-                       "orphan_cycles": 0, "duplicate_files": len(sources) - len(unique_sources),
-                       "source_format": source_format}
-            if source_format == "top":
-                summary["timestamp_timezones"] = {"UTC": 0, "local": 0}
-                summary["timestamp_policy"] = "UTC 标记按 UTC；旧日志无时区按导入机器本地时区（含当日夏令时）解析"
-                summary["statistics_policy"] = "沿用 nearest-rank；缺周期/缺指标为 NULL，不采用原脚本插值及补零"
-            db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (
-                session_id, "",
-                datetime.now(timezone.utc).isoformat(), signature, "{}"))
-            last_ts = None
-            boot = None
-            segment = 0
-            cycle = 0
-            cycle_has_s = False
-            batch = []
-            first_ts = None
-            for source, stream in unique_sources:
-                last_sample = None
-                for record in parser(stream):
-                    if record.error:
-                        summary["errors"] += 1
-                        if len(summary["issues"]) < 100:
-                            summary["issues"].append({"source": source, "line": record.number, "message": record.error})
+        with span("import.total") as total:
+            # Only internal archive imports provide a previously validated snapshot.
+            # Keep its local-time name stable even if the service timezone changes.
+            if naming_snapshot is not None:
+                naming_snapshot = dict(naming_snapshot)
+                expected_keys = {"name", "capture_method", "device_name", "capture_started_at", "naming_time_source"}
+                if (set(naming_snapshot) != expected_keys
+                        or capture_method != "Top"
+                        or naming_snapshot["capture_method"] != capture_method
+                        or naming_snapshot["device_name"] != safe_filename(device_name, max_bytes=180)
+                        or not isinstance(naming_snapshot["name"], str)
+                        or naming_snapshot["name"] != safe_filename(naming_snapshot["name"])
+                        or not re.fullmatch(r"Top_(?:[0-9]{12}|未知时间)", naming_snapshot["name"])):
+                    raise ValueError("归档命名快照无效")
+            sources = sorted(sources, key=lambda source: rotation_key(source[0]))
+            fingerprint = hashlib.sha256()
+            unique_sources, seen = [], set()
+            with span("import.fingerprint", files=0, bytes=0) as progress:
+                for name, stream in sources:
+                    digest = hashlib.sha256()
+                    stream.seek(0)
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                        progress["bytes"] += len(block)
+                    progress["files"] += 1
+                    value = digest.digest()
+                    if value in seen:
                         continue
-                    if record.kind is None:
-                        summary["unknown"] += 1
-                        continue
-                    kind, data = record.kind, dict(record.data)
-                    if kind in ("P", "DP"):
-                        normalize_process_record(data)
-                    sample = data.pop("_sample", None)
-                    new_sample = source_format == "top" and sample != last_sample
-                    last_sample = sample
-                    ts = data["ts"]
-                    changed_boot = (kind == "S" and "boot" in data and
-                                    boot is not None and data["boot"] != boot)
-                    backwards = last_ts is not None and ts < last_ts
-                    if changed_boot or backwards:
-                        segment += 1
-                        summary["event_count"] += 1
-                        if len(summary["events"]) < 100:
-                            summary["events"].append({"source": source, "line": record.number, "ts": ts,
-                                                      "message": "设备重启" if changed_boot else "时钟回拨或数据乱序"})
-                    if ts != last_ts or changed_boot or backwards or new_sample:
+                    seen.add(value)
+                    fingerprint.update(value)
+                    stream.seek(0)
+                    unique_sources.append((Path(name.replace("\\", "/")).name, stream))
+            formats = set()
+            with span("import.detect", files=len(unique_sources)) as detection:
+                for name, stream in unique_sources:
+                    try:
+                        detected = detect_source_format(stream)
+                    except ValueError as exc:
+                        raise ValueError(name + ": " + str(exc)) from exc
+                    if detected:
+                        formats.add(detected)
+                if len(formats) > 1:
+                    raise ValueError("同一导入不能混合 Top/sysmonitor")
+                source_format = next(iter(formats), "sysmonitor")
+                if source_format in ("top", "sysmonitor"):
+                    detection["source_format"] = source_format
+            parser = iter_top_records if source_format == "top" else iter_records
+            signature = fingerprint.hexdigest()
+            with self.connect(import_commit=True) as db:
+                # Serialize imports before checking duplicates.
+                with span("import.lock"):
+                    db.execute("BEGIN IMMEDIATE")
+                existing = db.execute("SELECT id FROM sessions WHERE fingerprint=?", (signature,)).fetchone()
+                total["duplicate"] = bool(existing)
+                if existing:
+                    return {"id": existing["id"], "duplicate": True}
+                session_id = uuid.uuid4().hex
+                summary = {"counts": {k: 0 for k in ("S", "P", "D", "DE", "DP")},
+                           "errors": 0, "unknown": 0, "issues": [], "events": [], "event_count": 0,
+                           "files": [name for name, _ in unique_sources], "segments": 0,
+                           "orphan_cycles": 0, "duplicate_files": len(sources) - len(unique_sources),
+                           "source_format": source_format}
+                if source_format == "top":
+                    summary["timestamp_timezones"] = {"UTC": 0, "local": 0}
+                    summary["timestamp_policy"] = "UTC 标记按 UTC；旧日志无时区按导入机器本地时区（含当日夏令时）解析"
+                    summary["statistics_policy"] = "沿用 nearest-rank；缺周期/缺指标为 NULL，不采用原脚本插值及补零"
+                db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (
+                    session_id, "",
+                    datetime.now(timezone.utc).isoformat(), signature, "{}"))
+                last_ts = None
+                boot = None
+                segment = 0
+                cycle = 0
+                cycle_has_s = False
+                batch = []
+                first_ts = None
+                with span("import.parse", files=len(unique_sources), records=0, errors=0, unknown=0, samples=0) as parsing:
+                    processed = 0
+                    try:
+                        for source, stream in unique_sources:
+                            last_sample = None
+                            for record in parser(stream):
+                                processed += 1
+                                if processed % 10000 == 0:
+                                    parsing.update(records=sum(summary["counts"].values()),
+                                                   errors=summary["errors"], unknown=summary["unknown"], samples=cycle)
+                                if record.error:
+                                    summary["errors"] += 1
+                                    if len(summary["issues"]) < 100:
+                                        summary["issues"].append({"source": source, "line": record.number, "message": record.error})
+                                    continue
+                                if record.kind is None:
+                                    summary["unknown"] += 1
+                                    continue
+                                kind, data = record.kind, dict(record.data)
+                                if kind in ("P", "DP"):
+                                    normalize_process_record(data)
+                                sample = data.pop("_sample", None)
+                                new_sample = source_format == "top" and sample != last_sample
+                                last_sample = sample
+                                ts = data["ts"]
+                                changed_boot = (kind == "S" and "boot" in data and
+                                                boot is not None and data["boot"] != boot)
+                                backwards = last_ts is not None and ts < last_ts
+                                if changed_boot or backwards:
+                                    segment += 1
+                                    summary["event_count"] += 1
+                                    if len(summary["events"]) < 100:
+                                        summary["events"].append({"source": source, "line": record.number, "ts": ts,
+                                                                  "message": "设备重启" if changed_boot else "时钟回拨或数据乱序"})
+                                if ts != last_ts or changed_boot or backwards or new_sample:
+                                    if last_ts is not None and not cycle_has_s:
+                                        summary["orphan_cycles"] += 1
+                                    cycle += 1
+                                    cycle_has_s = False
+                                if kind == "S":
+                                    boot = data.get("boot")
+                                    cycle_has_s = True
+                                    if source_format == "top":
+                                        summary["timestamp_timezones"][data["timestamp_timezone"]] += 1
+                                if first_ts is None:
+                                    first_ts = ts
+                                last_ts = ts
+                                summary["counts"][kind] += 1
+                                batch.append((session_id, segment, cycle, ts, kind, data.get("pid"),
+                                              data.get("name", data.get("exporter")), source, record.number,
+                                              json.dumps(data, ensure_ascii=False)))
+                                if len(batch) >= 1000:
+                                    self._insert(db, batch)
+                                    batch.clear()
+                        self._insert(db, batch)
+                        if not any(summary["counts"].values()):
+                            raise ValueError("没有有效的 sysmonitor/Top 记录，请检查日志格式及末尾换行")
                         if last_ts is not None and not cycle_has_s:
                             summary["orphan_cycles"] += 1
-                        cycle += 1
-                        cycle_has_s = False
-                    if kind == "S":
-                        boot = data.get("boot")
-                        cycle_has_s = True
-                        if source_format == "top":
-                            summary["timestamp_timezones"][data["timestamp_timezone"]] += 1
-                    if first_ts is None:
-                        first_ts = ts
-                    last_ts = ts
-                    summary["counts"][kind] += 1
-                    batch.append((session_id, segment, cycle, ts, kind, data.get("pid"),
-                                  data.get("name", data.get("exporter")), source, record.number,
-                                  json.dumps(data, ensure_ascii=False)))
-                    if len(batch) >= 1000:
-                        self._insert(db, batch)
-                        batch.clear()
-            self._insert(db, batch)
-            if not any(summary["counts"].values()):
-                raise ValueError("没有有效的 sysmonitor/Top 记录，请检查日志格式及末尾换行")
-            if last_ts is not None and not cycle_has_s:
-                summary["orphan_cycles"] += 1
-            summary.update(segments=segment + 1, cycles=cycle, first_ts=first_ts, last_ts=last_ts)
-            naming = naming_snapshot if naming_snapshot is not None else capture_naming(
-                capture_method, device_name, started_at, first_ts)
-            # Legacy callers may still send title; it no longer overrides automatic names.
-            summary.update({key: value for key, value in naming.items() if key != "name"})
-            db.execute("UPDATE sessions SET name=?, summary=? WHERE id=?",
-                       (naming["name"], json.dumps(summary, ensure_ascii=False), session_id))
-        return {"id": session_id, "duplicate": False}
+                        summary.update(segments=segment + 1, cycles=cycle, first_ts=first_ts, last_ts=last_ts)
+                        naming = naming_snapshot if naming_snapshot is not None else capture_naming(
+                            capture_method, device_name, started_at, first_ts)
+                        # Legacy callers may still send title; it no longer overrides automatic names.
+                        summary.update({key: value for key, value in naming.items() if key != "name"})
+                        db.execute("UPDATE sessions SET name=?, summary=? WHERE id=?",
+                                   (naming["name"], json.dumps(summary, ensure_ascii=False), session_id))
+                    finally:
+                        parsing.update(records=sum(summary["counts"].values()),
+                                       errors=summary["errors"], unknown=summary["unknown"], samples=cycle)
+            return {"id": session_id, "duplicate": False}
 
     @staticmethod
     def _insert(db, rows):
@@ -452,56 +477,61 @@ class Store(GroupStore):
         """Exact nearest-rank statistics, disk-backed sorting and immutable-scope cache."""
         if kind not in NUMERIC:
             raise ValueError("不支持的记录类型")
-        self.session(session_id)
-        scope = json.dumps([PRECISION_VERSION, kind, pid, segment, name], ensure_ascii=False)
-        where, params = "session=? AND kind=?", [session_id, kind]
-        for key, value in (("pid", pid), ("segment", segment), ("name", name)):
-            if value is not None:
-                if key == "name":
-                    where += " AND (name=? OR json_extract(data,'$.raw_name')=?)"
-                    params.extend([value, value])
-                else:
-                    where += " AND " + key + "=?"
-                    params.append(value)
-        with self.connect() as db:
-            cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope=?",
-                                (session_id, scope)).fetchone()
-            if cached:
-                return json.loads(cached[0])
-            # Keep raw JSON extraction to one scan. SQLite spills metric sorts to disk.
-            db.execute("PRAGMA temp_store=FILE")
-            db.execute("PRAGMA temp.cache_size=-8192")
-            fields = NUMERIC[kind] + CATEGORIES.get(kind, ())
-            columns = ",".join(
-                ("metric_round(json_extract(data,'$.%s')) AS %s" if f in NUMERIC[kind]
-                 else "json_extract(data,'$.%s') AS %s") % (f, f) for f in fields)
-            db.execute("CREATE TEMP TABLE metric_scope AS SELECT ts," + columns +
-                       " FROM records WHERE " + where, params)
-            bounds = dict(db.execute("SELECT COUNT(*) samples, MIN(ts) start, MAX(ts) end FROM metric_scope").fetchone())
-            result = dict(bounds, method=METHOD, metrics={}, categories={},
-                          scope={"kind": kind, "pid": pid, "segment": segment, "name": name})
-            for field in NUMERIC[kind]:
-                row = dict(db.execute(f"""WITH ranked AS (
-                    SELECT {field} value, ROW_NUMBER() OVER (ORDER BY {field}) rn,
-                           COUNT(*) OVER () n FROM metric_scope WHERE {field} IS NOT NULL
-                    ) SELECT COUNT(*) count, MIN(value) min, MAX(value) max, metric_avg(value) avg,
-                    MAX(CASE WHEN rn=(95*n+99)/100 THEN value END) p95,
-                    MAX(CASE WHEN rn=(99*n+99)/100 THEN value END) p99,
-                    metric_sum(value) total FROM ranked""").fetchone())
-                if field not in INCREMENTS:
-                    row.pop("total")
-                result["metrics"][field] = dict(row, **metadata(field))
-            for field in CATEGORIES.get(kind, ()):
-                rows = db.execute(f"SELECT {field} value, COUNT(*) count FROM metric_scope "
-                                  f"WHERE {field} IS NOT NULL GROUP BY {field} ORDER BY count DESC, value").fetchall()
-                count = sum(row["count"] for row in rows)
-                result["categories"][field] = {
-                    "label": LABELS[field], "note": NOTES.get(field, ""), "count": count,
-                    "values": [dict(row, percent=scale_metric(row["count"], 100, count)) for row in rows]}
-            # A concurrent deletion must not resurrect a cached session.
-            db.execute("INSERT OR IGNORE INTO analysis_cache SELECT id,?,? FROM sessions WHERE id=?",
-                       (scope, json.dumps(result, ensure_ascii=False), session_id))
-            return result
+        with span("analysis.statistics", kind=kind) as statistics:
+            self.session(session_id)
+            scope = json.dumps([PRECISION_VERSION, kind, pid, segment, name], ensure_ascii=False)
+            where, params = "session=? AND kind=?", [session_id, kind]
+            for key, value in (("pid", pid), ("segment", segment), ("name", name)):
+                if value is not None:
+                    if key == "name":
+                        where += " AND (name=? OR json_extract(data,'$.raw_name')=?)"
+                        params.extend([value, value])
+                    else:
+                        where += " AND " + key + "=?"
+                        params.append(value)
+            with self.connect() as db:
+                cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope=?",
+                                    (session_id, scope)).fetchone()
+                statistics["cache_hit"] = bool(cached)
+                if cached:
+                    return json.loads(cached[0])
+                with span("analysis.scope", kind=kind) as scope_progress:
+                    # Keep raw JSON extraction to one scan. SQLite spills metric sorts to disk.
+                    db.execute("PRAGMA temp_store=FILE")
+                    db.execute("PRAGMA temp.cache_size=-8192")
+                    fields = NUMERIC[kind] + CATEGORIES.get(kind, ())
+                    columns = ",".join(
+                        ("metric_round(json_extract(data,'$.%s')) AS %s" if f in NUMERIC[kind]
+                         else "json_extract(data,'$.%s') AS %s") % (f, f) for f in fields)
+                    db.execute("CREATE TEMP TABLE metric_scope AS SELECT ts," + columns +
+                               " FROM records WHERE " + where, params)
+                    bounds = dict(db.execute("SELECT COUNT(*) samples, MIN(ts) start, MAX(ts) end FROM metric_scope").fetchone())
+                    scope_progress["samples"] = bounds["samples"]
+                result = dict(bounds, method=METHOD, metrics={}, categories={},
+                              scope={"kind": kind, "pid": pid, "segment": segment, "name": name})
+                with span("analysis.aggregate", kind=kind, samples=bounds["samples"]):
+                    for field in NUMERIC[kind]:
+                        row = dict(db.execute(f"""WITH ranked AS (
+                            SELECT {field} value, ROW_NUMBER() OVER (ORDER BY {field}) rn,
+                                   COUNT(*) OVER () n FROM metric_scope WHERE {field} IS NOT NULL
+                            ) SELECT COUNT(*) count, MIN(value) min, MAX(value) max, metric_avg(value) avg,
+                            MAX(CASE WHEN rn=(95*n+99)/100 THEN value END) p95,
+                            MAX(CASE WHEN rn=(99*n+99)/100 THEN value END) p99,
+                            metric_sum(value) total FROM ranked""").fetchone())
+                        if field not in INCREMENTS:
+                            row.pop("total")
+                        result["metrics"][field] = dict(row, **metadata(field))
+                    for field in CATEGORIES.get(kind, ()):
+                        rows = db.execute(f"SELECT {field} value, COUNT(*) count FROM metric_scope "
+                                          f"WHERE {field} IS NOT NULL GROUP BY {field} ORDER BY count DESC, value").fetchall()
+                        count = sum(row["count"] for row in rows)
+                        result["categories"][field] = {
+                            "label": LABELS[field], "note": NOTES.get(field, ""), "count": count,
+                            "values": [dict(row, percent=scale_metric(row["count"], 100, count)) for row in rows]}
+                # A concurrent deletion must not resurrect a cached session.
+                db.execute("INSERT OR IGNORE INTO analysis_cache SELECT id,?,? FROM sessions WHERE id=?",
+                           (scope, json.dumps(result, ensure_ascii=False), session_id))
+                return result
 
     def series(self, session_id, kind, limit=1500, pid=None, segment=None, name=None):
         self.session(session_id)
@@ -690,114 +720,120 @@ class Store(GroupStore):
         if db.execute("SELECT 1 FROM process_rank_ready_v3 WHERE session=?", (session_id,)).fetchone():
             return
         # Recheck under SQLite's writer lock: concurrent first requests build only once.
-        db.execute("BEGIN IMMEDIATE")
+        with span("analysis.process_lock"):
+            db.execute("BEGIN IMMEDIATE")
         if not db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
             raise KeyError(session_id)
         if db.execute("SELECT 1 FROM process_rank_ready_v3 WHERE session=?", (session_id,)).fetchone():
             db.commit()
             return
-        db.execute("PRAGMA temp_store=FILE")
-        db.execute("PRAGMA cache_size=-8192")
-        db.execute("""INSERT INTO process_rank_v3
-            WITH ranked AS (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY segment,pid,name,kind
-                    ORDER BY metric_round(json_extract(data,'$.cpu1c')) IS NULL,metric_round(json_extract(data,'$.cpu1c'))) rn,
-       COUNT(metric_round(json_extract(data,'$.cpu1c'))) OVER (PARTITION BY segment,pid,name,kind) n
-                FROM records WHERE session=? AND kind IN ('P','DP')
-            ) SELECT ?,segment,pid,name,
-                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
-                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
-                SUM(kind='P'),
-                MAX(metric_round(json_extract(data,'$.cpu1c'))), metric_avg(metric_round(json_extract(data,'$.cpu1c'))),
-                MAX(metric_round(json_extract(data,'$.rss_kb'))), MAX(metric_round(json_extract(data,'$.wait'))),
-                metric_sum(metric_round(json_extract(data,'$.rd_kb'))),
-                metric_sum(metric_round(json_extract(data,'$.wr_kb'))),
-                MAX(CASE WHEN kind='DP' THEN metric_round(json_extract(data,'$.size_kb')) END)
-            FROM ranked GROUP BY segment,pid,name""", (session_id, session_id))
-        db.execute("""INSERT INTO process_rank_ready_v3 SELECT ?,COUNT(*)
-            FROM process_rank_v3 WHERE session=?""", (session_id, session_id))
-        db.commit()
+        with span("analysis.process_ranks"):
+            db.execute("PRAGMA temp_store=FILE")
+            db.execute("PRAGMA cache_size=-8192")
+            db.execute("""INSERT INTO process_rank_v3
+                WITH ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY segment,pid,name,kind
+                        ORDER BY metric_round(json_extract(data,'$.cpu1c')) IS NULL,metric_round(json_extract(data,'$.cpu1c'))) rn,
+           COUNT(metric_round(json_extract(data,'$.cpu1c'))) OVER (PARTITION BY segment,pid,name,kind) n
+                    FROM records WHERE session=? AND kind IN ('P','DP')
+                ) SELECT ?,segment,pid,name,
+                    MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                    MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                    SUM(kind='P'),
+                    MAX(metric_round(json_extract(data,'$.cpu1c'))), metric_avg(metric_round(json_extract(data,'$.cpu1c'))),
+                    MAX(metric_round(json_extract(data,'$.rss_kb'))), MAX(metric_round(json_extract(data,'$.wait'))),
+                    metric_sum(metric_round(json_extract(data,'$.rd_kb'))),
+                    metric_sum(metric_round(json_extract(data,'$.wr_kb'))),
+                    MAX(CASE WHEN kind='DP' THEN metric_round(json_extract(data,'$.size_kb')) END)
+                FROM ranked GROUP BY segment,pid,name""", (session_id, session_id))
+            db.execute("""INSERT INTO process_rank_ready_v3 SELECT ?,COUNT(*)
+                FROM process_rank_v3 WHERE session=?""", (session_id, session_id))
+            db.commit()
 
     def _ensure_process_name_ranks(self, db, session_id):
         if db.execute("SELECT 1 FROM process_name_ready_v2 WHERE session=?", (session_id,)).fetchone():
             return
-        db.execute("BEGIN IMMEDIATE")
+        with span("analysis.name_lock"):
+            db.execute("BEGIN IMMEDIATE")
         if not db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
             raise KeyError(session_id)
         if db.execute("SELECT 1 FROM process_name_ready_v2 WHERE session=?", (session_id,)).fetchone():
             db.commit()
             return
-        db.execute("PRAGMA temp_store=FILE")
-        db.execute("PRAGMA cache_size=-8192")
-        # Recompute from raw samples, never average per-PID percentiles/averages.
-        db.execute("""INSERT INTO process_name_rank_v2
-            (session,segment,name,cpu_p95,cpu_p99,samples,cpu_peak,cpu_avg,
-             rss_peak_kb,wait_peak,read_kb,write_kb,dmabuf_peak_kb)
-            WITH ranked AS (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY segment,name,kind
-                    ORDER BY metric_round(json_extract(data,'$.cpu1c')) IS NULL,metric_round(json_extract(data,'$.cpu1c'))) rn,
-                    COUNT(metric_round(json_extract(data,'$.cpu1c'))) OVER (PARTITION BY segment,name,kind) n
-                FROM records WHERE session=? AND kind IN ('P','DP')
-            ) SELECT ?,segment,name,
-                MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
-                MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
-                SUM(kind='P'), MAX(metric_round(json_extract(data,'$.cpu1c'))), metric_avg(metric_round(json_extract(data,'$.cpu1c'))),
-                MAX(metric_round(json_extract(data,'$.rss_kb'))), MAX(metric_round(json_extract(data,'$.wait'))),
-                metric_sum(metric_round(json_extract(data,'$.rd_kb'))),
-                metric_sum(metric_round(json_extract(data,'$.wr_kb'))),
-                MAX(CASE WHEN kind='DP' THEN metric_round(json_extract(data,'$.size_kb')) END)
-            FROM ranked GROUP BY segment,name""", (session_id, session_id))
-        from itertools import groupby
-        # P/DP repeats and duplicate rows within one cycle do not imply a restart.
-        cursor = db.execute("""SELECT DISTINCT segment,name,cycle,pid FROM records
-            WHERE session=? AND kind IN ('P','DP') ORDER BY segment,name,cycle,pid""", (session_id,))
-        for (segment, name), records in groupby(cursor, key=lambda row: (row['segment'], row['name'])):
-            pids, path, previous, changes, concurrent = {}, [], None, 0, False
-            for _, cycle in groupby(records, key=lambda row: row['cycle']):
-                current = [row['pid'] for row in cycle]
-                pids.update(dict.fromkeys(current))
-                concurrent |= len(current) > 1
-                if current != previous:
-                    changes += previous is not None
-                    if len(path) < 4:
-                        path.append(current)
-                    previous = current
-            db.execute("""UPDATE process_name_rank_v2 SET pids=?,pid_path=?,pid_changes=?,concurrent_pids=?
-                WHERE session=? AND segment=? AND name=?""",
-                       (json.dumps(list(pids)), json.dumps(path), changes, concurrent, session_id, segment, name))
-        db.execute("""INSERT INTO process_name_ready_v2 SELECT ?,COUNT(*)
-            FROM process_name_rank_v2 WHERE session=?""", (session_id, session_id))
-        db.commit()
+        with span("analysis.name_ranks"):
+            db.execute("PRAGMA temp_store=FILE")
+            db.execute("PRAGMA cache_size=-8192")
+            # Recompute from raw samples, never average per-PID percentiles/averages.
+            db.execute("""INSERT INTO process_name_rank_v2
+                (session,segment,name,cpu_p95,cpu_p99,samples,cpu_peak,cpu_avg,
+                 rss_peak_kb,wait_peak,read_kb,write_kb,dmabuf_peak_kb)
+                WITH ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY segment,name,kind
+                        ORDER BY metric_round(json_extract(data,'$.cpu1c')) IS NULL,metric_round(json_extract(data,'$.cpu1c'))) rn,
+                        COUNT(metric_round(json_extract(data,'$.cpu1c'))) OVER (PARTITION BY segment,name,kind) n
+                    FROM records WHERE session=? AND kind IN ('P','DP')
+                ) SELECT ?,segment,name,
+                    MAX(CASE WHEN kind='P' AND rn=(95*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                    MAX(CASE WHEN kind='P' AND rn=(99*n+99)/100 THEN metric_round(json_extract(data,'$.cpu1c')) END),
+                    SUM(kind='P'), MAX(metric_round(json_extract(data,'$.cpu1c'))), metric_avg(metric_round(json_extract(data,'$.cpu1c'))),
+                    MAX(metric_round(json_extract(data,'$.rss_kb'))), MAX(metric_round(json_extract(data,'$.wait'))),
+                    metric_sum(metric_round(json_extract(data,'$.rd_kb'))),
+                    metric_sum(metric_round(json_extract(data,'$.wr_kb'))),
+                    MAX(CASE WHEN kind='DP' THEN metric_round(json_extract(data,'$.size_kb')) END)
+                FROM ranked GROUP BY segment,name""", (session_id, session_id))
+            from itertools import groupby
+            # P/DP repeats and duplicate rows within one cycle do not imply a restart.
+            cursor = db.execute("""SELECT DISTINCT segment,name,cycle,pid FROM records
+                WHERE session=? AND kind IN ('P','DP') ORDER BY segment,name,cycle,pid""", (session_id,))
+            for (segment, name), records in groupby(cursor, key=lambda row: (row['segment'], row['name'])):
+                pids, path, previous, changes, concurrent = {}, [], None, 0, False
+                for _, cycle in groupby(records, key=lambda row: row['cycle']):
+                    current = [row['pid'] for row in cycle]
+                    pids.update(dict.fromkeys(current))
+                    concurrent |= len(current) > 1
+                    if current != previous:
+                        changes += previous is not None
+                        if len(path) < 4:
+                            path.append(current)
+                        previous = current
+                db.execute("""UPDATE process_name_rank_v2 SET pids=?,pid_path=?,pid_changes=?,concurrent_pids=?
+                    WHERE session=? AND segment=? AND name=?""",
+                           (json.dumps(list(pids)), json.dumps(path), changes, concurrent, session_id, segment, name))
+            db.execute("""INSERT INTO process_name_ready_v2 SELECT ?,COUNT(*)
+                FROM process_name_rank_v2 WHERE session=?""", (session_id, session_id))
+            db.commit()
 
     def _ensure_process_rss_ranks(self, db, session_id):
         if db.execute("SELECT 1 FROM process_rss_ready_v1 WHERE session=?", (session_id,)).fetchone():
             return
-        db.execute("BEGIN IMMEDIATE")
+        with span("analysis.rss_lock"):
+            db.execute("BEGIN IMMEDIATE")
         self._require_session(db, session_id)
         if db.execute("SELECT 1 FROM process_rss_ready_v1 WHERE session=?", (session_id,)).fetchone():
             db.commit()
             return
-        db.execute("PRAGMA temp_store=FILE")
-        db.execute("PRAGMA cache_size=-8192")
-        for merged in (0, 1):
-            identity = "segment,name" if merged else "segment,pid,name"
-            pid = "-1" if merged else "pid"
-            db.execute(f"""INSERT INTO process_rss_rank_v1
-                WITH ranked AS (
-                    SELECT segment,pid,name,metric_round(json_extract(data,'$.rss_kb')) value,
-                    ROW_NUMBER() OVER (PARTITION BY {identity}
-                        ORDER BY metric_round(json_extract(data,'$.rss_kb'))) rn,
-                    COUNT(*) OVER (PARTITION BY {identity}) n
-                    FROM records WHERE session=? AND kind='P'
-                    AND metric_round(json_extract(data,'$.rss_kb')) IS NOT NULL
-                ) SELECT ?,?,segment,{pid},name,metric_avg(value),
-                    MAX(CASE WHEN rn=(95*n+99)/100 THEN value END),
-                    MAX(CASE WHEN rn=(99*n+99)/100 THEN value END)
-                    FROM ranked GROUP BY {identity}""", (session_id, session_id, merged))
-        db.execute("INSERT INTO process_rss_ready_v1 VALUES (?)", (session_id,))
-        db.commit()
+        with span("analysis.rss_ranks"):
+            db.execute("PRAGMA temp_store=FILE")
+            db.execute("PRAGMA cache_size=-8192")
+            for merged in (0, 1):
+                identity = "segment,name" if merged else "segment,pid,name"
+                pid = "-1" if merged else "pid"
+                db.execute(f"""INSERT INTO process_rss_rank_v1
+                    WITH ranked AS (
+                        SELECT segment,pid,name,metric_round(json_extract(data,'$.rss_kb')) value,
+                        ROW_NUMBER() OVER (PARTITION BY {identity}
+                            ORDER BY metric_round(json_extract(data,'$.rss_kb'))) rn,
+                        COUNT(*) OVER (PARTITION BY {identity}) n
+                        FROM records WHERE session=? AND kind='P'
+                        AND metric_round(json_extract(data,'$.rss_kb')) IS NOT NULL
+                    ) SELECT ?,?,segment,{pid},name,metric_avg(value),
+                        MAX(CASE WHEN rn=(95*n+99)/100 THEN value END),
+                        MAX(CASE WHEN rn=(99*n+99)/100 THEN value END)
+                        FROM ranked GROUP BY {identity}""", (session_id, session_id, merged))
+            db.execute("INSERT INTO process_rss_ready_v1 VALUES (?)", (session_id,))
+            db.commit()
 
     def processes(self, session_id, sort="cpu_peak", limit=100, offset=0, q="", with_total=False, merge_names=False, segment=None):
         self.session(session_id)

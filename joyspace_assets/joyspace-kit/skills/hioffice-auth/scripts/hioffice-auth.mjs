@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { diagnosticFetch as fetch, diagnosticBody, safeError, authBranch, gatewayResult } from "../../safe-diagnostics.mjs";
+
 const DEFAULT_COLOR_GATEWAY_BASE = "https://api.m.jd.com";
 const DEFAULT_TENANT_CODE = "CN.JD.GROUP";
 const DEFAULT_APP_ID = "JDME_DESKTOP";
@@ -69,10 +71,12 @@ async function callColorGateway(functionId, body) {
   });
 
   if (!response.ok) {
-    throw new Error(`${functionId} HTTP ${response.status} ${response.statusText}`);
+    throw new Error("http_error");
   }
 
-  return response.json();
+  const result = await diagnosticBody(response, "json");
+  gatewayResult(functionId, result);
+  return result;
 }
 
 async function getLegacyEncryptPayload(ddAppId) {
@@ -89,7 +93,7 @@ async function getLegacyEncryptPayload(ddAppId) {
   });
 
   if (response?.code !== 0 || !response?.data?.aesKey || !response?.data?.content) {
-    throw new Error(response?.msg || "desk.agent.auth.encrypt failed");
+    throw new Error("remote_error");
   }
 
   return {
@@ -125,7 +129,7 @@ async function queryHiOfficeAppToken({ aesKey, content }) {
       }
 
       return {
-        appToken: await response.text(),
+        appToken: await diagnosticBody(response, "text"),
         xAesKey,
       };
     } catch (error) {
@@ -147,13 +151,14 @@ async function exchangeLegacyWebToken({ appToken, xAesKey, tenantCode, deviceId 
   });
 
   if (response?.code !== 0 || !response?.data?.accessToken) {
-    throw new Error(response?.msg || "desk.agent.auth.getWebToken failed");
+    throw new Error("remote_error");
   }
 
   return response.data.accessToken.trim();
 }
 
 async function exchangeMeTokenViaHiOffice({ tenantCode, deviceId }) {
+  authBranch("legacy");
   const { ddAppId } = requireTenantConfig(tenantCode);
   const encrypt = await getLegacyEncryptPayload(ddAppId);
   const hiOffice = await queryHiOfficeAppToken(encrypt);
@@ -184,6 +189,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`Error: ${error.message}\n`);
+  process.stderr.write(`${safeError(error)}\n`);
   process.exit(1);
 });

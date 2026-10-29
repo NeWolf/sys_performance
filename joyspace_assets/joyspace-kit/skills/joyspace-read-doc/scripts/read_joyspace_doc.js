@@ -33,6 +33,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_JOYSPACE_API_BASE = "https://apijoyspace.jd.com";
+import { diagnosticFetch as fetch, diagnosticBody, safeError, authBranch, gatewayResult } from "../../safe-diagnostics.mjs";
+
 const DEFAULT_COLOR_GATEWAY_BASE = "https://api.m.jd.com";
 const DEFAULT_TENANT_CODE = "CN.JD.GROUP";
 const DEFAULT_APP_ID = "JDME_DESKTOP";
@@ -105,9 +107,11 @@ async function callColorGateway(functionId, body) {
     body: JSON.stringify({ functionId, body, appid: DEFAULT_APP_ID }),
   });
   if (!response.ok) {
-    throw new Error(`${functionId} HTTP ${response.status} ${response.statusText}`);
+    throw new Error("http_error");
   }
-  return response.json();
+  const result = await diagnosticBody(response, "json");
+  gatewayResult(functionId, result);
+  return result;
 }
 
 async function exchangeMeTokenFromStartupToken({ startupToken, tenantCode, deviceId }) {
@@ -120,7 +124,7 @@ async function exchangeMeTokenFromStartupToken({ startupToken, tenantCode, devic
     appCode: process.platform === "darwin" ? "hio_plugin_joydesk_Mac" : "hio_plugin_joydesk",
   });
   if (response?.code !== 0 || !response?.data?.accessToken) {
-    throw new Error(response?.msg || "desk.agent.auth.tokenGrant failed");
+    throw new Error("remote_error");
   }
   return response.data.accessToken.trim();
 }
@@ -138,7 +142,7 @@ async function getLegacyEncryptPayload(ddAppId) {
     jdmeAppId: ddAppId,
   });
   if (response?.code !== 0 || !response?.data?.aesKey || !response?.data?.content) {
-    throw new Error(response?.msg || "desk.agent.auth.encrypt failed");
+    throw new Error("remote_error");
   }
   return { aesKey: response.data.aesKey, content: response.data.content };
 }
@@ -158,7 +162,7 @@ async function queryHiOfficeAppToken({ aesKey, content }) {
       if (!response.ok) throw new Error(`HiOffice ${port}: HTTP ${response.status}`);
       const xAesKey = response.headers.get("X-AES-Key");
       if (!xAesKey) throw new Error(`HiOffice ${port}: missing X-AES-Key`);
-      return { appToken: await response.text(), xAesKey };
+      return { appToken: await diagnosticBody(response, "text"), xAesKey };
     } catch (error) {
       lastError = error;
     }
@@ -176,12 +180,13 @@ async function exchangeLegacyWebToken({ appToken, xAesKey, tenantCode, deviceId 
     jdmeAppId: ddAppId,
   });
   if (response?.code !== 0 || !response?.data?.accessToken) {
-    throw new Error(response?.msg || "desk.agent.auth.getWebToken failed");
+    throw new Error("remote_error");
   }
   return response.data.accessToken.trim();
 }
 
 async function exchangeMeTokenViaHiOffice({ tenantCode, deviceId }) {
+  authBranch("legacy");
   const { ddAppId } = requireTenantConfig(tenantCode);
   const encrypt = await getLegacyEncryptPayload(ddAppId);
   const hiOffice = await queryHiOfficeAppToken(encrypt);
@@ -197,15 +202,18 @@ async function resolveAuth(options) {
   const envMeToken = process.env.ME_TOKEN || process.env.me_token || "";
   const envSsoToken = process.env.SSO_TOKEN || process.env.sso_token || "";
   if (envMeToken || envSsoToken) {
+    authBranch("env");
     return { mode: "env", meToken: envMeToken, ssoToken: envSsoToken };
   }
   const configTokens = await readConfigTokens(
     options.configPath || path.join(process.env.HOME || process.env.USERPROFILE || os.homedir(), ".joyclaw", "openclaw.json"),
   );
   if (configTokens.meToken || configTokens.ssoToken) {
+    authBranch("config");
     return { mode: "config", ...configTokens };
   }
   if (options.startupToken) {
+    authBranch("tokenGrant");
     const meToken = await exchangeMeTokenFromStartupToken({
       startupToken: options.startupToken,
       tenantCode: options.tenantCode,
@@ -233,14 +241,14 @@ async function requestJoySpaceJson({ method, url, cookieHeader, teamHeaderId, bo
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!response.ok) {
-    throw new Error(`${url} HTTP ${response.status} ${response.statusText}`);
+    throw new Error("http_error");
   }
-  const json = await response.json();
+  const json = await diagnosticBody(response, "json");
   if (json?.status === "success" || json?.status === "0" || json?.status === 0) {
     return json.data;
   }
   if (json?.errorCode && json.errorCode !== "0") {
-    throw new Error(json.errorMsg || json.errMsg || `${url} failed`);
+    throw new Error("remote_error");
   }
   return json.data ?? json;
 }
@@ -250,7 +258,7 @@ function extractPageIdFromUrl(pageUrl) {
     /joyspace\.jd\.com\/(?:pages|doc|sheets?|table|ppt|board|mind|meeting)\/([A-Za-z0-9_-]+)/i,
   );
   if (!match?.[1]) {
-    throw new Error(`Unable to extract JoySpace page id from URL: ${pageUrl}`);
+    throw new Error("invalid_page_url");
   }
   return match[1];
 }
@@ -725,7 +733,7 @@ function isMainModule() {
 
 if (isMainModule()) {
   main().catch((error) => {
-    process.stderr.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`${safeError(error)}\n`);
     process.exitCode = 1;
   });
 }

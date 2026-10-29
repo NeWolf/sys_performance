@@ -112,10 +112,10 @@ export function formatMetricValue(value: MetricValue | undefined, unit: string, 
 }
 
 export function formatStatistic(value: MetricValue | undefined, unit: string, total = false, average = false): string {
-  if (value == null) return '—'
-  const suffix = total ? unit.replace(' / 周期', '') : unit
+  if (value == null || !Number.isFinite(value)) return '—'
+  const suffix = total ? unit.replace(/\s*\/\s*周期/g, '') : unit
   if (suffix.startsWith('KB') || suffix.startsWith('MB')) {
-    return formatMemory(value, suffix.startsWith('MB') ? 'MB' : 'KB') + (suffix.includes('周期') ? ' / 周期' : '')
+    return formatMemory(value, suffix.startsWith('MB') ? 'MB' : 'KB')
   }
   return `${formatMetricValue(value, suffix, average)} ${suffix}`
 }

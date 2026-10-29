@@ -1,5 +1,7 @@
 """Safe bridge to the bundled JoySpace read/import tools (no npm dependency)."""
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
+from functools import wraps
 import errno
 import hashlib
 import json
@@ -17,6 +19,170 @@ import time
 from urllib.parse import urlsplit
 
 import perf_slate
+from perf_diagnostics import correlation
+
+
+def _diagnostic_emit(stage, **fields):
+    # Import lazily: diagnostics are optional and must never break business work.
+    try:
+        from perf_diagnostics import emit
+        emit(stage, **fields)
+    except Exception:
+        pass
+
+
+def _diagnostic_clock(*, wall=False):
+    try:
+        return time.time() if wall else time.monotonic()
+    except Exception:
+        return None
+
+
+def _diagnostic_elapsed(started):
+    try:
+        return {"elapsed_ms": max(0, min(86400000, round((time.monotonic() - started) * 1000)))}
+    except Exception:
+        return {}
+
+
+_DIAGNOSTIC_FILE = ContextVar("joyspace_diagnostic_file", default=None)
+_DIAGNOSTIC_OPERATION = ContextVar("joyspace_diagnostic_operation", default=None)
+_DIAGNOSTIC_ENV = "JOYSPACE_DIAGNOSTIC_FILE"
+_DIAGNOSTIC_ENUMS = {
+    "stage": {"joyspace.auth", "joyspace.gateway", "joyspace.gateway_result", "joyspace.port", "joyspace.auth_process"},
+    "source": {"env", "config", "tokenGrant", "legacy"},
+    "operation": {"encrypt", "tokenGrant", "getWebToken", "hioffice"},
+    "status": {"selected", "begin", "ok", "error", "timeout"},
+    "phase": {"headers", "body"},
+    "code": {"ok", "remote_error", "http_error", "missing_auth_header", "unknown_error", "timeout",
+             "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
+             "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+             "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"},
+}
+_DIAGNOSTIC_NUMBERS = {"elapsed_ms": (0, 86400000), "http_status": (100, 599),
+                       "port": (8988, 9006), "attempt": (1, 10)}
+
+
+def _import_diagnostics(path, interrupted=None):
+    # Treat even our private child channel as untrusted: exact enums, bounded I/O.
+    pending = {}
+
+    def finish_pending(status):
+        try:
+            now = round(_diagnostic_clock(wall=True) * 1000)
+        except Exception:
+            now = None
+        for (stage, operation, port), (fields, started) in pending.items():
+            end = {key: value for key, value in fields.items()
+                   if key in ("operation", "port", "attempt", "phase")}
+            end.update(status=status, code="timeout" if status == "timeout" else "unknown_error")
+            if now is not None and type(started) is int and 0 <= now - started <= 86400000:
+                end["elapsed_ms"] = now - started
+            _diagnostic_emit(stage, **end)
+        pending.clear()
+
+    try:
+        with open(path, "rb") as stream:
+            for _ in range(1024):
+                line = stream.readline(2049)
+                if not line or len(line) > 2048:
+                    break
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        continue
+                    if record.get("stage") not in _DIAGNOSTIC_ENUMS["stage"]:
+                        continue
+                    safe = {}
+                    for key, value in record.items():
+                        if key in _DIAGNOSTIC_ENUMS:
+                            if type(value) is str and value in _DIAGNOSTIC_ENUMS[key]:
+                                safe[key] = value
+                        elif key in _DIAGNOSTIC_NUMBERS:
+                            low, high = _DIAGNOSTIC_NUMBERS[key]
+                            if (type(value) is int and low <= value <= high
+                                    and (key != "port" or value % 2 == 0)):
+                                safe[key] = value
+                        elif key == "has_auth_header" and type(value) is bool:
+                            safe[key] = value
+                    stage = safe.pop("stage")
+                    _diagnostic_emit(stage, **safe)
+                    if stage in ("joyspace.port", "joyspace.gateway", "joyspace.auth_process"):
+                        key = (stage, safe.get("operation"), safe.get("port"))
+                        if safe.get("status") == "begin":
+                            pending[key] = (safe, record.get("started_ms"))
+                        elif safe.get("phase") == "headers" and safe.get("status") == "ok":
+                            if key in pending:
+                                fields, started = pending[key]
+                                pending[key] = (dict(fields, phase="body"), started)
+                        elif safe.get("status") in ("ok", "error", "timeout"):
+                            pending.pop(key, None)
+                    if stage == "joyspace.auth_process" and safe.get("status") in ("error", "timeout"):
+                        finish_pending(safe["status"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+    except Exception:
+        pass
+    # An exited child cannot complete an unfinished body, even on exit code zero.
+    finish_pending(interrupted if interrupted in ("error", "timeout") else "error")
+
+
+@contextmanager
+def _diagnostic_channel(probe):
+    directory = None
+    path = None
+    try:
+        if not probe:
+            directory = tempfile.TemporaryDirectory(prefix="jdperf-joy-diag-")
+            path = Path(directory.name) / "events.jsonl"
+            with path.open("xb"):
+                pass
+    except Exception:
+        path = None
+    token = _DIAGNOSTIC_FILE.set(path)
+    interrupted = None
+    try:
+        yield
+    except BaseException as exc:
+        interrupted = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "error"
+        raise
+    finally:
+        _DIAGNOSTIC_FILE.reset(token)
+        try:
+            if path is not None:
+                _import_diagnostics(path, interrupted=interrupted)
+        except Exception:
+            pass
+        finally:
+            if directory is not None:
+                try:
+                    directory.cleanup()
+                except Exception:
+                    pass
+
+
+def _diagnostic_operation(stage):
+    def decorate(function):
+        @wraps(function)
+        @correlation()
+        def wrapped(*args, **kwargs):
+            started = _diagnostic_clock()
+            status = "error"
+            state = {"timeout": False}
+            token = _DIAGNOSTIC_OPERATION.set(state)
+            _diagnostic_emit(stage, status="begin")
+            try:
+                result = function(*args, **kwargs)
+                status = "error" if isinstance(result, dict) and result.get("verified") is False else "ok"
+                return result
+            finally:
+                _DIAGNOSTIC_OPERATION.reset(token)
+                if status != "ok" and state["timeout"]:
+                    status = "timeout"
+                _diagnostic_emit(stage, status=status,
+                                 **_diagnostic_elapsed(started))
+        return wrapped
+    return decorate
 
 
 # Read the templates in order: the first one that answers with content wins,
@@ -60,7 +226,7 @@ def _runtime():
     skill = root / "joyspace_assets/joyspace-kit"
     for name in ("SKILL.md", READ_SCRIPT, IMPORT_SCRIPT, SLATE_SCRIPT, LIST_SCRIPT,
                 "skills/markdown-to-joyspace/scripts/chart_browser.mjs",
-                "skills/shared-auth.mjs",
+                "skills/shared-auth.mjs", "skills/safe-diagnostics.mjs",
                 "skills/hioffice-auth/scripts/hioffice-auth.mjs"):
         if not (skill / name).is_file():
             raise JoySpaceError("内置 JoySpace 资源不完整，请重新安装应用。")
@@ -85,6 +251,9 @@ def _environment(probe=False):
     else:
         env = {k: v for k, v in os.environ.items()
                if not k.upper().startswith(("NODE_", "DYLD_", "LD_"))}
+    env = {k: v for k, v in env.items() if k.upper() != _DIAGNOSTIC_ENV}
+    if not probe and _DIAGNOSTIC_FILE.get() is not None:
+        env[_DIAGNOSTIC_ENV] = str(_DIAGNOSTIC_FILE.get())
     env["PATH"] = ""
     return env
 
@@ -399,25 +568,40 @@ def _run_publish(node, args, skill, *, timeout, probe=False):
 
 
 def _invoke(node, args, skill, *, timeout, publish=False, probe=False, shape=dict):
+    started = _diagnostic_clock()
+    operation = "publish" if publish else "read"
+    outcome = "error"
+    if not probe:
+        _diagnostic_emit("joyspace.invoke", operation=operation, status="begin")
     try:
-        if publish:
-            result = _run_publish(node, args, skill, timeout=timeout, probe=probe)
-        else:
-            result = subprocess.run(
-                [str(node), *args], cwd=str(skill), env=_environment(probe),
-                shell=False, capture_output=True, text=True, encoding="utf-8",
-                timeout=timeout, check=False,
-            )
-        if result.returncode:
-            raise ValueError("script failed")
-        data = json.loads(result.stdout)
-        if not isinstance(data, shape):
-            raise ValueError("invalid result")
-        return data
+        with _diagnostic_channel(probe):
+            if publish:
+                result = _run_publish(node, args, skill, timeout=timeout, probe=probe)
+            else:
+                result = subprocess.run(
+                    [str(node), *args], cwd=str(skill), env=_environment(probe),
+                    shell=False, capture_output=True, text=True, encoding="utf-8",
+                    timeout=timeout, check=False,
+                )
+            if result.returncode:
+                raise ValueError("script failed")
+            data = json.loads(result.stdout)
+            if not isinstance(data, shape):
+                raise ValueError("invalid result")
+            outcome = "ok"
+            return data
     except subprocess.TimeoutExpired:
+        outcome = "timeout"
+        state = _DIAGNOSTIC_OPERATION.get()
+        if not probe and state is not None:
+            state["timeout"] = True
         raise JoySpaceError(PUBLISH_UNKNOWN if publish else "JoySpace 读取超时，请检查内网连接和 HiOffice 登录状态。") from None
     except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
         raise JoySpaceError(PUBLISH_UNKNOWN if publish else "JoySpace 操作失败，请检查内网连接和 HiOffice 登录状态。") from None
+    finally:
+        if not probe:
+            _diagnostic_emit("joyspace.invoke", operation=operation, status=outcome,
+                             **_diagnostic_elapsed(started))
 
 
 def _check_runtime():
@@ -458,6 +642,7 @@ def _page_id(value):
         raise JoySpaceError("仅支持 https://joyspace.jd.com/pages/ 页面链接或页面 ID。") from None
 
 
+@_diagnostic_operation("joyspace.template")
 def read_template():
     """Read the template as a Slate block tree, not as Markdown.
 
@@ -562,6 +747,7 @@ def _recover(title):
     return dict(found[0], verified=False, message=PUBLISH_RECOVERED)
 
 
+@_diagnostic_operation("joyspace.publish")
 def publish_slate(file_path, title, placement="personal", parent_page=None, *, expected_sha256=None):
     """Upload the draft block tree as-is, so the page matches the template."""
     if placement not in ("personal", "child", "sibling"):

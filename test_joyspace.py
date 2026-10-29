@@ -45,6 +45,229 @@ class JoySpaceBridgeTests(unittest.TestCase):
         cls.blocks = [{"type": "p", "children": [{"text":"report"}]}]
         cls.report.write_text(json.dumps(cls.blocks), encoding="utf-8")
 
+    def test_diagnostics_private_channel_timeout_and_probe(self):
+        events, paths = [], []
+        def run(*args, **kwargs):
+            path = Path(kwargs["env"][joy._DIAGNOSTIC_ENV])
+            paths.append(path)
+            self.assertNotEqual(str(path), "external-secret-path")
+            path.write_text(json.dumps({"stage": "joyspace.port", "status": "error",
+                "port": 8988, "http_status": 200, "has_auth_header": False,
+                "code": "missing_auth_header", "body": "secret-body"}) + "\n")
+            raise subprocess.TimeoutExpired("secret-command", 1, "secret-out", "secret-error")
+        with patch.dict(os.environ, {joy._DIAGNOSTIC_ENV: "external-secret-path"}), \
+                patch.object(joy, "_diagnostic_emit", side_effect=lambda stage, **f: events.append((stage, f))), \
+                patch.object(joy.subprocess, "run", side_effect=run):
+            with self.assertRaises(joy.JoySpaceError):
+                joy._invoke(Path("/node"), ["script"], self.folder, timeout=1)
+            self.assertNotIn(joy._DIAGNOSTIC_ENV, joy._environment())
+            self.assertNotIn(joy._DIAGNOSTIC_ENV, joy._environment(probe=True))
+        self.assertTrue(paths)
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(events[1][1]["code"], "missing_auth_header")
+        self.assertEqual(events[-1][1]["status"], "timeout")
+        self.assertNotIn("secret", json.dumps(events))
+        with patch.object(joy, "_diagnostic_emit") as emit, \
+                patch.object(joy.tempfile, "TemporaryDirectory") as temporary, \
+                patch.object(joy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}")):
+            self.assertEqual(joy._invoke(Path("/node"), ["script"], self.folder, timeout=1, probe=True), {})
+            emit.assert_not_called()
+            temporary.assert_not_called()
+
+    def test_diagnostics_reject_dynamic_values_and_tolerate_failures(self):
+        path = self.folder / "unsafe-diagnostics.jsonl"
+        records = [[], {"stage": []}, {"stage": "secret-stage"},
+            {"stage": "joyspace.port", "code": "SECRET_LOOKS_VALID", "source": "secret",
+             "operation": "secret", "status": "secret", "port": True, "http_status": 600,
+             "elapsed_ms": float("inf"), "attempt": -1, "has_auth_header": "secret",
+             "stdout": "secret", "url": "secret", "trace_id": "a" * 32},
+            {"stage": "joyspace.port", "port": 9006, "attempt": 10,
+             "code": "ECONNREFUSED", "status": "error", "elapsed_ms": 12}]
+        path.write_text("not json\n" + "\n".join(json.dumps(r) for r in records) + "\n")
+        with patch.object(joy, "_diagnostic_emit") as emit:
+            joy._import_diagnostics(path)
+        self.assertEqual(emit.call_count, 2)
+        self.assertEqual(emit.call_args_list[0].args, ("joyspace.port",))
+        self.assertEqual(emit.call_args_list[0].kwargs, {})
+        self.assertEqual(emit.call_args.kwargs["code"], "ECONNREFUSED")
+        with patch.object(joy.tempfile, "TemporaryDirectory", side_effect=OSError("secret")), \
+                patch.object(joy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}")):
+            self.assertEqual(joy._invoke(Path("/node"), ["script"], self.folder, timeout=1), {})
+        import types
+        broken = types.SimpleNamespace(emit=lambda *a, **k: (_ for _ in ()).throw(OSError("secret")))
+        with patch.dict(joy.sys.modules, {"perf_diagnostics": broken}):
+            joy._diagnostic_emit("joyspace.invoke", status="ok")
+
+    def test_diagnostics_close_interrupted_requests_without_inventing_response(self):
+        path = self.folder / "interrupted-diagnostics.jsonl"
+        begin = {"stage": "joyspace.port", "operation": "hioffice", "status": "begin",
+                 "port": 8990, "attempt": 2, "started_ms": 100000}
+        missing = {"stage": "joyspace.port", "status": "error", "port": 8988,
+                   "http_status": 200, "has_auth_header": False, "code": "missing_auth_header"}
+        for auth_timeout in (False, True):
+            records = [missing, begin]
+            if auth_timeout:
+                records.append({"stage": "joyspace.auth_process", "status": "timeout"})
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            with patch.object(joy, "_diagnostic_emit") as emit, patch.object(joy.time, "time", return_value=101):
+                joy._import_diagnostics(path, interrupted=None if auth_timeout else "timeout")
+            self.assertEqual(emit.call_args_list[0].kwargs["code"], "missing_auth_header")
+            end = emit.call_args.kwargs
+            self.assertEqual(end, {"operation": "hioffice", "port": 8990, "attempt": 2,
+                                   "status": "timeout", "code": "timeout", "elapsed_ms": 1000})
+            self.assertNotIn("started_ms", str(emit.call_args_list))
+
+    def test_diagnostics_body_pending_and_terminal_events(self):
+        path = self.folder / "body-events.jsonl"
+        begin = {"stage": "joyspace.gateway", "operation": "tokenGrant", "status": "begin",
+                 "started_ms": 100000}
+        headers = dict(begin, phase="headers", status="ok", code="ok", http_status=200)
+        for end_status in (None, "ok", "error", "timeout"):
+            for interruption in (None, "error", "timeout"):
+                for child_timeout in (False, True):
+                    records = [begin, headers]
+                    if end_status:
+                        records.append(dict(begin, phase="body", status=end_status, code="ok"))
+                    if child_timeout:
+                        records.append({"stage": "joyspace.auth_process", "status": "timeout"})
+                    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+                    with patch.object(joy, "_diagnostic_emit") as emit:
+                        joy._import_diagnostics(path, interrupted=interruption)
+                    ends = [c.kwargs for c in emit.call_args_list
+                            if c.args == ("joyspace.gateway",) and c.kwargs.get("phase") == "body"]
+                    self.assertEqual(len(ends), 1)
+                    expected = end_status or ("timeout" if child_timeout else interruption or "error")
+                    self.assertEqual(ends[0]["status"], expected)
+                    self.assertNotIn("started_ms", ends[0])
+                    if not end_status:
+                        self.assertNotIn("http_status", ends[0])
+
+    def test_diagnostics_base_exception_identity_and_cleanup(self):
+        for error in (KeyboardInterrupt("secret"), SystemExit("secret"), BaseException("secret")):
+            outer = joy._DIAGNOSTIC_FILE.set("outer")
+            try:
+                with patch.object(joy, "_diagnostic_emit") as emit:
+                    with self.assertRaises(type(error)) as raised:
+                        with joy._diagnostic_channel(False):
+                            path = joy._DIAGNOSTIC_FILE.get()
+                            path.write_text(json.dumps({"stage": "joyspace.gateway",
+                                "operation": "encrypt", "status": "begin"}) + "\n")
+                            raise error
+                    self.assertIs(raised.exception, error)
+                    self.assertEqual(joy._DIAGNOSTIC_FILE.get(), "outer")
+                    self.assertFalse(path.parent.exists())
+                    self.assertEqual(emit.call_args.kwargs["status"], "error")
+                    self.assertNotIn("secret", str(emit.call_args_list))
+            finally:
+                joy._DIAGNOSTIC_FILE.reset(outer)
+
+    def test_diagnostic_timing_faults_preserve_operation_and_invoke(self):
+        for entry in ("operation", "invoke"):
+            for fault in ("before", "after", "always"):
+                for error in (None, RuntimeError("secret-body"), KeyboardInterrupt("secret"),
+                              SystemExit("secret")):
+                    with self.subTest(entry=entry, fault=fault, error=type(error).__name__):
+                        value, calls = {"ok": True}, []
+                        def body(*args, **kwargs):
+                            calls.append((args, kwargs))
+                            if error is not None:
+                                raise error
+                            return value if entry == "operation" else subprocess.CompletedProcess([], 0, "{}")
+                        clock = OSError("secret-clock")
+                        ticks = {"before": [clock, 20], "after": [10, clock], "always": clock}[fault]
+                        outer = joy._DIAGNOSTIC_OPERATION.set({"outer": True})
+                        previous = joy._DIAGNOSTIC_OPERATION.get()
+                        try:
+                            with patch.object(joy.time, "monotonic", side_effect=ticks), \
+                                    patch.object(joy, "_diagnostic_emit") as emit, \
+                                    patch.object(joy, "_import_diagnostics"), \
+                                    patch.object(joy.subprocess, "run", side_effect=body), \
+                                    patch.object(joy.json, "loads", return_value=value):
+                                run = joy._diagnostic_operation("joyspace.template")(body) if entry == "operation" else (
+                                    lambda: joy._invoke(Path("/node"), ["script"], self.folder, timeout=1))
+                                if error is None:
+                                    self.assertIs(run(), value)
+                                else:
+                                    with self.assertRaises(type(error)) as raised:
+                                        run()
+                                    self.assertIs(raised.exception, error)
+                                self.assertEqual(len(calls), 1)
+                                self.assertIs(joy._DIAGNOSTIC_OPERATION.get(), previous)
+                                self.assertEqual(emit.call_args.kwargs["status"], "ok" if error is None else "error")
+                                self.assertNotIn("elapsed_ms", emit.call_args.kwargs)
+                        finally:
+                            joy._DIAGNOSTIC_OPERATION.reset(outer)
+
+    def test_diagnostic_channel_import_fault_always_cleans_directory(self):
+        for error in (None, RuntimeError("secret-body"), KeyboardInterrupt("secret"),
+                      SystemExit("secret"), subprocess.TimeoutExpired("secret", 1)):
+            with self.subTest(error=type(error).__name__):
+                outer = joy._DIAGNOSTIC_FILE.set("outer")
+                paths = []
+                value = object()
+                def run():
+                    with joy._diagnostic_channel(False):
+                        path = joy._DIAGNOSTIC_FILE.get()
+                        paths.append(path)
+                        self.assertTrue(path.is_file())
+                        if error is not None:
+                            raise error
+                        return value
+                try:
+                    with patch.object(joy, "_import_diagnostics", side_effect=ImportError("secret-import")) as importer:
+                        if error is None:
+                            self.assertIs(run(), value)
+                        else:
+                            with self.assertRaises(type(error)) as raised:
+                                run()
+                            self.assertIs(raised.exception, error)
+                        self.assertEqual(len(paths), 1)
+                        importer.assert_called_once_with(paths[0], interrupted=(
+                            "timeout" if isinstance(error, subprocess.TimeoutExpired) else "error" if error else None))
+                        self.assertFalse(paths[0].parent.exists())
+                        self.assertEqual(joy._DIAGNOSTIC_FILE.get(), "outer")
+                finally:
+                    joy._DIAGNOSTIC_FILE.reset(outer)
+
+    def test_diagnostics_template_final_status_and_context_reset(self):
+        valid = subprocess.CompletedProcess([], 0, json.dumps({"raw": {"content": {"content": self.blocks}}}))
+        timeout = subprocess.TimeoutExpired("secret-command", 1, "secret-output")
+        for responses, expected in (([timeout, valid], "ok"), ([timeout, timeout], "timeout"),
+                                    ([subprocess.CompletedProcess([], 0, "{}")] * 2, "error")):
+            events = []
+            with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
+                    patch.object(joy.subprocess, "run", side_effect=responses), \
+                    patch.object(joy, "_diagnostic_emit", side_effect=lambda s, **f: events.append((s, f))):
+                if expected == "ok":
+                    self.assertEqual(joy.read_template(), self.blocks)
+                else:
+                    with self.assertRaises(joy.JoySpaceError):
+                        joy.read_template()
+            self.assertEqual(events[-1][0], "joyspace.template")
+            self.assertEqual(events[-1][1]["status"], expected)
+            self.assertIsNone(joy._DIAGNOSTIC_OPERATION.get())
+            self.assertNotIn("secret", json.dumps(events))
+
+    def test_diagnostics_publish_verified_failure_and_timeout(self):
+        valid = {"verified": True, "imageFree": True, "pageId": "new123", "title": "report",
+                 "sourceSha256": joy.report_sha256(self.report)}
+        for response, expected in ((subprocess.CompletedProcess([], 0, json.dumps(valid)), "ok"),
+                                   (subprocess.CompletedProcess([], 0, "{}"), "error"),
+                                   (subprocess.TimeoutExpired("secret-command", 1, "secret-output"), "timeout")):
+            events = []
+            with patch.object(joy, "_check_runtime", return_value=(Path("/node"), self.folder)), \
+                    patch.object(joy, "_run_publish", side_effect=[response]) as run, \
+                    patch.object(joy, "_recover", return_value={"verified": False}) as recover, \
+                    patch.object(joy, "_diagnostic_emit", side_effect=lambda s, **f: events.append((s, f))):
+                result = joy.publish_slate(self.report, "report")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(recover.call_count, int(expected != "ok"))
+            self.assertIs(result["verified"], expected == "ok")
+            self.assertEqual(events[-1][0], "joyspace.publish")
+            self.assertEqual(events[-1][1]["status"], expected)
+            self.assertIsNone(joy._DIAGNOSTIC_OPERATION.get())
+            self.assertNotIn("secret", json.dumps(events))
+
     def test_chart_bridge_preflight_markers_and_recovery(self):
         path = self.folder / "charts.json"
         original = json.dumps(self.blocks + [chart_fixture()]).encode("utf-8")
@@ -541,6 +764,414 @@ else:
             call.process.wait(timeout=joy._PUBLISH_GRACE), call.job.close(),
             call.process.stdin.close()])
         self.assertTrue(popen.call_args.kwargs["stdout"].closed)
+
+
+class JoySpaceDiagnosticsTests(unittest.TestCase):
+    def run_node(self, source):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node unavailable for offline JS test")
+        root = (Path(__file__).parent / "joyspace_assets/joyspace-kit/skills").resolve()
+        with tempfile.TemporaryDirectory(prefix="jdperf-diagnostics-test-") as directory:
+            env = joy._environment(probe=True)
+            env.update(HOME=directory, USERPROFILE=directory,
+                       JOYSPACE_DIAGNOSTIC_FILE=str(Path(directory) / "events.jsonl"))
+            source = source.replace("SKILLS_URL", json.dumps(root.as_uri() + "/"))
+            result = subprocess.run([node, "--input-type=module", "-e", source],
+                                    cwd=directory, env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            events = (Path(directory) / "events.jsonl").read_text()
+            self.assertNotIn("secret", events)
+            self.assertNotIn(directory, events)
+            self.assertNotIn("http://", events)
+            self.assertNotIn("https://", events)
+            return [json.loads(line) for line in events.splitlines()]
+
+    def test_fetch_metadata_identity_and_exact_error_whitelist(self):
+        events = self.run_node(r'''
+import assert from 'node:assert/strict';
+const {diagnosticFetch, gatewayResult} = await import(SKILLS_URL + 'safe-diagnostics.mjs');
+const url = 'http://127.0.0.1:8988/hioffice?secret=query';
+const options = {body: 'secret-body', headers: {'X-AES-Key': 'secret-key'}};
+const response = {ok: true, status: 200, headers: new Headers(),
+  text() {throw new Error('body must not be consumed');},
+  clone() {throw new Error('must not clone');}};
+globalThis.fetch = async (...args) => {
+  assert.equal(args[0], url); assert.equal(args[1], options); return response;
+};
+assert.equal(await diagnosticFetch(url, options), response);
+for (const [error, expected] of [
+  [Object.assign(new Error('secret-message'), {code: 'SECRET_LOOKS_VALID'}), 'unknown_error'],
+  [Object.assign(new Error('secret-message'), {cause: {code: 'ECONNREFUSED'}}), 'ECONNREFUSED'],
+  [Object.assign(new Error('secret-message'), {name: 'TimeoutError'}), 'timeout'],
+  [Object.assign(new Error('secret-message'), {code: 'ETIMEDOUT'}), 'ETIMEDOUT'],
+]) {
+  globalThis.fetch = async () => {throw error;};
+  await assert.rejects(diagnosticFetch(url, options), e => e === error);
+}
+globalThis.fetch = async () => response;
+await diagnosticFetch('https://secret.example/private');
+await diagnosticFetch('http://127.0.0.1:8989/hioffice');
+gatewayResult('desk.agent.auth.tokenGrant', {code: 'SECRET_LOOKS_VALID', msg: 'secret-body'});
+gatewayResult('secret-route', {code: 0});
+''')
+        ends = [e for e in events if e.get("status") != "begin"]
+        self.assertEqual([e["code"] for e in ends], ["missing_auth_header", "unknown_error",
+            "ECONNREFUSED", "timeout", "ETIMEDOUT", "remote_error"])
+        self.assertEqual(ends[0]["http_status"], 200)
+        self.assertIs(ends[0]["has_auth_header"], False)
+        self.assertEqual([e["status"] for e in ends[3:5]], ["timeout", "timeout"])
+        self.assertTrue(all(isinstance(e["elapsed_ms"], int) for e in ends[:-1]))
+
+
+    def test_body_observation_preserves_identity_and_reads_once(self):
+        events = self.run_node(r'''
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const {diagnosticFetch, diagnosticBody} = await import(SKILLS_URL + 'safe-diagnostics.mjs');
+for (const method of ['json', 'text']) {
+  for (const kind of ['ok', 'malformed', 'reset', 'timeout', 'pending']) {
+    let reads = 0;
+    const value = method === 'json' ? {token: 'secret'} : 'secret';
+    const error = kind === 'malformed' ? new SyntaxError('secret-json')
+      : Object.assign(new Error('secret'), {cause: {code:
+          kind === 'timeout' ? 'UND_ERR_BODY_TIMEOUT' : 'ECONNRESET'}});
+    const response = {ok: true, status: 200, headers: new Headers({'X-AES-Key': 'secret'}),
+      clone() {assert.fail('clone forbidden');},
+      [method]() {
+        assert.equal(this, response); reads++;
+        if (kind === 'pending') return new Promise(() => {});
+        if (kind !== 'ok') return Promise.reject(error);
+        return Promise.resolve(value);
+      }};
+    globalThis.fetch = async () => response;
+    const url = method === 'text' ? 'http://127.0.0.1:8988/hioffice'
+      : 'https://api.m.jd.com/?functionId=desk.agent.auth.tokenGrant';
+    assert.equal(await diagnosticFetch(url), response);
+    assert.equal(reads, 0);
+    const before = readFileSync(process.env.JOYSPACE_DIAGNOSTIC_FILE, 'utf8').trim().split('\n');
+    assert.equal(JSON.parse(before.at(-1)).phase, 'headers');
+    const result = diagnosticBody(response, method);
+    if (kind === 'ok') assert.equal(await result, value);
+    else if (kind !== 'pending') await assert.rejects(result, e => e === error);
+    assert.equal(reads, 1);
+  }
+}
+''')
+        bodies = [e for e in events if e.get("phase") == "body"]
+        self.assertEqual([e["code"] for e in bodies],
+                         ["ok", "unknown_error", "ECONNRESET", "UND_ERR_BODY_TIMEOUT"] * 2)
+        self.assertEqual([e["status"] for e in bodies], ["ok", "error", "error", "timeout"] * 2)
+        self.assertEqual(len([e for e in events if e.get("phase") == "headers"]), 10)
+
+    def test_js_clock_and_body_finalization_faults_preserve_identity(self):
+        source = r'''
+import assert from 'node:assert/strict';
+import {performance} from 'node:perf_hooks';
+import {writeFileSync} from 'node:fs';
+writeFileSync(process.env.JOYSPACE_DIAGNOSTIC_FILE, '');
+const {diagnosticFetch, diagnosticBody} = await import(SKILLS_URL + 'safe-diagnostics.mjs');
+const fault = FAULT, outcome = OUTCOME;
+for (const method of ['json', 'text']) {
+  let calls = 0, reads = 0, ticks = 0;
+  const value = method === 'json' ? {secret: 'result'} : 'secret-result';
+  const error = new Error('secret-business');
+  const clockError = new Error('secret-diagnostic');
+  const response = {ok: true, status: 200, headers: {get: () => 'secret'},
+    clone() {assert.fail('clone forbidden');},
+    [method]() {
+      assert.equal(this, response); reads++;
+      if (outcome === 'body-error') return Promise.reject(error);
+      return Promise.resolve(value);
+    }};
+  globalThis.fetch = async () => {
+    calls++;
+    if (outcome === 'fetch-error') throw error;
+    return response;
+  };
+  const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+  const dateNow = Date.now, remove = WeakMap.prototype.delete;
+  Object.defineProperty(performance, 'now', {configurable: true, value: () => {
+    ticks++;
+    if (fault === 'always' || (fault === 'before' && ticks === 1)
+        || (fault === 'headers' && ticks === 2) || (fault === 'body' && ticks === 3)) throw clockError;
+    return ticks * 10;
+  }});
+  if (fault === 'date') Date.now = () => {throw clockError;};
+  try {
+    const fetched = diagnosticFetch('http://127.0.0.1:8988/hioffice');
+    if (outcome === 'fetch-error') await assert.rejects(fetched, e => e === error);
+    else {
+      assert.equal(await fetched, response);
+      assert.equal(reads, 0);
+      if (fault === 'cleanup') WeakMap.prototype.delete = () => {throw clockError;};
+      if (outcome === 'body-error') await assert.rejects(diagnosticBody(response, method), e => e === error);
+      else assert.equal(await diagnosticBody(response, method), value);
+    }
+    assert.equal(calls, 1);
+    assert.equal(reads, outcome === 'fetch-error' ? 0 : 1);
+  } finally {
+    if (descriptor) Object.defineProperty(performance, 'now', descriptor);
+    else delete performance.now;
+    Date.now = dateNow;
+    WeakMap.prototype.delete = remove;
+  }
+}
+'''
+        for fault in ("before", "headers", "body", "always", "date", "cleanup"):
+            for outcome in ("ok", "body-error", "fetch-error"):
+                with self.subTest(fault=fault, outcome=outcome):
+                    self.run_node(source.replace("FAULT", json.dumps(fault)).replace("OUTCOME", json.dumps(outcome)))
+
+    def test_auth_clock_faults_keep_business_status_and_single_spawn(self):
+        source = r'''
+import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import {performance} from 'node:perf_hooks';
+import {syncBuiltinESMExports} from 'node:module';
+import {writeFileSync} from 'node:fs';
+writeFileSync(process.env.JOYSPACE_DIAGNOSTIC_FILE, '');
+let calls = 0, ticks = 0;
+childProcess.spawnSync = (node, args, options) => {
+  calls++;
+  assert.equal(node, process.execPath);
+  assert.equal(args.length, 1);
+  assert.deepEqual(options, {encoding: 'utf8', shell: false, timeout: 45000});
+  if (OUTCOME === 'error') throw new Error('secret-spawn');
+  if (OUTCOME === 'timeout') return {status: null, error: {code: 'ETIMEDOUT'}};
+  return {status: 0, stdout: '{"meToken":"secret-token"}'};
+};
+syncBuiltinESMExports();
+const {getMeToken} = await import(SKILLS_URL + 'shared-auth.mjs');
+Object.defineProperty(performance, 'now', {configurable: true, value: () => {
+  ticks++;
+  if (FAULT === 'always' || (FAULT === 'before' && ticks === 1)
+      || (FAULT === 'after' && ticks === 2)) throw new Error('secret-clock');
+  return ticks * 10;
+}});
+if (FAULT === 'date') Date.now = () => {throw new Error('secret-clock');};
+if (OUTCOME === 'ok') assert.deepEqual(getMeToken(), {meToken: 'secret-token', me_token: 'secret-token'});
+else assert.throws(getMeToken, e => e.message === (OUTCOME === 'timeout' ? 'timeout' : 'auth_process_error'));
+assert.equal(calls, 1);
+'''
+        for fault in ("before", "after", "always", "date"):
+            for outcome in ("ok", "error", "timeout"):
+                with self.subTest(fault=fault, outcome=outcome):
+                    self.run_node(source.replace("FAULT", json.dumps(fault)).replace("OUTCOME", json.dumps(outcome)))
+
+    def test_auth_branches_gateways_and_all_legacy_ports(self):
+        events = self.run_node(r'''
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+const configPath = process.env.HOME + '/offline-config.json';
+const options = {configPath, tenantCode: 'CN.JD.GROUP', deviceId: 'secret-device'};
+let failPorts = false;
+let calls = 0;
+const refused = Object.assign(new Error('secret-refused'), {code: 'ECONNREFUSED'});
+globalThis.fetch = async (input, init) => {
+  calls++;
+  const url = new URL(input);
+  if (url.hostname === '127.0.0.1') {
+    if (failPorts && url.port !== '8988') throw refused;
+    return {ok: true, status: 200,
+      headers: new Headers(failPorts ? {} : {'X-AES-Key': 'secret-key'}),
+      text: async () => 'secret-app-token'};
+  }
+  assert.equal(url.origin, 'https://api.m.jd.com');
+  const route = url.searchParams.get('functionId');
+  assert.ok(['desk.agent.auth.encrypt', 'desk.agent.auth.tokenGrant',
+             'desk.agent.auth.getWebToken'].includes(route));
+  const data = route.endsWith('.encrypt') ? {aesKey: 'secret-key', content: 'secret-body'}
+    : {accessToken: 'secret-access-token'};
+  return {ok: true, status: 200, json: async () => ({code: 0, data})};
+};
+for (const script of ['joyspace-read-doc/scripts/read_joyspace_doc.js',
+                      'markdown-to-joyspace/scripts/import_markdown_doc.js']) {
+  const {resolveAuth} = await import(SKILLS_URL + script);
+  const before = calls;
+  process.env.ME_TOKEN = 'secret-env';
+  assert.equal((await resolveAuth(options)).mode, 'env');
+  delete process.env.ME_TOKEN;
+  writeFileSync(configPath, JSON.stringify({models: {providers: {jdcloud: {
+    headers: {Cookie: 'me_token=secret-config;'}}}}}));
+  assert.equal((await resolveAuth(options)).mode, 'config');
+  assert.equal(calls, before);
+  writeFileSync(configPath, '{}');
+  assert.equal((await resolveAuth({...options, startupToken: 'secret-startup'})).mode, 'tokenGrant');
+  failPorts = false;
+  assert.equal((await resolveAuth(options)).mode, 'legacy');
+  failPorts = true;
+  await assert.rejects(resolveAuth(options), e => e === refused);
+}
+// Also execute the actual auth entry point with the same stub, never a real request.
+failPorts = false;
+await import(SKILLS_URL + 'hioffice-auth/scripts/hioffice-auth.mjs');
+''')
+        self.assertEqual([e["source"] for e in events if e["stage"] == "joyspace.auth"],
+                         ["env", "config", "tokenGrant", "legacy", "legacy"] * 2 + ["legacy"])
+        self.assertEqual({e["operation"] for e in events if e["stage"] == "joyspace.gateway_result"},
+                         {"encrypt", "tokenGrant", "getWebToken"})
+        bodies = [e for e in events if e.get("phase") == "body"]
+        self.assertEqual([e["operation"] for e in bodies],
+                         ["tokenGrant", "encrypt", "hioffice", "getWebToken", "encrypt"] * 2
+                         + ["encrypt", "hioffice", "getWebToken"])
+        self.assertTrue(all(e["status"] == "ok" for e in bodies))
+        port_ends = [e for e in events if e["stage"] == "joyspace.port" and e["status"] != "begin"
+                     and not (e.get("phase") == "headers" and e["status"] == "ok")]
+        for start in (1, 12):
+            failed = port_ends[start:start + 10]
+            self.assertEqual([e["port"] for e in failed], list(range(8988, 9007, 2)))
+            self.assertEqual([e["attempt"] for e in failed], list(range(1, 11)))
+            self.assertEqual(failed[0]["code"], "missing_auth_header")
+            self.assertEqual(failed[0]["http_status"], 200)
+            self.assertIs(failed[0]["has_auth_header"], False)
+            self.assertEqual([e["code"] for e in failed[1:]], ["ECONNREFUSED"] * 9)
+
+
+    def test_diagnostics_write_failure_is_harmless(self):
+        events = self.run_node(r'''
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+// Preserve an empty channel for the harness, then target an unwritable directory.
+writeFileSync(process.env.JOYSPACE_DIAGNOSTIC_FILE, '');
+process.env.JOYSPACE_DIAGNOSTIC_FILE = process.env.HOME;
+const {diagnosticFetch, authBranch, gatewayResult, authProcess} =
+  await import(SKILLS_URL + 'safe-diagnostics.mjs');
+const response = {ok: true, status: 200, headers: new Headers({'X-AES-Key': 'secret'})};
+globalThis.fetch = async () => response;
+authBranch('env');
+authProcess('begin');
+gatewayResult('desk.agent.auth.encrypt', {code: 0, data: {aesKey: 'secret', content: 'secret'}});
+assert.equal(await diagnosticFetch('http://127.0.0.1:8988/hioffice'), response);
+const error = new Error('secret');
+globalThis.fetch = async () => {throw error;};
+await assert.rejects(diagnosticFetch('http://127.0.0.1:8990/hioffice'), e => e === error);
+''')
+        self.assertEqual(events, [])
+
+    def test_import_response_errors_and_debug_are_sanitized(self):
+        self.run_node(r'''
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+writeFileSync(process.env.JOYSPACE_DIAGNOSTIC_FILE, '');
+const {requestJoySpaceJson} = await import(SKILLS_URL +
+  'markdown-to-joyspace/scripts/import_markdown_doc.js');
+process.env.DEBUG_JOYSPACE = '1';
+const write = process.stderr.write;
+let output = '', reads = 0;
+process.stderr.write = chunk => {output += chunk; return true;};
+try {
+  for (const data of [{errorCode: 'secret-code', errorMessage: 'secret-message'},
+                       {code: 99, msg: 'secret-message'}, {secret: 'response'}]) {
+    globalThis.fetch = async () => ({ok: true, json: async () => data});
+    await assert.rejects(requestJoySpaceJson({method: 'GET', url: '/secret-path'}),
+      error => error.message === 'remote_error' && !error.stack.includes('secret'));
+  }
+  globalThis.fetch = async () => ({ok: false, status: 500,
+    text: async () => {reads++; return 'secret-body';}});
+  await assert.rejects(requestJoySpaceJson({method: 'GET', url: '/secret-path'}),
+    error => error.message === 'http_error');
+  const data = {secret: 'successful business result'};
+  globalThis.fetch = async () => ({ok: true, json: async () => ({code: 0, data})});
+  assert.equal(await requestJoySpaceJson({method: 'GET', url: '/secret-path'}), data);
+} finally {process.stderr.write = write;}
+assert.equal(reads, 0);
+assert.equal(output, '');
+''')
+
+    def test_three_cli_error_boundaries_are_sanitized(self):
+        self.run_node(r'''
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+writeFileSync(process.env.JOYSPACE_DIAGNOSTIC_FILE, '');
+const file = process.env.HOME + '/secret-report.txt';
+writeFileSync(file, '# offline report');
+const scripts = ['hioffice-auth/scripts/hioffice-auth.mjs',
+  'joyspace-read-doc/scripts/read_joyspace_doc.js',
+  'markdown-to-joyspace/scripts/import_markdown_doc.js'];
+const originalWrite = process.stderr.write, originalExit = process.exit;
+for (const [index, script] of scripts.entries()) {
+  for (const mode of ['network', 'json', 'remote', 'http', 'local']) {
+    delete process.env.ME_TOKEN;
+    if (index) process.env.ME_TOKEN = 'secret-fake-token';
+    process.env.DEBUG_JOYSPACE = '1';
+    let calls = 0, reads = 0, output = '';
+    globalThis.fetch = async () => {
+      calls++;
+      if (mode === 'network') throw new Error('secret-network URL /path');
+    return {ok: mode !== 'http', status: mode === 'http' ? 500 : 200,
+        headers: new Headers(), text: async () => {reads++; return 'secret-body';},
+        json: async () => {
+          if (mode === 'json') throw new SyntaxError('secret-json-body');
+          return {code: 99, errorCode: 'secret-code', msg: 'secret-remote'};
+        }};
+    };
+    const url = SKILLS_URL + script;
+    let args = index === 0 ? [] : index === 1 ? ['--page-id', 'offline'] :
+      ['--file', file, '--page-url', 'https://joyspace.jd.com/pages/offline', '--image-free'];
+    if (mode === 'local') args = index === 0 ? ['--secret-option'] : index === 1 ?
+      ['--url', 'secret-invalid-url'] : ['--file', file + '-secret-missing'];
+    process.argv = [process.execPath, fileURLToPath(url), ...args];
+    let signal;
+    const done = new Promise(resolve => {signal = resolve;});
+    process.stderr.write = chunk => {output += chunk; signal(); return true;};
+    process.exit = code => {process.exitCode = code;};
+    try {
+      await import(url + '?' + mode);
+      await done;
+      await new Promise(resolve => setImmediate(resolve));
+    } finally {
+      process.stderr.write = originalWrite;
+      process.exit = originalExit;
+    }
+    assert.equal(process.exitCode, 1);
+    process.exitCode = 0;
+    assert.equal(output, 'unknown_error\n');
+    assert.equal(calls, mode === 'local' ? 0 : 1);
+    assert.equal(reads, 0);
+  }
+}
+''')
+
+    def test_auth_subprocess_status_without_output_leak(self):
+        events = self.run_node(r'''
+import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import {syncBuiltinESMExports} from 'node:module';
+let result;
+childProcess.spawnSync = (node, args, options) => {
+  assert.equal(node, process.execPath);
+  assert.equal(args.length, 1);
+  assert.ok(args[0].endsWith('hioffice-auth.mjs'));
+  assert.deepEqual(options, {encoding: 'utf8', shell: false, timeout: 45000});
+  if (result instanceof Error) throw result;
+  return result;
+};
+syncBuiltinESMExports();
+const {getMeToken} = await import(SKILLS_URL + 'shared-auth.mjs');
+result = {status: 0, stdout: JSON.stringify({meToken: 'secret-token'})};
+assert.equal(getMeToken().meToken, 'secret-token');
+for (const failed of [{status: null, error: {code: 'ETIMEDOUT'}, stderr: 'secret-stderr'},
+                     {status: 1, stderr: 'secret-stderr'},
+                     {status: 0, stdout: 'secret-invalid-json'},
+                     {status: 0, stdout: '{"secret":"missing-token"}'},
+                     {status: 0, stdout: 'null'},
+                     {status: 0, stdout: '{"meToken":{"secret":"object"}}'},
+                     {status: 0, stdout: '{"meToken":"  "}'},
+                     new Error('secret-spawn-error')]) {
+  result = failed;
+  assert.throws(getMeToken, error => {
+    assert.match(error.message, /^(timeout|auth_process_error)$/);
+    assert.ok(!error.stack.includes('secret'));
+    assert.equal(error.cause, undefined);
+    return true;
+  });
+}
+''')
+        self.assertEqual([e["status"] for e in events],
+                         ["begin", "ok", "begin", "timeout"] + ["begin", "error"] * 7)
+        self.assertTrue(all(e["stage"] == "joyspace.auth_process" for e in events))
 
 
 class JoySpaceImageTests(unittest.TestCase):
@@ -1185,8 +1816,7 @@ await import(SCRIPT_URL);
                     else:
                         self.assertEqual(result.returncode, 1, result.stderr)
                         self.assertEqual(result.stdout, "")
-                        expected = "Report changed after review" if scenario == "changed" else "Image-free report required"
-                        self.assertIn(expected, result.stderr)
+                        self.assertEqual(result.stderr, "unknown_error\n")
                         self.assertNotIn("AssertionError", result.stderr)
 
     def test_offline_image_preprocessing(self):

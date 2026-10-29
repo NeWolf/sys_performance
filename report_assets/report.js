@@ -71,6 +71,15 @@
   }
   const fmt = v => valid(v) ? roundMetric(v).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—';
   const fmtCount = v => valid(v) ? v.toLocaleString('zh-CN', {maximumFractionDigits:0}) : '—';
+  function fmtIO(value, perCycle=false) {
+    const input = roundMetric(value);
+    if (input == null) return '—';
+    const units = ['KB','MB','GB','TB','PB'];
+    let index = 0;
+    while (Math.abs(input) >= 1024 ** (index + 1) && index < units.length - 1) index++;
+    return fmt(scaleMetric(input,1,1024 ** index)) + ' ' + units[index];
+  }
+  const unitText = (value, unit) => /KB/.test(unit) ? fmtIO(value,unit.includes('周期')) : fmt(value) + ' ' + unit;
   function pidLabel(p) {
     const pids = [...new Set(p.pids || [])];
     if (pids.length <= 3) return pids.join(', ') || '—';
@@ -236,7 +245,13 @@
     const axes = axis => (Array.isArray(axis) ? axis : [axis]).filter(Boolean);
     for (const axis of [...axes(option.xAxis),...axes(option.yAxis)]) {
       if (axis.type !== 'value') continue;
-      const formatter = axis.minInterval === 1 && axis.name === '有效样本数' ? fmtCount : fmt;
+      const ioUnit = /KB/.test(axis.name || '') ? axis.name : null;
+      const formatter = ioUnit ? value => fmtIO(value,ioUnit.includes('周期'))
+        : axis.minInterval === 1 && axis.name === '有效样本数' ? fmtCount : fmt;
+      if (ioUnit) {
+        axis.name = '';
+        option.tooltip = {valueFormatter:formatter,...option.tooltip};
+      }
       axis.axisLabel = {formatter,...axis.axisLabel};
       axis.axisPointer = {label:{formatter:params => formatter(Number(params.value))},...axis.axisPointer};
     }
@@ -335,7 +350,7 @@
           const dot = el('i', null, 'overlay-tooltip-dot');
           dot.style.backgroundColor = entry.reference ? '#ff6b6b' : palette[n % palette.length];
           row.append(dot, el('span', entry.name + '：', 'overlay-tooltip-name'),
-            el('b', valid(value) ? fmt(scaleMetric(value,1,entry.divisor)) + ' ' + unit : '缺失或冲突',
+            el('b', valid(value) ? unitText(scaleMetric(value,1,entry.divisor),unit) : '缺失或冲突',
               'overlay-tooltip-value' + (valid(value) ? '' : ' is-missing')));
           list.append(row);
         });
@@ -437,7 +452,7 @@
       const tr = el('tr'), isCPU = group[0] === 'cpu1c', isIO = io.includes(group[0]);
       const headers = ['指标 / 单位','有效周期','时段周期覆盖 %','最小','均值','P95','P99','峰值'];
       if (isCPU) headers.push('P95K KDMIPS','峰值K KDMIPS');
-      if (isIO) headers.push('有效累计 KB');
+      if (isIO) headers.push('有效累计');
       headers.forEach(t => tr.append(el('th',t))); head.append(tr);
       for (const f of group) {
         const m = (active ? result.activeMetrics : result.metrics)[f === 'rss_kb' ? 'rss_mb' : f];
@@ -446,9 +461,9 @@
           ...['min','avg','p95','p99','max'].map(k => roundMetric(m[k]))];
         if (isCPU) values.push(...['p95','max'].map(k => scaleMetric(m[k],28.75,100)));
         if (isIO) values.push(m.total);
-        row.append(el('td',labels[f] + ' / ' + (f === 'rss_kb' ? 'MB' : isIO ? 'KB/周期' : '%')),
+        row.append(el('td',labels[f] + (isIO ? '' : ' / ' + (f === 'rss_kb' ? 'MB' : '%'))),
           el('td',fmtCount(m.count)));
-        values.forEach(v => row.append(el('td',fmt(v)))); body.append(row);
+        values.forEach((v,i) => row.append(el('td',isIO && i > 0 ? fmtIO(v,i < values.length - 1) : fmt(v)))); body.append(row);
       }
       table.append(head,body); wrap.append(table); container.append(wrap);
     }
@@ -522,7 +537,15 @@
           metric(p,'cpu1c','max'),scaleMetric(metric(p,'cpu1c','max'),28.75,100),
           metric(p,'rss_kb','max'),scaleMetric(metric(p,'rd_kb','max'),1,1024),
           scaleMetric(metric(p,'wr_kb','max'),1,1024)];
-        row.querySelectorAll('td[data-sort]').forEach((cell,i) => writeValue(cell,values[i]));
+        row.querySelectorAll('td[data-sort]').forEach((cell,i) => {
+          writeValue(cell,values[i]);
+          if (i >= 5) {
+            const raw = metric(p,i === 5 ? 'rd_kb' : 'wr_kb','max');
+            cell.dataset.ioUnit = 'cycle';
+            cell.dataset.ioKb = valid(raw) ? String(raw) : '';
+            cell.textContent = fmtIO(raw,true);
+          }
+        });
         const group = row.closest('tbody');
         group.dataset.search = (group.dataset.search || '') + ' ' + (p.pids || []).join(', ');
         const identity = group.querySelector('.focus-identity');
@@ -542,6 +565,7 @@
         if (!field || !key) return;
         let value = metric(p,field,key,/活跃/.test(header));
         if (/KDMIPS/.test(header)) value = scaleMetric(value,28.75,100);
+        if (io.includes(field) && key !== 'count') cell.dataset.ioUnit = key === 'total' ? 'total' : 'cycle';
         writeValue(cell,value,key === 'count');
       });
       const column = headers.indexOf('PID'), cell = row.cells[column];
@@ -557,7 +581,8 @@
       const integer = /有效样本|有效周期|活跃周期|PID变化|样本数|记录数/.test(header);
       const rounded = integer ? value : roundMetric(value);
       cell.dataset.sort = String(rounded);
-      cell.textContent = (integer ? fmtCount : fmt)(rounded);
+      const ioValue = cell.dataset.ioKb === undefined ? rounded : cell.dataset.ioKb === '' ? null : Number(cell.dataset.ioKb);
+      cell.textContent = cell.dataset.ioUnit ? fmtIO(ioValue,cell.dataset.ioUnit === 'cycle') : (integer ? fmtCount : fmt)(rounded);
     });
   }
   function setupTable(wrap, toggle) {
@@ -667,6 +692,10 @@
         .filter(row => !row.hidden).map(row => row.dataset.process));
       rank(ps.filter(p => visible.has(p.id)), 'cpu1c', 'avg', true).slice(0,15)
         .forEach(p => overlay.add(p.id));
+      refreshOverlay();
+    });
+    allTable?.querySelector('.clear-selection')?.addEventListener('click', () => {
+      overlay.clear();
       refreshOverlay();
     });
     const overview = overviewOptions(system);

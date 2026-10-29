@@ -39,7 +39,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
   const hasPercentiles = metrics.some(({ field }) => [percentiles?.[field]?.p95, percentiles?.[field]?.p99].some((value) => typeof value === 'number' && Number.isFinite(value)))
   const host = useRef<HTMLDivElement>(null)
   const memoryUnit = unit === 'MB' ? 'MB' : unit.startsWith('KB') ? 'KB' : null
-  const displayUnit = memoryUnit ? `容量（自动换算）${unit.includes('周期') ? ' / 周期' : ''}` : unit
+  const displayUnit = memoryUnit ? '' : unit
   const hasData = Boolean(data?.points.some((point) => metrics.some(({ field }) => typeof point[field] === 'number' && Number.isFinite(point[field])))
     || references?.some(({ data: source, field }) => source?.points.some((point) => typeof point[field] === 'number' && Number.isFinite(point[field]))))
   useEffect(() => {
@@ -50,7 +50,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
       animation: false,
       color: ['#4f6cf6', '#11a897', '#ed9b3b', '#b178e8', '#e16c87'],
       textStyle: { fontFamily: 'system-ui, sans-serif', color: '#62718a' },
-      aria: { enabled: true, description: `${title}，${displayUnit}，横轴为本地时间。` },
+      aria: { enabled: true, description: `${title}${displayUnit ? `，${displayUnit}` : ''}，横轴为本地时间。` },
       tooltip: {
         trigger: mode === 'scatter' ? 'item' : 'axis', renderMode: 'richText', confine: true,
         formatter: (params) => {
@@ -61,7 +61,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
             const raw = Array.isArray(item.value) ? item.value[1] : null
             const value = typeof raw === 'number' ? raw : null
             const text = memoryUnit ? formatMemory(value, memoryUnit) : formatMetricValue(value, unit)
-            const suffix = memoryUnit ? (unit.includes('周期') ? ' / 周期' : '') : ` ${unit}`
+            const suffix = memoryUnit ? '' : ` ${unit}`
             return `${item.seriesName}: ${text}${value == null ? '' : suffix}`
           })].join('\n')
         },
@@ -75,7 +75,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
         splitLine: { show: false }, axisLine: { lineStyle: { color: '#d9e1ec' } },
       },
       yAxis: {
-        type: 'value', name: memoryUnit ? (unit.includes('周期') ? '容量 / 周期' : '容量') : unit,
+        type: 'value', name: displayUnit,
         axisLabel: { formatter: (value: number) => memoryUnit ? formatMemory(value, memoryUnit) : formatMetricValue(value, unit) },
         splitLine: { lineStyle: { color: '#edf1f6', type: 'dashed' } },
       },
@@ -130,12 +130,12 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
 
   return (
     <section className="panel chart-panel" aria-label={title}>
-      <div className="panel-heading"><h3>{title}</h3><span className="unit">{displayUnit}</span></div>
+      <div className="panel-heading"><h3>{title}</h3>{displayUnit && <span className="unit">{displayUnit}</span>}</div>
       {percentiles && <label><input type="checkbox" checked={showPercentiles} disabled={!hasPercentiles} onChange={(event) => setShowPercentiles(event.target.checked)} />显示 P95 / P99 参考线（原始样本分位数，非准入阈值）{!hasPercentiles && ' · 暂无有效分位数'}</label>}
       {loading ? <div className="chart-placeholder" role="status">正在读取趋势…</div>
         : error ? <div className="chart-placeholder error" role="alert">{error}</div>
         : !hasData ? <div className="chart-placeholder">此时间段暂无对应记录，不以零值填充</div>
-        : <div ref={host} className="chart" role="img" aria-label={`${title}趋势，单位 ${displayUnit}`} />}
+        : <div ref={host} className="chart" role="img" aria-label={`${title}趋势${displayUnit ? `，单位 ${displayUnit}` : ''}`} />}
       <p className="chart-caption">
         {data && !error && !loading && `${data.sampled ? '已降采样 · 限额内优先保留极值' : '原始记录'} · 展示 ${formatNumber(data.points.length, 0)} / ${formatNumber(data.total, 0)} 条。`}
         {note || '拖动底部滑块缩放；缺失记录不补零。'}
@@ -174,12 +174,12 @@ export function ComparisonBars({ title, unit, items, ranking = false, note, base
     const element = host.current
     let chart: ReturnType<typeof init> | undefined
     const text = (value: number | null, suffix: string, signed = false) => value == null || !Number.isFinite(value)
-      ? '—（缺失）' : `${signed && value > 0 ? '+' : ''}${formatNumber(value, 2)} ${suffix}`
+      ? '—（缺失）' : `${signed && value > 0 ? '+' : ''}${formatStatistic(value, suffix)}`
     const option: EChartsOption = {
       animation: false,
       color: ['#4f6cf6', '#11a897'],
       textStyle: { fontFamily: 'system-ui, sans-serif', color: '#62718a' },
-      aria: { enabled: true, description: `${title}，单位 ${displayUnit}。缺失不补零，详细数值见下方表格。` },
+      aria: { enabled: true, description: `${title}，源单位 ${displayUnit}。缺失不补零，详细数值见下方表格。` },
       tooltip: {
         trigger: 'axis', renderMode: 'richText', confine: true,
         axisPointer: { type: 'shadow' },
@@ -195,8 +195,8 @@ export function ComparisonBars({ title, unit, items, ranking = false, note, base
       legend: { show: !ranking, top: 0, data: ['baseline', 'target'], formatter: (name: string) => name === 'baseline' ? baselineLabel : targetLabel },
       grid: { top: 40, left: 180, right: 30, bottom: 48 },
       xAxis: {
-        type: 'value', name: displayUnit, nameLocation: 'middle', nameGap: 30,
-        axisLabel: { hideOverlap: true, formatter: (value: number) => formatNumber(value) },
+        type: 'value', name: /^(KB|MB)/.test(displayUnit) ? '' : displayUnit, nameLocation: 'middle', nameGap: 30,
+        axisLabel: { hideOverlap: true, formatter: (value: number) => /^(KB|MB)/.test(displayUnit) ? formatStatistic(value, displayUnit) : formatNumber(value) },
         splitLine: { lineStyle: { color: '#edf1f6', type: 'dashed' } },
       },
       yAxis: {
@@ -227,7 +227,7 @@ export function ComparisonBars({ title, unit, items, ranking = false, note, base
   }, [rows, title, unit, ranking, hasData, displayUnit, deltaUnit, baselineLabel, targetLabel])
 
   return <section className="compare-chart" aria-label={title}>
-    <div className="panel-heading"><h3>{title}</h3><span className="unit">{displayUnit}</span></div>
+    <div className="panel-heading"><h3>{title}</h3>{!/^(KB|MB)/.test(displayUnit) && <span className="unit">{displayUnit}</span>}</div>
     {hasData ? <div ref={host} role="img" aria-label={`${title}，详细数值见下方表格`} style={{ height: Math.max(230, rows.length * (ranking ? 32 : 52) + 100) }} />
       : <div className="compare-chart-empty">{ranking ? '当前筛选没有可比较的进程，不生成差值排行。' : '暂无有效数据，不以零值填充。'}</div>}
     <p className="chart-caption">{note} {ranking ? '红色增加、绿色减少，不代表好坏。' : `蓝色为${baselineLabel}，青色为${targetLabel}；缺失不绘柱，零值柱长为零。`} 悬停查看完整名称和数值。</p>
