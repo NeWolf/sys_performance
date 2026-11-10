@@ -1,3 +1,3 @@
 """Shared application version for the local service and installers."""
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
