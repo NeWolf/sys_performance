@@ -23,19 +23,20 @@ function Analysis({ data, disabled, view, reportStyle }: { data: Overview; disab
   const [reportTab, setReportTab] = useState('groups')
   const [reportRevision, setReportRevision] = useState(0)
   const [segment, setSegment] = useState(data.segments[0]?.segment ?? 0)
+  const isQnx = data.summary.source_format === 'qnx'
   return <>
     <ViewPanel active={view === 'analysis'}>
-      <InteractiveReport key={data.id} id={data.id} name={data.name} segments={data.segments} disabled={disabled} reportStyle={reportStyle} />
+      <InteractiveReport key={data.id} id={data.id} name={data.name} segments={data.segments} disabled={disabled} reportStyle={isQnx ? 'default' : reportStyle} isQnx={isQnx} />
       <details className="panel diagnostics">
         <summary>日志质量与来源</summary>
-        <p className="muted">{formatNumber(data.summary.cycles, 0)} 个周期 · {data.summary.segments} 个时间段 · {formatTime(data.summary.first_ts)} → {formatTime(data.summary.last_ts)}</p>
-        <div className="quality-row"><span>解析异常 <b>{data.summary.errors}</b></span><span>未知行 <b>{data.summary.unknown}</b></span><span>孤立周期 <b>{data.summary.orphan_cycles}</b></span></div>
+        <p className="muted">{formatNumber(data.summary.cycles, 0)} 个{isQnx ? '时间点' : '周期'} · {data.summary.segments} 个时间段 · {formatTime(data.summary.first_ts)} → {formatTime(data.summary.last_ts)}</p>
+        <div className="quality-row"><span>解析异常 <b>{data.summary.errors}</b></span><span>未知行 <b>{data.summary.unknown}</b></span>{!isQnx && <span>孤立周期 <b>{data.summary.orphan_cycles}</b></span>}</div>
         <details><summary>来源文件（{data.summary.files.length}）</summary><ul>{data.summary.files.map((file, index) => <li key={index}>{file}</li>)}</ul></details>
         <details><summary>解析异常明细（{data.summary.issues.length}）</summary><ul className="log-list">{data.summary.issues.map((item, index) => <li key={index}><strong>{item.source} : {item.line}</strong><span>{item.message}</span></li>)}</ul></details>
         <details><summary>日志事件（{data.summary.events.length}）</summary><ul className="log-list">{data.summary.events.map((item, index) => <li key={index}><strong>{item.source} : {item.line} · {formatTime(item.ts)}</strong><span>{item.message}</span></li>)}</ul></details>
       </details>
     </ViewPanel>
-    <ViewPanel active={view === 'report'}>
+    {isQnx ? <ViewPanel active={view === 'report'}><p className="banner info">QNX 使用静态 SVG 报告，可在顶部下载 HTML；不支持图表缩放、组合图、Android 准入报告、进程组与人工分析配置。保留原单位；CPU 已是 8 核均值，不再除核数；DDR 为平台口径，模块间仅粗时间对齐。</p></ViewPanel> : <ViewPanel active={view === 'report'}>
       <p className="banner info">应用内性能分析与离线导出使用同一份报告。下方人工配置与进程组仅用于独立分析，不写入报告；下载不会保存或丢弃草稿。</p>
       <nav className="section-tabs" aria-label="分析配置分区">
         {[{ id: 'groups', label: '进程组分析设置' }, { id: 'content', label: '人工分析配置' }].map((item) => (
@@ -48,7 +49,7 @@ function Analysis({ data, disabled, view, reportStyle }: { data: Overview; disab
       <ViewPanel active={view === 'report' && reportTab === 'content'}>
         <ReportConfig id={data.id} disabled={disabled} onSaved={() => setReportRevision((value) => value + 1)} />
       </ViewPanel>
-    </ViewPanel>
+    </ViewPanel>}
   </>
 }
 
@@ -72,7 +73,7 @@ function releaseReport(url: string) {
   URL.revokeObjectURL(url)
 }
 
-function InteractiveReport({ id, name, segments, disabled, reportStyle }: { id: string; name: string; segments: Overview['segments']; disabled: boolean; reportStyle: ReportStyle }) {
+function InteractiveReport({ id, name, segments, disabled, reportStyle, isQnx }: { id: string; name: string; segments: Overview['segments']; disabled: boolean; reportStyle: ReportStyle; isQnx: boolean }) {
   const [revision, setRevision] = useState(0)
   const [expanded, setExpanded] = useState(false)
   const result = useAnalysisStream<string>(`${sessionPath(id)}/report/stream${reportStyle === 'compact' ? '?style=compact' : ''}`, revision, loadReport, releaseReport)
@@ -83,14 +84,14 @@ function InteractiveReport({ id, name, segments, disabled, reportStyle }: { id: 
     return () => window.removeEventListener('keydown', close)
   }, [expanded])
   function reload() {
-    if (!window.confirm('重新加载将清空报告内的搜索、曲线选择与合并结果，是否继续？')) return
+    if (!window.confirm(isQnx ? '确认重新加载 QNX 静态分析报告？' : '重新加载将清空报告内的搜索、曲线选择与合并结果，是否继续？')) return
     setRevision((value) => value + 1)
   }
-  return <section className={`analysis-report${expanded ? ' analysis-report-expanded' : ''}`} aria-label="交互性能分析">
+  return <section className={`analysis-report${expanded ? ' analysis-report-expanded' : ''}`} aria-label={isQnx ? 'QNX 静态性能分析' : '交互性能分析'}>
     <div className="analysis-report-toolbar">
-      <div><strong>交互性能分析 · {reportStyle === 'compact' ? '简洁组合图' : '原版完整报告'}</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
+      <div><strong>{isQnx ? 'QNX 静态性能分析 · SVG 报告' : `交互性能分析 · ${reportStyle === 'compact' ? '简洁组合图' : '原版完整报告'}`}</strong><p>与导出报告一致 · 分析成功后自动缓存到本机，下次打开直接读取</p></div>
       <div className="actions">
-        <AdmissionReport id={id} name={name} segments={segments} disabled={disabled} />
+        {!isQnx && <AdmissionReport id={id} name={name} segments={segments} disabled={disabled} />}
         <button disabled={disabled || result.loading} onClick={reload}>重新加载</button>
         {result.loading && <button onClick={result.cancel}>取消分析</button>}
         <button aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? '退出大屏' : '大屏查看'}</button>
@@ -101,7 +102,7 @@ function InteractiveReport({ id, name, segments, disabled, reportStyle }: { id: 
     {result.error && <div className="banner error" role="alert">{result.error} · 已用时 {result.elapsed} 秒<button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试</button></div>}
     {/* 保留报告自身 CSP；不授予同源、弹窗、下载或顶层导航权限。 */}
     {result.data && <iframe key={result.key} className="analysis-report-frame" title={`${name} · 性能分析`} sandbox="allow-scripts" referrerPolicy="no-referrer" src={result.data} />}
-    <p className="analysis-report-note">{result.data && `分析报告已就绪 · 已用时 ${result.elapsed} 秒。`}图表缩放不改变全量统计；未采集保持缺失。大屏模式可用顶部按钮或 Esc 退出。</p>
+    <p className="analysis-report-note">{result.data && `分析报告已就绪 · 已用时 ${result.elapsed} 秒。`}{isQnx ? '静态 SVG，不支持缩放；原单位保留，CPU 已是 8 核均值，不再除核数，DDR按平台口径，模块间粗时间对齐；未采集保持缺失。' : '图表缩放不改变全量统计；未采集保持缺失。'}大屏模式可用顶部按钮或 Esc 退出。</p>
   </section>
 }
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, apiResponse, downloadFilename, errorMessage } from './api'
 import { useEditGuard, useMutation } from './Editing'
+import { Qnx } from './Qnx'
 
 type Device = { serial: string; state: string; model: string }
 type Status = {
@@ -117,26 +118,24 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
 
   useEffect(() => {
     const controller = new AbortController()
-    let inFlight = false
     async function refresh() {
-      if (inFlight) return
-      inFlight = true
-      try {
-        const data = await api<Device[]>('/api/adb/devices', { signal: controller.signal })
-        if (controller.signal.aborted) return
-        setDevices({ data, loading: false, error: '' })
-        if (!serial) {
-          setSelected(data.find((device) => device.state === 'device')?.serial || '')
-          return
-        }
-        if (!data.some((device) => device.serial === serial && device.state === 'device')) {
-          setStatus(null)
-          setNotice('')
-          setPollError('')
-          return
-        }
-        if (running.current || polling.current || topPolling.current) return
-        const request = (async () => {
+      if (running.current || polling.current || topPolling.current) return
+      const request = (async () => {
+        try {
+          const data = await api<Device[]>('/api/adb/devices', { signal: controller.signal })
+          if (controller.signal.aborted) return
+          setDevices({ data, loading: false, error: '' })
+          if (!serial) {
+            setSelected(data.find((device) => device.state === 'device')?.serial || '')
+            return
+          }
+          if (!data.some((device) => device.serial === serial && device.state === 'device')) {
+            setStatus(null)
+            setNotice('')
+            setPollError('')
+            return
+          }
+          if (running.current) return
           try {
             const next = await api<Status>(`/api/adb/status?${new URLSearchParams({ serial })}`, { signal: controller.signal })
             if (!controller.signal.aborted) { setStatus(next); setPollError('') }
@@ -151,15 +150,15 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
               } catch { /* 原始状态错误已显示，下一轮继续检查连接。 */ }
             }
           }
-        })()
-        polling.current = request
-        try { await request } finally { if (polling.current === request) polling.current = null }
-      } catch (failure) {
-        if (!controller.signal.aborted) {
-          setDevices((previous) => ({ ...previous, loading: false, error: errorMessage(failure) }))
-          setStatus(null)
+        } catch (failure) {
+          if (!controller.signal.aborted) {
+            setDevices((previous) => ({ ...previous, loading: false, error: errorMessage(failure) }))
+            setStatus(null)
+          }
         }
-      } finally { inFlight = false }
+      })()
+      polling.current = request
+      try { await request } finally { if (polling.current === request) polling.current = null }
     }
     void refresh()
     const timer = window.setInterval(() => void refresh(), 5000)
@@ -382,6 +381,7 @@ export function Devices({ onImported, disabled, view, onAdvanced }: { onImported
       </div>}
     </section>
   </section>
+  <Qnx serial={serial} connected={connected} locked={locked} visible={view === 'capture'} running={running} polling={polling} topPolling={topPolling} onBusy={setBusy} onImported={onImported} />
   {view !== 'capture' && (topActive || topPollError || (!topCleared && topStatus?.error)) && <div className="banner warning" role="status">Top 采集：{topPollError || topStatus?.error || `${topLabels[topStatus!.status] || topStatus!.status} · ${topStatus!.count} 次`}。请到数据集查看或停止任务。</div>}
   {view !== 'capture' && (disconnected || devices.error || pollError || error) && <div className="banner warning" role="status">设备采集提示：{disconnected ? '设备已断开连接或不可用，正在自动检测重连。' : devices.error || pollError || error} 请到数据采集查看详情。</div>}
   {view !== 'capture' && !topCleared && topStatus?.warning && <div className="banner warning" role="status">{topStatus.warning}</div>}

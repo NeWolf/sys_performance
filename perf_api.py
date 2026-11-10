@@ -23,6 +23,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from perf_metrics import resource_settings
+from perf_groups import QnxIsolationError, reject_qnx_if_present
 
 from perf_adb import AdbController, AdbError
 from perf_report import REPORT_CSP, render_report
@@ -30,6 +31,7 @@ from perf_report_compact import REPORT_CSP as COMPACT_REPORT_CSP
 from perf_store import Store, safe_filename
 from urllib.parse import quote
 from perf_top_capture import TopCapture
+from perf_qnx_capture import QnxCapture, validate_target
 from perf_version import VERSION
 
 MAX_FILE_BYTES = 1024 * 1024 * 1024
@@ -160,6 +162,35 @@ class TopStartRequest(TopConfirmRequest):
         return self
 
 
+class QnxTargetRequest(TopConfirmRequest):
+    serial: str = Field(min_length=1, max_length=200)
+    qnx_address: str = Field(min_length=1, max_length=253)
+
+    @model_validator(mode="after")
+    def valid_target(self):
+        try:
+            validate_target(self.serial, self.qnx_address)
+        except AdbError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+class QnxStartRequest(QnxTargetRequest):
+    interval_ms: int = Field(default=1000, ge=100, le=60000, strict=True)
+    max_duration_s: int = Field(default=60, ge=1, le=3600, strict=True)
+    title: str = Field(default="", max_length=120)
+
+
+class QnxRecoverRequest(QnxTargetRequest):
+    remote_session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    stop: bool = Field(default=False, strict=True)
+    title: str = Field(default="", max_length=120)
+
+
+class QnxCaptureRequest(TopConfirmRequest):
+    capture_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class GroupMember(BaseModel):
     model_config = ConfigDict(extra="forbid")
     pid: int = Field(ge=0, le=2**63 - 1, strict=True)
@@ -271,6 +302,7 @@ def create_app(database, port=8765, development=False, frontend=None):
     report_slots = threading.BoundedSemaphore(2)
     adb = AdbController(Path(database).resolve().parent / "adb_logs")
     top = TopCapture(adb, Path(database).resolve().parent / "top_logs", store, import_lock)
+    qnx = QnxCapture(adb, Path(database).resolve().parent / "qnx_logs", store, import_lock)
 
     from perf_admission_jobs import AdmissionJobs
 
@@ -291,6 +323,7 @@ def create_app(database, port=8765, development=False, frontend=None):
 
     def close_services():
         nonlocal admission_closed
+        qnx.close()  # Does not signal remote tasks or wait for device timeouts.
         try:
             with admission_lock:
                 admission_closed = True
@@ -315,6 +348,7 @@ def create_app(database, port=8765, development=False, frontend=None):
     app.state.store = store
     app.state.adb = adb
     app.state.top = top
+    app.state.qnx = qnx
     app.state.admission_jobs = None
     app.state.close_services = close_services
 
@@ -357,6 +391,7 @@ def create_app(database, port=8765, development=False, frontend=None):
                                     status_code=exc.status_code)
         try:
             def invoke():
+                reject_qnx_if_present(store, session_id)
                 jobs = admission_jobs()
                 if operation == "create":
                     return jobs.create(session_id, **body.model_dump())
@@ -372,6 +407,8 @@ def create_app(database, port=8765, development=False, frontend=None):
                                                "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
                 })
             return result
+        except QnxIsolationError as exc:
+            return JSONResponse({"detail": str(exc), "accepted": False}, status_code=400)
         except AdmissionJobError as exc:
             # These service branches precede persistence/enqueue. 503 is ambiguous,
             # including commit failure and executor.submit failure: never unlock it.
@@ -400,6 +437,44 @@ def create_app(database, port=8765, development=False, frontend=None):
     @app.post("/api/sessions/{session_id}/admission/drafts/{draft_id}/publish")
     async def admission_publish(session_id: str, draft_id: str, request: Request):
         return await admission_call("publish", session_id, draft_id, request)
+
+    @app.get("/api/qnx/captures")
+    def qnx_captures():
+        return qnx.captures()
+
+    @app.get("/api/qnx/sessions")
+    def qnx_sessions(serial: str = Query(min_length=1, max_length=200),
+                     qnx_address: str = Query(min_length=1, max_length=253)):
+        return qnx.sessions(serial, qnx_address)
+
+    @app.get("/api/qnx/status")
+    def qnx_status(capture_id: str = Query(pattern=r"^[0-9a-f]{32}$"), refresh: bool = False):
+        return qnx.status(capture_id, refresh=refresh)
+
+    @app.post("/api/qnx/start")
+    def qnx_start(body: QnxStartRequest):
+        return qnx.start(body.serial, body.qnx_address, body.interval_ms, body.max_duration_s, body.title)
+
+    @app.post("/api/qnx/recover")
+    def qnx_recover(body: QnxRecoverRequest):
+        return qnx.recover(body.serial, body.qnx_address, body.remote_session_id, body.stop, body.title)
+
+    @app.post("/api/qnx/stop")
+    def qnx_stop(body: QnxCaptureRequest):
+        return qnx.stop(body.capture_id)  # Upstream stop also pulls and converts.
+
+    @app.post("/api/qnx/pull")
+    def qnx_pull(body: QnxCaptureRequest):
+        return qnx.pull(body.capture_id)
+
+    @app.post("/api/qnx/import")
+    def qnx_import(body: QnxCaptureRequest):
+        return qnx.import_capture(body.capture_id)
+
+    @app.get("/api/qnx/archive")
+    def qnx_archive(capture_id: str = Query(pattern=r"^[0-9a-f]{32}$")):
+        path = qnx.archive_path(capture_id)
+        return FileResponse(path, media_type="application/x-tar", filename="qnx_" + capture_id + ".tar")
 
     @app.get("/api/top/status")
     def top_status(serial: Optional[str] = Query(None, min_length=1, max_length=200)):
@@ -483,6 +558,10 @@ def create_app(database, port=8765, development=False, frontend=None):
             import_lock.release()
 
     app.add_middleware(LocalBoundary, token=token, port=port, development=development)
+
+    @app.exception_handler(QnxIsolationError)
+    async def qnx_isolation(_request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=400)
 
     @app.exception_handler(KeyError)
     async def missing(_request, _exc):
@@ -719,8 +798,12 @@ def create_app(database, port=8765, development=False, frontend=None):
     @app.get("/api/sessions/{session_id}/report")
     def report(session_id: str, style: Literal["default", "compact"] = "default"):
         document = render_report(store, session_id, style=style) if style == "compact" else render_report(store, session_id)
-        filename = safe_filename(store.session(session_id)["name"], fallback="report") + ".html"
+        session = store.session(session_id)
+        filename = safe_filename(session["name"], fallback="report") + ".html"
         csp = COMPACT_REPORT_CSP if style == "compact" else REPORT_CSP
+        if session.get("summary", {}).get("source_format") == "qnx":
+            from perf_qnx_report import REPORT_CSP as QNX_REPORT_CSP
+            csp = QNX_REPORT_CSP
         return HTMLResponse(document, headers={
             "Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename, safe=""),
             "Content-Security-Policy": csp + "; sandbox allow-scripts",

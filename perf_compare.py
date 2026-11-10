@@ -5,6 +5,7 @@ import time
 from concurrent.futures import CancelledError
 from collections import defaultdict
 
+from perf_groups import reject_qnx_session
 from perf_metrics import round_metric, scale_metric, subtract_metric, sum_metrics
 from perf_report_data import (
     INCREMENTS, PROCESS_FIELDS, SYSTEM_FIELDS, _insert_values, _statistics,
@@ -171,8 +172,8 @@ def compare_sessions(store, baseline_id, target_id, baseline_segment=None, targe
     if baseline_id == target_id:
         raise ValueError("请选择两次不同的采集")
     # Validate both sessions before doing expensive sample aggregation.
-    store.session(baseline_id)
-    store.session(target_id)
+    reject_qnx_session(store.session(baseline_id))
+    reject_qnx_session(store.session(target_id))
     baseline = _snapshot(store, baseline_id, baseline_segment,
                          lambda *args: report("baseline", *args), cancelled)
     target = _snapshot(store, target_id, target_segment,

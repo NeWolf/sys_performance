@@ -15,5 +15,6 @@ nav{display:flex;gap:18px;flex-wrap:wrap}a{color:#2462b9}summary{cursor:pointer;
 .compact-tooltip-row:last-child{border-bottom:0}.compact-tooltip-row.is-reference{font-weight:600}
 .compact-tooltip-dot{width:8px;height:8px;border-radius:50%;margin-top:6px}.compact-tooltip-name{min-width:0;overflow-wrap:anywhere}
 .compact-tooltip-value{white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums;font-weight:600}.compact-tooltip-value.is-missing{color:#7b6470;font-weight:400}
+.pid-monitor table{table-layout:fixed;width:100%;min-width:760px}.pid-monitor :is(th,td){text-align:left;white-space:normal;overflow-wrap:anywhere;min-width:0;max-width:none;vertical-align:top}.pid-monitor th:first-child{width:24%}.pid-monitor th:nth-child(2){width:26%}.pid-monitor th:nth-child(3){width:8%}.pid-monitor th:nth-child(4){width:14%}.pid-monitor th:nth-child(n+5){width:14%}.js-enabled .pid-monitor .controls{display:flex}
 @media(max-width:900px){.charts{grid-template-columns:1fr}main{padding:12px}.panel{padding:16px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.chart{height:320px}}
 @media print{header{background:white;color:#243247}.panel{box-shadow:none;break-inside:avoid}.js-only{display:none!important}.scroll{max-height:none;overflow:visible}.charts{grid-template-columns:1fr}main{padding:0}.legend-list{max-height:none}th{position:static}}

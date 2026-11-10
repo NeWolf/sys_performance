@@ -18,7 +18,7 @@ _SIZE = re.compile(r"(\d+(?:\.\d+)?)([BKMGT]?)(?:i?B)?", re.I)
 _CPU = re.compile(r"(\d+(?:\.\d+)?)%([a-z]+)", re.I)
 
 
-def _lines(stream):
+def _lines(stream, *, strip_ansi=True):
     """One result per physical line, with bounded reads even for corrupt input."""
     number = 0
     while True:
@@ -40,7 +40,8 @@ def _lines(stream):
             yield number, None, "非法 UTF-8，已跳过", size
             continue
         error = None if raw.endswith(b"\n") else "文件末尾残行，已跳过"
-        yield number, _ANSI.sub("", text).strip(), error, size
+        text = _ANSI.sub("", text).strip() if strip_ansi else text.rstrip("\r\n")
+        yield number, text, error, size
 
 
 def detect_source_format(stream):
@@ -55,8 +56,12 @@ def detect_source_format(stream):
                 found.add("top")
             elif _SYS_MARKER.match(text):
                 found.add("sysmonitor")
+            elif re.match(r'^"?(?:QC|QG|QDSP|QDDR)"?\s*,', text) or re.fullmatch(
+                    ','.join('"?' + field + '"?' for field in
+                             ('kind', 'ts', 'module', 'metric', 'value', 'unit', 'qnx_relative_s')), text):
+                found.add("qnx")
             if len(found) > 1:
-                raise ValueError("同一导入不能混合 Top/sysmonitor（同文件混合格式）")
+                raise ValueError("同一导入不能混合 Top/sysmonitor/QNX（同文件混合格式）")
     finally:
         stream.seek(0)
     return next(iter(found), None)

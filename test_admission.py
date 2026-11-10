@@ -56,7 +56,7 @@ def template():
             head["children"][column]["hidden"] = True
     process = [head, subhead]
     for i, item in enumerate(REQUIRED_PROCESSES):
-        if i == 31:
+        if i == 32:
             process.append(row([""] * 19, shaded=True))
         process.append(row(
             [item["module"], item["business"], item["name"], " 人工前台 ", "人工后台"] +
@@ -165,7 +165,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(total, [["CPU(%)", "80.00", "80.00"], ["内存(GB)", "4.00", "4.00"]])
         self.assertEqual(json.loads((self.output / "report.json").read_text()), blocks)
         self.assertEqual([item.name for item in self.output.iterdir()], ["report.json"])
-        self.assertEqual(len(rows), 49)
+        self.assertEqual(len(rows), 50)
         self.assertTrue(all(len(r) == 19 for r in rows))
         tags = Tags(result["html"]).tags
         self.assertEqual(sum(attrs.get("colspan") == "7" for _, attrs in tags), 2)
@@ -185,7 +185,7 @@ class AdmissionTests(unittest.TestCase):
                 before = deepcopy(original)
                 result = self.build(s(1) + p(1), source=original)
                 self.assert_preserved(before, result["blocks"])
-                self.assertEqual(len(self.rows(result["blocks"])[0]), 49)
+                self.assertEqual(len(self.rows(result["blocks"])[0]), 50)
                 blank_rows = [r for r in table_named(result["blocks"], "process")["children"]
                               if not any(perf_slate.text_of(c).strip() for c in r["children"])]
                 self.assertEqual(len(blank_rows), count + 1)
@@ -224,7 +224,7 @@ class AdmissionTests(unittest.TestCase):
         text += p(2, pid=1, cpu1c=999) * 2
         text += p(3, pid=1, cpu1c=999) + "DP,3,2,100,1," + REQUIRED_PROCESSES[0]["name"] + "\n"
         text += p(4, name="/one/audioserver") + p(4, name="/two/audioserver")
-        text += p(5, name=webview + "e") + p(6, name="mediaserver", cpu1c=40)
+        text += p(5, name=webview + ".SandboxedProcessService:0") + p(6, name="mediaserver", cpu1c=40)
         result = self.build(text)
         rows, totals = self.rows(result["blocks"])
         self.assertEqual(rows[0][5:12], ["10.00", "2.88", "10.00", "2.88", "2.00", "200.00", "400.00"])
@@ -263,7 +263,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(any("CPU/100×20" in w and "来自本次请求" in w for w in explicit["warnings"]))
 
     def test_scenes_optional_and_derived_from_groups(self):
-        name = REQUIRED_PROCESSES[2]["name"]
+        name = REQUIRED_PROCESSES[3]["name"]
         sid = self.load(s(1) + p(1, name=name, cpu1c=50, rd_kb=1024, wr_kb=2048) +
                         s(2) + p(2, name=name, cpu1c=200, rss_kb=2048))
         members = [dict(pid=1, name=name)]
@@ -273,13 +273,13 @@ class AdmissionTests(unittest.TestCase):
         self.store.save_group(sid, dict(group, name="未标注组", scene="未标注", start=None, end=None))
         result = build_admission(self.store, sid, template(), self.output)
         rows, _ = self.rows(result["blocks"])
-        self.assertEqual(rows[2][5:12], ["200.00", "57.50", "200.00", "57.50", "2.00", "100.00", "200.00"])
-        self.assertEqual(rows[2][12:19], ["50.00", "14.38", "50.00", "14.38", "1.00", "1.00", "2.00"])
+        self.assertEqual(rows[3][5:12], ["200.00", "57.50", "200.00", "57.50", "2.00", "100.00", "200.00"])
+        self.assertEqual(rows[3][12:19], ["50.00", "14.38", "50.00", "14.38", "1.00", "1.00", "2.00"])
         self.assertTrue(any("关注进程" in w and "前台组" in w and "后台组" in w for w in result["warnings"]))
         self.assertFalse(any("未标注组" in w for w in result["warnings"]))
         # An explicit scene still overrides every group window of that segment.
         override = build_admission(self.store, sid, template(), self.output, {0: "unknown"}, None)
-        self.assertEqual(self.rows(override["blocks"])[0][2][5:], [""] * 14)
+        self.assertEqual(self.rows(override["blocks"])[0][3][5:], [""] * 14)
 
     def test_without_groups_rows_follow_excel_requirement(self):
         result = build_admission(self.store, self.load(s(1) + p(1)), template(), self.output)
@@ -293,7 +293,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(any("未检测到前台/后台场景标注" in w for w in result["warnings"]))
 
     def test_applicable_sides_and_scene_specific_budget_colors(self):
-        selected = [item for item in REQUIRED_PROCESSES if item["excel_row"] in (7, 9, 23)]
+        selected = [item for item in REQUIRED_PROCESSES if item["excel_row"] in (7, 10, 24)]
         text = s(1) + "".join(p(1, name=item["name"], pid=i + 1, cpu1c=10)
                              for i, item in enumerate(selected))
         result = self.build(text, scenes={})
@@ -371,7 +371,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(json.loads((self.output / "report.json").read_text()), result["blocks"])
 
     def test_io_windows_exclude_overlap_and_uncovered_cycles(self):
-        name = REQUIRED_PROCESSES[2]["name"]
+        name = REQUIRED_PROCESSES[3]["name"]
         text = "".join(s(ts) + p(ts, name=name, rd_kb=kb, wr_kb=kb * 2)
                        for ts, kb in ((1, 1024), (2, 999999), (3, 2048), (4, 9999999)))
         sid = self.load(text)
@@ -380,8 +380,8 @@ class AdmissionTests(unittest.TestCase):
                                            members=[dict(pid=1, name=name)], start=start, end=end))
         result = build_admission(self.store, sid, template(), self.output)
         rows, _ = self.rows(result["blocks"])
-        self.assertEqual(rows[2][10:12], ["1.00", "2.00"])
-        self.assertEqual(rows[2][17:19], ["2.00", "4.00"])
+        self.assertEqual(rows[3][10:12], ["1.00", "2.00"])
+        self.assertEqual(rows[3][17:19], ["2.00", "4.00"])
 
     def test_io_only_zero_invalid_and_absent_fields(self):
         sid = self.load(s(1) + p(1))
@@ -424,6 +424,36 @@ class AdmissionTests(unittest.TestCase):
         budgets = [EXCEL_BUDGETS[item["excel_row"]] for item in REQUIRED_PROCESSES]
         self.assertEqual([row[3:5] for row in rows],
                          [[budget["D"], budget["E"]] for budget in budgets])
+
+    def test_updated_focus_someip_without_budget_and_healing(self):
+        source = template()
+        for r in process_rows(source):
+            for cell in r["children"][3:5]:
+                put_text(cell, "")
+        someip = "com.desaysv.ivi.vds.carlan"
+        healing = "com.jd.jkc.healing"
+        webview = REQUIRED_PROCESSES[-1]["name"]
+        text = s(1) + p(1, someip, pid=1, cpu1c=123, rd_kb=1536, wr_kb=2560)
+        text += p(1, healing, pid=2, cpu1c=80)
+        text += p(1, webview, pid=3) + p(1, webview + ".SandboxedProcessService:0", pid=4)
+        result = self.build(text, scenes={}, source=source)
+        rows, _ = self.rows(result["blocks"])
+        self.assertEqual(len(rows), 50)
+        by_name = {r[2]: r for r in rows}
+        self.assertEqual(by_name[someip][3:5], ["N", "Y"])
+        self.assertEqual(by_name[someip][5:12],
+                         ["123.00", "35.36", "123.00", "35.36", "1.00", "1.50", "2.50"])
+        self.assertEqual(by_name[someip][12:], ["-"] * 7)
+        cells = next(r for r in process_rows(result["blocks"])
+                     if perf_slate.text_of(r["children"][2]) == someip)["children"]
+        self.assertTrue(all("fontColor" not in leaf for c in cells[5:]
+                            for leaf in c["children"][0]["children"]))
+        self.assertEqual(by_name[healing][3:5], ["Y", "N"])
+        self.assertEqual(by_name[healing][5:12], ["-"] * 7)
+        self.assertEqual(by_name[healing][12:16], ["80.00", "23.00", "80.00", "23.00"])
+        self.assertEqual(by_name[webview][5:], [""] * 14)
+        self.assertTrue(any("可靠匹配采集覆盖：2/50；" in w for w in result["warnings"]))
+        self.assertEqual(json.loads((self.output / "report.json").read_text()), result["blocks"])
 
     def assert_rejected_before_read(self, source):
         with patch("perf_admission.build_report_data") as builder:

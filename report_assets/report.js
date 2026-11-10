@@ -625,6 +625,27 @@
       });
     });
   }
+  function setupPidMonitor(root) {
+    const input = root.querySelector('.pid-search');
+    const count = root.querySelector('.pid-count');
+    const empty = root.querySelector('.pid-empty');
+    const groups = [...root.querySelectorAll('tbody[data-pid-search]')];
+    const indexed = groups.map(group => ({group, search:group.dataset.pidSearch.toLowerCase(),
+      changes:Math.max(0, group.querySelectorAll('tr').length - 1)}));
+    function filter() {
+      const query = input.value.trim().toLowerCase();
+      let visible = 0, changes = 0;
+      indexed.forEach(item => {
+        item.group.hidden = !item.search.includes(query);
+        if (!item.group.hidden) { visible++; changes += item.changes; }
+      });
+      count.textContent = '匹配进程 ' + visible + ' / ' + groups.length + ' · PID 集合变化 ' + changes + ' 次';
+      empty.hidden = visible > 0;
+      empty.textContent = groups.length ? '没有匹配的进程，请尝试名称或历史 PID。' : '本采集段未观察到 PID 集合变化。';
+    }
+    input.addEventListener('input', filter);
+    filter();
+  }
   function setupSegment(system) {
     if (document.body?.dataset?.reportStyle === 'compact' && typeof window.setupCompactReport === 'function') {
       window.setupCompactReport(system, {data, valid, fmt, fmtCount, roundMetric, scaleMetric,
@@ -797,6 +818,7 @@
   }
   data.processes.forEach(prepareMetrics);
   data.systems.forEach(setupSegment);
+  document.querySelectorAll('.pid-monitor').forEach(setupPidMonitor);
   function resizeVisible(root=document) {
     instances.forEach((state, node) => {
       if (!root.contains(node) || !node.getClientRects().length || !node.clientWidth) return;

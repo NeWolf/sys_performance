@@ -22,6 +22,7 @@ _DIAGNOSTIC_MAX_BYTES = 256 * 1024
 
 import perf_slate
 from perf_admission import build_admission
+from perf_groups import reject_qnx_if_present
 from perf_joyspace import (JoySpaceError, PUBLISH_RECOVERED, PUBLISH_UNKNOWN, _page_id,
                            publish_slate, read_template, report_snapshot)
 
@@ -305,6 +306,7 @@ class AdmissionJobs:
 
     def create(self, session_id, draft_id, title, scenes=None, factor=None):
         session_id, draft_id = _id(session_id), _id(draft_id)
+        reject_qnx_if_present(self._store, session_id)
         if not isinstance(title, str) or not title.strip() or len(title) > 200 or "\x00" in title:
             raise AdmissionJobError("标题不能为空、含NUL或超过200字符。")
         if scenes is not None and (not isinstance(scenes, dict) or any(type(k) is not int for k in scenes)

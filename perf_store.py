@@ -13,7 +13,8 @@ from pathlib import Path
 from perf_diagnostics import span
 from perf_parser import iter_records, rotation_key
 from perf_top_parser import detect_source_format, iter_top_records
-from perf_groups import GroupStore
+from perf_qnx_parser import MODULES as QNX_KINDS, iter_qnx_records
+from perf_groups import GroupStore, reject_qnx_session
 from perf_metrics import CATEGORIES, INCREMENTS, LABELS, METHOD, NOTES, NUMERIC, metadata, system_cpu_reference, cpu_reference_note
 from perf_metrics import PRECISION_VERSION, register_metric_sql, round_metric, scale_metric, subtract_metric
 
@@ -37,7 +38,7 @@ def safe_filename(value, fallback="未知设备", max_bytes=220):
 
 
 def capture_naming(method="本地导入", device_name="", started_at=None, first_ts=None):
-    if method not in ("SysMonitor", "Top", "本地导入"):
+    if method not in ("SysMonitor", "Top", "QNX", "本地导入"):
         raise ValueError("不支持的采集方式")
     device = safe_filename(device_name, max_bytes=180)
     stamp, timestamp, source = "未知时间", None, "unknown"
@@ -363,11 +364,11 @@ class Store(GroupStore):
                     if detected:
                         formats.add(detected)
                 if len(formats) > 1:
-                    raise ValueError("同一导入不能混合 Top/sysmonitor")
+                    raise ValueError("同一导入不能混合 Top/sysmonitor/QNX")
                 source_format = next(iter(formats), "sysmonitor")
-                if source_format in ("top", "sysmonitor"):
-                    detection["source_format"] = source_format
-            parser = iter_top_records if source_format == "top" else iter_records
+                detection["source_format"] = source_format
+            parser = {"top": iter_top_records, "qnx": iter_qnx_records}.get(source_format, iter_records)
+            is_qnx = source_format == "qnx"
             signature = fingerprint.hexdigest()
             with self.connect(import_commit=True) as db:
                 # Serialize imports before checking duplicates.
@@ -378,11 +379,15 @@ class Store(GroupStore):
                 if existing:
                     return {"id": existing["id"], "duplicate": True}
                 session_id = uuid.uuid4().hex
-                summary = {"counts": {k: 0 for k in ("S", "P", "D", "DE", "DP")},
+                summary = {"counts": {k: 0 for k in (QNX_KINDS if is_qnx else ("S", "P", "D", "DE", "DP"))},
                            "errors": 0, "unknown": 0, "issues": [], "events": [], "event_count": 0,
                            "files": [name for name, _ in unique_sources], "segments": 0,
                            "orphan_cycles": 0, "duplicate_files": len(sources) - len(unique_sources),
                            "source_format": source_format}
+                if is_qnx:
+                    summary.update(timestamp_policy="UTC 毫秒仅粗对齐；保留 QNX 原始相对秒，不做精确同步",
+                                   statistics_policy="全量有效值 nearest-rank；空值 NULL，不补零、不强凑周期",
+                                   cycle_policy="每条 QNX 指标记录独立；不要求 Android S，不计孤立周期")
                 if source_format == "top":
                     summary["timestamp_timezones"] = {"UTC": 0, "local": 0}
                     summary["timestamp_policy"] = "UTC 标记按 UTC；旧日志无时区按导入机器本地时区（含当日夏令时）解析"
@@ -431,8 +436,8 @@ class Store(GroupStore):
                                     if len(summary["events"]) < 100:
                                         summary["events"].append({"source": source, "line": record.number, "ts": ts,
                                                                   "message": "设备重启" if changed_boot else "时钟回拨或数据乱序"})
-                                if ts != last_ts or changed_boot or backwards or new_sample:
-                                    if last_ts is not None and not cycle_has_s:
+                                if is_qnx or ts != last_ts or changed_boot or backwards or new_sample:
+                                    if not is_qnx and last_ts is not None and not cycle_has_s:
                                         summary["orphan_cycles"] += 1
                                     cycle += 1
                                     cycle_has_s = False
@@ -453,8 +458,8 @@ class Store(GroupStore):
                                     batch.clear()
                         self._insert(db, batch)
                         if not any(summary["counts"].values()):
-                            raise ValueError("没有有效的 sysmonitor/Top 记录，请检查日志格式及末尾换行")
-                        if last_ts is not None and not cycle_has_s:
+                            raise ValueError("没有有效的 sysmonitor/Top/QNX 记录，请检查日志格式及末尾换行")
+                        if not is_qnx and last_ts is not None and not cycle_has_s:
                             summary["orphan_cycles"] += 1
                         summary.update(segments=segment + 1, cycles=cycle, first_ts=first_ts, last_ts=last_ts)
                         naming = naming_snapshot if naming_snapshot is not None else capture_naming(
@@ -478,7 +483,7 @@ class Store(GroupStore):
         if kind not in NUMERIC:
             raise ValueError("不支持的记录类型")
         with span("analysis.statistics", kind=kind) as statistics:
-            self.session(session_id)
+            reject_qnx_session(self.session(session_id))
             scope = json.dumps([PRECISION_VERSION, kind, pid, segment, name], ensure_ascii=False)
             where, params = "session=? AND kind=?", [session_id, kind]
             for key, value in (("pid", pid), ("segment", segment), ("name", name)):
@@ -534,7 +539,7 @@ class Store(GroupStore):
                 return result
 
     def series(self, session_id, kind, limit=1500, pid=None, segment=None, name=None):
-        self.session(session_id)
+        reject_qnx_session(self.session(session_id))
         where = "session=? AND kind=?"
         params = [session_id, kind]
         for key, value in (("pid", pid), ("segment", segment), ("name", name)):
@@ -553,7 +558,7 @@ class Store(GroupStore):
 
     def process_references(self, session_id, segment, limit=1500):
         """Aggregate full-scope P IO before sampling; never inherit process filters."""
-        self.session(session_id)
+        reject_qnx_session(self.session(session_id))
         io_fields = ("rd_kb", "wr_kb", "rchar_kb", "wchar_kb")
         sums = ",".join(
             f"metric_sum(CASE WHEN kind='P' THEN json_extract(data,'$.{field}') END) AS {field}"
@@ -691,6 +696,14 @@ class Store(GroupStore):
 
     def overview(self, session_id):
         session = self.session(session_id)
+        if session["summary"].get("source_format") == "qnx":
+            with self.connect() as db:
+                segments = db.execute("""SELECT segment,MIN(ts) start,MAX(ts) end,COUNT(*) records
+                    FROM records WHERE session=? GROUP BY segment ORDER BY segment""", (session_id,)).fetchall()
+                counts = db.execute("""SELECT COUNT(*) samples,
+                    COUNT(json_extract(data,'$.value')) valid_samples
+                    FROM records WHERE session=?""", (session_id,)).fetchone()
+            return dict(session, stats=dict(counts), segments=[dict(row) for row in segments], exporters=[])
         scope = "overview-v1:" + PRECISION_VERSION
         with self.connect() as db:
             cached = db.execute("SELECT result FROM analysis_cache WHERE session=? AND scope=?",
@@ -836,7 +849,7 @@ class Store(GroupStore):
             db.commit()
 
     def processes(self, session_id, sort="cpu_peak", limit=100, offset=0, q="", with_total=False, merge_names=False, segment=None):
-        self.session(session_id)
+        reject_qnx_session(self.session(session_id))
         if sort not in {"cpu_peak", "cpu_avg", "cpu_p95", "cpu_p99", "rss_peak_kb", "rss_avg_kb", "rss_p95_kb", "rss_p99_kb", "read_kb", "write_kb", "wait_peak", "dmabuf_peak_kb"}:
             raise ValueError("不支持的排序字段")
         if type(limit) is not int or limit < 1 or type(offset) is not int or offset < 0:

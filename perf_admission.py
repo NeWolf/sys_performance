@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 
 import perf_slate
+from perf_groups import reject_qnx_if_present
 from perf_metrics import round_metric, scale_metric
 from perf_report_data import KDMIPS_PER_CORE, REQUIRED_PROCESSES, build_report_data
 from perf_report_ui import EXCEL_BUDGETS
@@ -215,6 +216,7 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     仅CPU缺失时K才留空，不以零代填。
     Group scene配置在独立快照中读取，样本仍来自同一份一致性报告数据。
     """
+    reject_qnx_if_present(store, session_id)
     if factor is not None and (not _valid(factor) or factor <= 0):
         raise ValueError("factor必须是显式正有限数值或None")
     # K列不留空：未显式给出系数时沿用离线报告同一个常量，使5.2与“当前实测”逐行可比。
@@ -316,7 +318,7 @@ def build_admission(store, session_id, template: list, output_dir: Path,
                 colors.append(color)
             perf_slate.write_row(row, texts, offset, colors=colors)
     covered = sum(any(p["p_records"] for p in group) for group in matched)
-    warnings.append(f"可靠匹配采集覆盖：{covered}/49；歧义候选不参与，截断WebView始终留空。")
+    warnings.append(f"可靠匹配采集覆盖：{covered}/{len(data['required'])}；歧义候选不参与，截断WebView始终留空。")
     missing = [r["name"] for r, group in zip(data["required"], matched) if not any(p["p_records"] for p in group)]
     if missing:
         warnings.append("未可靠采集：" + "、".join(missing))

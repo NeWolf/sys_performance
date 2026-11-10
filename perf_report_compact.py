@@ -4,7 +4,7 @@ import hashlib
 
 from perf_report_ui import (
     ASSETS, JS as BASE_JS, esc, grid, metric, number, prepare_display,
-    report_data_scripts, integer, pid_label, time_label,
+    report_data_scripts, integer, pid_label, time_label, pid_monitor,
 )
 
 CSS = (ASSETS / "report_compact.css").read_text(encoding="utf-8")
@@ -40,7 +40,9 @@ def segment_html(data, system):
              *[metric(p, "rss_mb", k) for k in ("avg", "max", "p95", "p99")]] for p in processes]
     out.append('<div class="process-detail" tabindex="-1"><h3 class="detail-title" aria-live="polite">请选择一个进程</h3><div class="charts">' + chart(system, "detail-cpu", "进程 CPU 及 P95/P99") + chart(system, "detail-memory", "进程内存及 P95/P99") + '</div></div>')
     out.append(grid(headers, rows, [p["id"] for p in processes], True, "compact-processes", search_terms=[', '.join(map(str, p["pids"])) for p in processes]))
-    out.append('</section></section>')
+    out.append('</section>')
+    out.append(pid_monitor(processes))
+    out.append('</section>')
     return ''.join(out)
 
 

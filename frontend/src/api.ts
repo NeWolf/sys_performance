@@ -13,7 +13,8 @@ export interface Session {
   name: string
   created: string | number
   summary: {
-    counts: Record<Kind, number>
+    source_format?: string
+    counts: Partial<Record<Kind, number>> & Record<string, number | undefined>
     errors: number
     unknown: number
     issues: LogNotice[]
@@ -207,7 +208,7 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试。'
 }
 
-export function downloadFilename(response: Response, extension: '.txt' | '.html'): string {
+export function downloadFilename(response: Response, extension: '.txt' | '.html' | '.tar'): string {
   const disposition = response.headers.get('Content-Disposition') || ''
   const invalid = () => new Error('下载文件名缺失或无效，请更新程序后重试下载。')
   const names = new Map<string, string>()

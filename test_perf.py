@@ -674,6 +674,110 @@ class StoreTests(ReportAssertions, unittest.TestCase):
         processes = sorted(build_report_data(self.store, sid)['processes'], key=lambda row: row['segment'])
         self.assertEqual([r['pid_changes'] for r in processes], [3, 0])
         self.assertEqual([r['pids'] for r in processes], [[11, 22, 33, 44], [55]])
+        self.assertEqual([[e['ts'] for e in p['pid_path']] for p in processes], [[1, 5, 6, 7], [0]])
+        self.assertEqual([[e['pids'] for e in p['pid_path']] for p in processes],
+                         [[[11, 22], [33], [44], [11, 22]], [[55]]])
+        for process in processes:
+            by_time = {row[1]: row[0] for row in process['full_cycles']}
+            self.assertEqual([e['cycle'] for e in process['pid_path']],
+                             [by_time[e['ts']] for e in process['pid_path']])
+        from perf_report import render_report
+        from perf_report_ui import pid_monitor
+        for style in ('default', 'compact'):
+            with self.subTest(style=style):
+                html = render_report(self.store, sid, style=style)
+                markup = ReportMarkup(html)
+                monitors = [attrs for tag, attrs in markup.tags
+                            if tag == 'section' and attrs.get('class') == 'panel pid-monitor']
+                self.assertEqual(len(monitors), 2)
+                for process in processes:
+                    self.assertIn(pid_monitor([process]), html)
+                self.assertEqual(html.count('>首次观察</td>'), 1)
+                self.assertEqual(html.count('>PID 集合变化</td>'), 3)
+                self.assertEqual(render_report(self.store, sid, style=style), html)
+                script_hash = base64.b64encode(hashlib.sha256(markup.scripts[-1][1].encode()).digest()).decode()
+                self.assertIn("sha256-" + script_hash, html)
+
+    def test_pid_monitor_search_isolated_and_complete(self):
+        source = Path('report_assets/report.js').read_text(encoding='utf-8')
+        setup = source[source.index('  function setupPidMonitor('):source.index('  function setupSegment(')]
+        self.assertIn("document.querySelectorAll('.pid-monitor').forEach(setupPidMonitor)", source)
+        self.run_report_script(setup + r'''
+const assert = require('node:assert/strict');
+function monitor(specs) {
+  const input = {value:'', addEventListener(type, fn) { this[type] = fn; }};
+  const count = {}, empty = {};
+  const groups = specs.map(([search, rows]) => ({dataset:{pidSearch:search}, hidden:false,
+    querySelectorAll(selector) { assert.equal(selector,'tr'); return Array(rows).fill({}); }}));
+  const root = {
+    querySelector(selector) {
+      return {'.pid-search':input, '.pid-count':count, '.pid-empty':empty}[selector];
+    },
+    querySelectorAll(selector) { assert.equal(selector,'tbody[data-pid-search]'); return groups; }
+  };
+  setupPidMonitor(root);
+  return {input, count, empty, groups,
+    search(value) { input.value=value; input.input(); },
+    visible() { return groups.map(g => !g.hidden); }};
+}
+const a = monitor([['Worker 11, 22, 33, 44', 4], ['[system] 55', 1], ['DP-only 66', 1],
+                   ['"<script>& 77', 1]]);
+const b = monitor([['Worker 99', 1]]);
+assert.deepEqual(a.visible(), [true,true,true,true]);
+assert.match(a.count.textContent, /4 \/ 4.*3 次/);
+a.search(' wOrKeR ');
+assert.deepEqual(a.visible(), [true,false,false,false]);
+assert.match(a.count.textContent, /1 \/ 4.*3 次/);
+a.search('22');
+assert.deepEqual(a.visible(), [true,false,false,false]);
+assert.equal(a.groups[0].querySelectorAll('tr').length, 4);
+assert.deepEqual(b.visible(), [true]);
+a.search('[system]');
+assert.deepEqual(a.visible(), [false,true,false,false]);
+a.search('66');
+assert.deepEqual(a.visible(), [false,false,true,false]);
+a.search('"<script>&');
+assert.deepEqual(a.visible(), [false,false,false,true]);
+a.search('.*');
+assert.deepEqual(a.visible(), [false,false,false,false]);
+assert.equal(a.empty.hidden, false);
+assert.match(a.empty.textContent, /没有匹配/);
+a.search('');
+assert.deepEqual(a.visible(), [true,true,true,true]);
+assert.equal(a.empty.hidden, true);
+const empty = monitor([]);
+assert.equal(empty.empty.hidden, false);
+assert.equal(empty.empty.textContent, '本采集段未观察到 PID 集合变化。');
+assert.match(empty.count.textContent, /0 \/ 0.*0 次/);
+''')
+
+    def test_pid_monitor_safe_static_and_empty(self):
+        from datetime import datetime
+        from perf_report_ui import pid_monitor
+        name = '\"><script>alert(1)</script>&worker'
+        processes = [dict(name=name, pids=[11, None], pid_path=[
+            dict(cycle=0, ts=946684800000, pids=[11, None]),
+            dict(cycle=7, ts=946684807456, pids=[22])]),
+            dict(name='no-path', pids=[], pid_path=[]),
+            dict(name='unchanged', pids=[33], pid_path=[
+                dict(cycle=0, ts=946684800000, pids=[33])])]
+        html = pid_monitor(processes)
+        markup = ReportMarkup(html)
+        self.assertFalse(markup.scripts)
+        self.assertNotIn('data-process=', html)
+        self.assertNotIn('data-table=', html)
+        for ts in (946684800000, 946684807456):
+            expected = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            self.assertIn('<td>' + expected + '</td>', html)
+        self.assertNotRegex(html, r'\d{2}:\d{2}:\d{2}(?:\.\d+|[+-]\d{2}:\d{2})')
+        self.assertIn('<td>11, 未知</td><td>22</td>', html)
+        self.assertNotIn('no-path', html)
+        self.assertNotIn('unchanged', html)
+        self.assertIn('本采集段未观察到 PID 集合变化。', pid_monitor(processes[1:]))
+        self.assertIn('本采集段未观察到 PID 集合变化。', pid_monitor([]))
+        self.assertNotIn(' hidden', pid_monitor([]))
+        search = [a['data-pid-search'] for t, a in markup.tags if t == 'tbody']
+        self.assertEqual(search, [name + ' 11, 未知'])
 
     def import_sample(self, text=SAMPLE):
         return self.store.import_files([("perf.log", io.BytesIO(text.encode()))])
@@ -3335,14 +3439,14 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
         missing = required_table(data, 1)
         self.assertNotIn('class="budget-', missing)
 
-    def test_report_excel49_missing_entries_and_source(self):
+    def test_report_excel50_missing_entries_and_source(self):
         from perf_report import render_report
 
         data = self.assert_report(render_report(self.store, self.load(self.s(1))))
         required = data["required"]
-        self.assertEqual(len(required), 49)
+        self.assertEqual(len(required), 50)
         self.assertEqual([item["excel_row"] for item in required],
-                         list(range(7, 38)) + list(range(39, 57)))
+                         list(range(7, 39)) + list(range(40, 58)))
         self.assertEqual(data["processes"], [])
         from perf_report_ui import EXCEL_BUDGETS, number, required_table
         html = required_table(data, 0)
@@ -3353,7 +3457,7 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
         self.assertEqual(len(controls), 1)
         self.assertIn("checked", controls[0])
         groups = re.findall(r'<tbody class="focus-group".*?</tbody>', html)
-        self.assertEqual(len(groups), 49)
+        self.assertEqual(len(groups), 50)
         for item, group in zip(required, groups):
             rows = re.findall(r'<tr\b.*?</tr>', group)
             self.assertEqual(len(rows), 3)
@@ -3366,11 +3470,11 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 self.assertEqual(values, [(str(source[c]) if source.get(c) is not None else "",
                                            number(source.get(c))) for c in columns])
             self.assertEqual(re.findall(r'<td data-sort="([^"]*)"[^>]*>', rows[2]), [""] * 7)
-        self.assertEqual(data["required_source"]["file"], "8255内部-资源分布策略.xlsx")
+        self.assertEqual(data["required_source"]["file"], "8255内部-资源分布策略_v1.xlsx")
         self.assertEqual(data["required_source"]["sheet"], "Sheet1")
-        self.assertEqual(data["required_source"]["rows"], [[7, 37], [39, 56]])
+        self.assertEqual(data["required_source"]["rows"], [[7, 38], [40, 57]])
         self.assertEqual(data["required_source"]["sha256"],
-                         "fe8f5b0b2ef37604bcbe8f20b110365c032b8669d1a9da05ca353d1f6d3e4988")
+                         "d84a853f1624709a172f32fc3e50db0318c761b336d3769ac6fab88a5f35b989")
         for item in required:
             with self.subTest(row=item["excel_row"]):
                 self.assertEqual(item["status"], "missing")
@@ -3379,35 +3483,35 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 self.assertEqual(item["candidates"], [])
                 self.assertEqual(item["segments"], [dict(segment=0, status="missing", match=None,
                                                        process_ids=[], candidate_ids=[])])
-                self.assertEqual(item["module"], "应用服务" if item["excel_row"] <= 37 else "系统服务")
+                self.assertEqual(item["module"], "应用服务" if item["excel_row"] <= 38 else "系统服务")
                 self.assertTrue(item["business"])
                 self.assertTrue(item["name"])
-                self.assertEqual(item["truncated"], item["excel_row"] == 56)
+                self.assertEqual(item["truncated"], item["excel_row"] == 57)
 
     def test_report_excel_matching_is_segment_local_and_ambiguity_safe(self):
         from perf_report import render_report
 
-        webview = "com.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessServic"
+        webview = "com.android.webview:sandboxed_process0:org.chromium.content.app"
         names = ["/system/bin/mediaserver", "mediaserver", "audioserver",
-                 "/vendor/bin/logd", "/other/bin/logd", webview, webview + "e:0"]
+                 "/vendor/bin/logd", "/other/bin/logd", webview, webview + ".SandboxedProcessService:0"]
         rows = self.s(100) + "".join(self.p(100, pid, name) for pid, name in enumerate(names, 1))
         rows += "DP,100,20,99999,1,/system/bin/surfaceflinger\n"
         rows += self.s(1) + self.p(1, name="/system/bin/logd")
         data = self.assert_report(render_report(self.store, self.load(rows)))
         required = {item["excel_row"]: item for item in data["required"]}
         processes = {(p["segment"], p["name"]): p for p in data["processes"]}
-        self.assertEqual(len(required), 49)
+        self.assertEqual(len(required), 50)
         self.assertEqual(len(processes), 9)
         def pid(segment, name):
             return processes[(segment, name)]["id"]
 
         expected = {
-            44: ("collected", "exact", [pid(0, names[0])], []),
-            45: ("collected", "basename", [pid(0, "audioserver")], []),
-            47: ("dp_only", "exact", [pid(0, "/system/bin/surfaceflinger")], []),
-            51: ("pending_confirmation", "ambiguous", [],
+            45: ("collected", "exact", [pid(0, names[0])], []),
+            46: ("collected", "basename", [pid(0, "audioserver")], []),
+            48: ("dp_only", "exact", [pid(0, "/system/bin/surfaceflinger")], []),
+            52: ("pending_confirmation", "ambiguous", [],
                  [pid(0, "/vendor/bin/logd"), pid(0, "/other/bin/logd")]),
-            56: ("pending_confirmation", "candidate", [], [pid(0, webview), pid(0, webview + "e:0")]),
+            57: ("pending_confirmation", "candidate", [], [pid(0, webview), pid(0, webview + ".SandboxedProcessService:0")]),
         }
         for row, item in required.items():
             with self.subTest(row=row):
@@ -3417,7 +3521,7 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 self.assertEqual((first["status"], first["match"]), (status, mode))
                 self.assertEqual(first["process_ids"], matches)
                 self.assertCountEqual(first["candidate_ids"], candidates)
-                later = [pid(1, "/system/bin/logd")] if row == 51 else []
+                later = [pid(1, "/system/bin/logd")] if row == 52 else []
                 self.assertEqual(second, dict(segment=1, status="collected" if later else "missing",
                                              match="exact" if later else None,
                                              process_ids=later, candidate_ids=[]))
@@ -3425,8 +3529,8 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 self.assertCountEqual(item["candidates"], candidates)
                 self.assertEqual(item["missing"], not bool(matches + later))
                 self.assertEqual(item["status"], "collected" if later else status)
-        assigned = {(0, names[0]): [44], (0, "audioserver"): [45],
-                    (0, "/system/bin/surfaceflinger"): [47], (1, "/system/bin/logd"): [51]}
+        assigned = {(0, names[0]): [45], (0, "audioserver"): [46],
+                    (0, "/system/bin/surfaceflinger"): [48], (1, "/system/bin/logd"): [52]}
         for key, process in processes.items():
             self.assertEqual(process["required_rows"], assigned.get(key, []), key)
 
@@ -3452,11 +3556,11 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
         rows = "".join(self.s(700 - segment * 100) + records
                        for segment, (records, _, _, _) in enumerate(cases))
         data = self.assert_report(render_report(self.store, self.load(rows)))
-        item = next(r for r in data["required"] if r["excel_row"] == 12)
-        entry = next(r for r in REQUIRED_PROCESSES if r["excel_row"] == 12)
+        item = next(r for r in data["required"] if r["excel_row"] == 13)
+        entry = next(r for r in REQUIRED_PROCESSES if r["excel_row"] == 13)
         self.assertEqual({key: item[key] for key in entry}, entry)
         self.assertEqual(item["business"], "语音算法")
-        self.assertEqual(len(data["required"]), 49)
+        self.assertEqual(len(data["required"]), 50)
         self.assertEqual(len(item["segments"]), len(cases))
         self.assertEqual(item["candidates"], [])
         lookup = {p["id"]: p for p in data["processes"]}
@@ -3470,17 +3574,66 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 for process in data["processes"]:
                     if process["segment"] == segment:
                         self.assertEqual(process["required_rows"],
-                                         [12] if process["name"] == name else [])
+                                         [13] if process["name"] == name else [])
                 if status == "collected":
                     self.assertEqual(matched[0]["metrics"]["cpu1c"]["p95"],
                                      99 if name == fallback else 11)
                 html = required_table(dict(data, required=[item]), segment)
                 self.assertIn("<strong>" + (name or primary) + "</strong>", html)
                 self.assertIn("语音算法", html)
-                self.assertIn("Excel 行 12", html)
+                self.assertIn("Excel 行 13", html)
                 self.assertIn("后台标准", html)
                 self.assertIn("前台标准", html)
         self.assertEqual(item["matches"], [pid for s in item["segments"] for pid in s["process_ids"]])
+
+    def test_report_updated_focus_names_and_empty_someip_budget(self):
+        from perf_report import render_report
+        from perf_report_data import REQUIRED_PROCESSES
+        from perf_report_ui import EXCEL_BUDGETS, budget_comparison, required_table
+
+        expected = {
+            8: "com.desaysv.ivi.vds.carlan",
+            32: "com.jd.jkc.healing",
+            34: "/vendor/bin/hw/vendor.qti.hardware.lights.service",
+            50: "/vendor/bin/hw/android.hardware.bluetooth-service-qti",
+            51: "/vendor/bin/hw/android.hardware.camera.provider@V1-qti-service",
+            57: "com.android.webview:sandboxed_process0:org.chromium.content.app",
+        }
+        old_names = [
+            "com.jd.jkc.heading", "jkc_backlight_service",
+            "/vendor/bin/hw/android.hardware.bluetooth@1.0-service",
+            "/vendor/bin/hw/android.hardware.camera.provider@2.4-service_64",
+            "com.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessServic",
+        ]
+        entries = {r["excel_row"]: r for r in REQUIRED_PROCESSES}
+        self.assertEqual({n: entries[n]["name"] for n in expected}, expected)
+        self.assertEqual(sum(r["module"] == "应用服务" for r in REQUIRED_PROCESSES), 32)
+        self.assertEqual(sum(r["module"] == "系统服务" for r in REQUIRED_PROCESSES), 18)
+        self.assertEqual(set(EXCEL_BUDGETS), set(entries))
+        self.assertEqual(EXCEL_BUDGETS[8], dict(D="N", E="Y", **dict.fromkeys("MNOPQRS", "—")))
+        self.assertEqual([EXCEL_BUDGETS[7][c] for c in "DEFHJ"], ["N", "Y", 2, 5, 150])
+        for column in range(7):
+            self.assertEqual(budget_comparison(100, EXCEL_BUDGETS[8], column), ("", ""))
+        # Current exact names collect; retired names do not become aliases.
+        # The short WebView name and its old longer form remain candidates only.
+        text = self.s(100) + "".join(self.p(100, i, name) for i, name in enumerate(expected.values(), 1))
+        text += self.s(1) + "".join(self.p(1, i, name) for i, name in enumerate(old_names, 1))
+        data = self.assert_report(render_report(self.store, self.load(text)))
+        required = {r["excel_row"]: r for r in data["required"]}
+        for excel_row in expected:
+            first, retired = required[excel_row]["segments"]
+            if excel_row == 57:
+                for segment in (first, retired):
+                    self.assertEqual(segment["status"], "pending_confirmation")
+                    self.assertEqual(segment["process_ids"], [])
+                    self.assertEqual(len(segment["candidate_ids"]), 1)
+            else:
+                self.assertEqual((first["status"], first["match"]), ("collected", "exact"))
+                self.assertEqual(retired["status"], "missing")
+                self.assertEqual(retired["candidate_ids"], [])
+        html = required_table(dict(data, required=[required[8]]), 0)
+        self.assertNotIn("budget-high", html)
+        self.assertNotIn("budget-low", html)
 
     def test_member_resources_independent_exact_scope_and_nulls(self):
         rows = self.s(1000) + self.p(1000, cpu1c=50, rss_kb=10, rd_kb=2)
@@ -3924,6 +4077,9 @@ class ApiTests(ReportAssertions, unittest.TestCase):
         self.app = create_app(Path(self.temp.name) / "api.sqlite3")
         self.client = TestClient(self.app, base_url="http://127.0.0.1:8765")
         self.addCleanup(self.client.close)
+        self.client.__enter__()
+        # Run application shutdown (including diagnostic drain) before temp cleanup.
+        self.addCleanup(self.client.__exit__, None, None, None)
         self.headers = {"X-Session-Token": self.client.get("/api/token").json()["token"]}
 
     def upload(self, text=SAMPLE, title="接口测试", device_name=None):

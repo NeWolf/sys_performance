@@ -10,6 +10,7 @@ import time
 from concurrent.futures import CancelledError
 from collections import Counter, defaultdict
 
+from perf_groups import reject_qnx_session
 from perf_metrics import (
     METHOD, metadata, to_kdmips, system_cpu_reference, cpu_reference_note,
     round_metric, scale_metric, subtract_metric, sum_metrics, register_metric_sql,
@@ -20,66 +21,67 @@ KDMIPS_PER_CORE = 28.75
 
 
 EXCEL_SOURCE = {
-    "file": "8255内部-资源分布策略.xlsx", "sheet": "Sheet1",
-    "sha256": "fe8f5b0b2ef37604bcbe8f20b110365c032b8669d1a9da05ca353d1f6d3e4988",
-    "rows": [[7, 37], [39, 56]],
+    "file": "8255内部-资源分布策略_v1.xlsx", "sheet": "Sheet1",
+    "sha256": "d84a853f1624709a172f32fc3e50db0318c761b336d3769ac6fab88a5f35b989",
+    "rows": [[7, 38], [40, 57]],
     "columns": {"module": "A (merged cells expanded)", "business": "B", "name": "C"},
 }
-# Transcribed from the complete zip/XML workbook, including its truncated row 56.
+# Transcribed from the complete zip/XML workbook, including its truncated WebView name.
 _REQUIRED_ROWS = (
-    (7, "车控初始化服务", "com.auto.beardrive"),
-    (8, "车控通信服务", "com.auto.beardrive:remote"),
-    (9, "HMI车控服务", "com.jd.jkc.carctl"),
-    (10, "语音助手", "com.jd.jkc.joy.assistant"),
-    (11, "语音助手后台常驻服务进程", "com.jd.jkc.joy.assistant:assistantservice"),
-    (12, "语音算法", "com.iflytek.cutefly.speechclient.hmi"),
-    (13, "编解码服务", "jkc_codec_service"),
-    (14, "视频落盘", "oms_device"),
-    (15, "摄像头底层服务，为OMS/DMS提供图像流", "jkc_camera_service"),
-    (16, "模型管理", "com.jd.jkc.modelmanager"),
-    (17, "系统埋点落盘", "com.jd.jkc.datacollector"),
-    (18, "数据上传", "jkc_datacl"),
-    (19, "系统监控", "sysmonitor"),
-    (20, "SOS紧急呼叫", "com.jd.jkc.sos"),
-    (21, "行程", "com.jd.jkc.trip"),
-    (22, "行程（JD Push保活子进程）", "com.jd.jkc.trip:jdpush"),
-    (23, "SR地图", "com.jd.jkc.sr"),
-    (24, "健康监测", "com.jd.jkc.health"),
-    (25, "音乐律动/可视化特效", "com.jd.musicrhythm"),
-    (26, "无麦K歌", "com.jd.jkc.karaoke"),
-    (27, "无麦K歌（子进程）", "com.jd.jkc.karaoke:remote"),
-    (28, "音乐", "com.jd.jkc.music"),
-    (29, "彩蛋", "com.jd.jkc.promotion"),
-    (30, "塔罗", "com.jd.jkc.taro"),
-    (31, "疗愈", "com.jd.jkc.heading"),
-    (32, "商城", "com.jd.jkc.mall"),
-    (33, "屏幕背光控制服务", "jkc_backlight_service"),
-    (34, "硬件编解码进程(调用SoC硬解)", "media.hwcodec"),
-    (35, "车机桌面Launcher", "com.android.car.carlauncher"),
-    (36, "系统UI(状态栏/导航/通知)", "com.android.systemui"),
-    (37, "时间同步服务", "com.jd.jkc.timesyncfinal"),
-    (39, "艾拉比OTA升级管理(UCM)", "com.abupdate.vus.ucm"),
-    (40, "艾拉比OTA升级客户端", "com.abupdate.ota"),
-    (41, "路斯通音效调音(EQ/DSP音效)", "com.loostone.tuning"),
-    (42, "Android系统核心进程(承载AMS/WMS/PMS等系统服务)", "system_server"),
-    (43, "蓝牙协议栈应用", "com.android.bluetooth"),
-    (44, "媒体框架核心服务(播放/录制会话管理)", "/system/bin/mediaserver"),
-    (45, "Android音频服务(AudioFlinger/策略/混音)", "/system/bin/audioserver"),
-    (46, "相机框架服务", "/system/bin/cameraserver"),
-    (47, "显示合成器(图层合成/送显)", "/system/bin/surfaceflinger"),
-    (48, "媒体解封装(容器解析、抽取音视频轨)", "media.extractor"),
-    (49, "蓝牙HAL服务", "/vendor/bin/hw/android.hardware.bluetooth@1.0-service"),
-    (50, "相机HAL服务", "/vendor/bin/hw/android.hardware.camera.provider@2.4-service_64"),
-    (51, "系统日志守护进程", "/system/bin/logd"),
-    (52, "ADB调试守护进程", "/apex/com.android.adbd/bin/adbd"),
-    (53, "媒体库内容提供者", "com.android.providers.media.module"),
-    (54, "音频HAL服务", "/vendor/bin/hw/android.hardware.audio.service"),
-    (55, "Android软件编解码进程(CPU软解)", "media.swcodec"),
-    (56, "webview服务", "com.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessServic"),
+    (7, '车控初始化服务', 'com.auto.beardrive'),
+    (8, '车控someip', 'com.desaysv.ivi.vds.carlan'),
+    (9, '车控通信服务', 'com.auto.beardrive:remote'),
+    (10, 'HMI车控服务', 'com.jd.jkc.carctl'),
+    (11, '语音助手', 'com.jd.jkc.joy.assistant'),
+    (12, '语音助手后台常驻服务进程', 'com.jd.jkc.joy.assistant:assistantservice'),
+    (13, '语音算法', 'com.iflytek.cutefly.speechclient.hmi'),
+    (14, '编解码服务', 'jkc_codec_service'),
+    (15, '视频落盘', 'oms_device'),
+    (16, '摄像头底层服务，为OMS/DMS提供图像流', 'jkc_camera_service'),
+    (17, '模型管理', 'com.jd.jkc.modelmanager'),
+    (18, '系统埋点落盘', 'com.jd.jkc.datacollector'),
+    (19, '数据上传', 'jkc_datacl'),
+    (20, '系统监控', 'sysmonitor'),
+    (21, 'SOS紧急呼叫', 'com.jd.jkc.sos'),
+    (22, '行程', 'com.jd.jkc.trip'),
+    (23, '行程（JD Push保活子进程）', 'com.jd.jkc.trip:jdpush'),
+    (24, 'SR地图', 'com.jd.jkc.sr'),
+    (25, '健康监测', 'com.jd.jkc.health'),
+    (26, '音乐律动/可视化特效', 'com.jd.musicrhythm'),
+    (27, '无麦K歌', 'com.jd.jkc.karaoke'),
+    (28, '无麦K歌（子进程）', 'com.jd.jkc.karaoke:remote'),
+    (29, '音乐', 'com.jd.jkc.music'),
+    (30, '彩蛋', 'com.jd.jkc.promotion'),
+    (31, '塔罗', 'com.jd.jkc.taro'),
+    (32, '疗愈', 'com.jd.jkc.healing'),
+    (33, '商城', 'com.jd.jkc.mall'),
+    (34, '屏幕背光控制服务', '/vendor/bin/hw/vendor.qti.hardware.lights.service'),
+    (35, '硬件编解码进程(调用SoC硬解)', 'media.hwcodec'),
+    (36, '车机桌面Launcher', 'com.android.car.carlauncher'),
+    (37, '系统UI(状态栏/导航/通知)', 'com.android.systemui'),
+    (38, '时间同步服务', 'com.jd.jkc.timesyncfinal'),
+    (40, '艾拉比OTA升级管理(UCM)', 'com.abupdate.vus.ucm'),
+    (41, '艾拉比OTA升级客户端', 'com.abupdate.ota'),
+    (42, '路斯通音效调音(EQ/DSP音效)', 'com.loostone.tuning'),
+    (43, 'Android系统核心进程(承载AMS/WMS/PMS等系统服务)', 'system_server'),
+    (44, '蓝牙协议栈应用', 'com.android.bluetooth'),
+    (45, '媒体框架核心服务(播放/录制会话管理)', '/system/bin/mediaserver'),
+    (46, 'Android音频服务(AudioFlinger/策略/混音)', '/system/bin/audioserver'),
+    (47, '相机框架服务', '/system/bin/cameraserver'),
+    (48, '显示合成器(图层合成/送显)', '/system/bin/surfaceflinger'),
+    (49, '媒体解封装(容器解析、抽取音视频轨)', 'media.extractor'),
+    (50, '蓝牙HAL服务', '/vendor/bin/hw/android.hardware.bluetooth-service-qti'),
+    (51, '相机HAL服务', '/vendor/bin/hw/android.hardware.camera.provider@V1-qti-service'),
+    (52, '系统日志守护进程', '/system/bin/logd'),
+    (53, 'ADB调试守护进程', '/apex/com.android.adbd/bin/adbd'),
+    (54, '媒体库内容提供者', 'com.android.providers.media.module'),
+    (55, '音频HAL服务', '/vendor/bin/hw/android.hardware.audio.service'),
+    (56, 'Android软件编解码进程(CPU软解)', 'media.swcodec'),
+    (57, 'webview服务', 'com.android.webview:sandboxed_process0:org.chromium.content.app'),
 )
 REQUIRED_PROCESSES = tuple(
-    dict(excel_row=row, module="应用服务" if row <= 37 else "系统服务",
-         business=business, name=name, truncated=row == 56)
+    dict(excel_row=row, module="应用服务" if row <= 38 else "系统服务",
+         business=business, name=name, truncated=name.startswith("com.android.webview:"))
     for row, business, name in _REQUIRED_ROWS
 )
 PROCESS_FIELDS = ("cpu", "cpu1c", "rss_kb", "rd_kb", "wr_kb", "rchar_kb", "wchar_kb")
@@ -302,6 +304,7 @@ def build_report_data(store, session_id, progress=None, cancelled=None, include_
         if raw is None:
             raise KeyError(session_id)
         session = dict(raw, summary=json.loads(raw["summary"]))
+        reject_qnx_session(session)
         _prepare(db, session_id)
         totals = dict(db.execute("SELECT kind,COUNT(*) FROM report_source GROUP BY kind"))
         completed = {"process": 0, "system": 0}

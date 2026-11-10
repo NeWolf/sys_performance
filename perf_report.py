@@ -1,6 +1,7 @@
 """Self-contained offline HTML report entry point."""
 from datetime import datetime, timezone
 import hashlib
+import json
 import threading
 import zlib
 
@@ -9,7 +10,7 @@ from perf_report_data import _progress_reporter, build_report_data
 from perf_report_ui import CSS, JS, REPORT_CSP, render_document
 
 # Bump when Python report/statistics semantics change; assets/CSP invalidate automatically.
-REPORT_CACHE_VERSION = "27:" + hashlib.sha256(
+REPORT_CACHE_VERSION = "28:" + hashlib.sha256(
     (CSS + "\0" + JS + "\0" + REPORT_CSP).encode("utf-8")).hexdigest()
 # Bounded process-wide locks also coalesce requests through separate Store instances.
 _REPORT_LOCKS = tuple(threading.Lock() for _ in range(64))
@@ -43,8 +44,13 @@ def render_report(store, session_id, progress=None, cancelled=None, *, style="de
     try:
         report("cache")
         with store.connect() as db:
-            if not db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+            session = db.execute("SELECT summary FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if session is None:
                 raise KeyError(session_id)
+            is_qnx = json.loads(session["summary"]).get("source_format") == "qnx"
+            if is_qnx:
+                import perf_qnx_report
+                version = version + ":" + perf_qnx_report.CACHE_VERSION
             cached = db.execute(
                 f"SELECT document FROM {table} WHERE session=? AND version=?",
                 (session_id, version)).fetchone()
@@ -57,11 +63,15 @@ def render_report(store, session_id, progress=None, cancelled=None, *, style="de
             else:
                 report("complete")
                 return document
-        # Both styles need the complete system stream for per-cycle overlays.
-        data = build_report_data(store, session_id, progress=progress,
-                                 cancelled=cancelled, include_full_system=True)
-        report("render")
-        document = renderer(data)
+        if is_qnx:
+            data = perf_qnx_report.build_report_data(store, session_id, progress=progress, cancelled=cancelled)
+            document = perf_qnx_report.render_document(data, style=style, progress=progress, cancelled=cancelled)
+        else:
+            # Both Android styles need the complete system stream for per-cycle overlays.
+            data = build_report_data(store, session_id, progress=progress,
+                                     cancelled=cancelled, include_full_system=True)
+            report("render")
+            document = renderer(data)
         report("compress")
         compressed = zlib.compress(document.encode("utf-8"))
         report("save")

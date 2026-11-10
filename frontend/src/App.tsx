@@ -21,10 +21,10 @@ export default function App() {
 }
 
 const workspaceViews = [
-  { id: 'capture', label: '数据集', description: 'SysMonitor采集 · Top 采集 · 本地日志导入' },
-  { id: 'analysis', label: '性能分析', description: '系统资源、进程排行、趋势叠加与精确合并' },
-  { id: 'compare', label: '双次采集对比', description: 'CPU、内存与 IO 差异 · 进程变化排行' },
-  { id: 'report', label: '配置与导出', description: '分析配置与离线交互 HTML 报告下载' },
+  { id: 'capture', label: '数据集', description: 'SysMonitor · Top · QNX 采集 · 本地导入' },
+  { id: 'analysis', label: '性能分析', description: 'Android 交互分析 · QNX 静态 SVG 报告' },
+  { id: 'compare', label: '双次采集对比', description: 'Android CPU、内存与 IO 差异 · 进程排行' },
+  { id: 'report', label: '配置与导出', description: 'Android 分析配置 · 离线 HTML 报告下载' },
   { id: 'advanced', label: '高级功能', description: '采样间隔与采集写入选项' },
 ] as const
 type WorkspaceView = typeof workspaceViews[number]['id']
@@ -42,7 +42,8 @@ function Workspace() {
   if (sessions.data && sessions.data !== compareSessions) setCompareSessions(sessions.data)
   const [selected, setSelected] = useState<string | null>(null)
   const activeId = selected ?? sessions.data?.[0]?.id ?? null
-  const active = sessions.data?.find((session) => session.id === activeId)
+  const active = (sessions.data ?? compareSessions)?.find((session) => session.id === activeId)
+  const isQnx = active?.summary.source_format === 'qnx'
   // 首次列表就绪时固定选择；刷新期间保留当前会话，不通过 effect 追加渲染。
   if (selected === null && activeId) setSelected(activeId)
   const [files, setFiles] = useState<File[]>([])
@@ -109,9 +110,9 @@ function Workspace() {
   }
 
   function exportReport() {
-    if (!activeId || !guard.confirm('有未保存的分析配置或进程组。离线交互报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃当前草稿。是否继续下载？')) return
+    if (!activeId || !active || !guard.confirm(isQnx ? '下载 QNX 静态 SVG HTML 报告，不会保存或丢弃当前草稿。是否继续下载？' : '有未保存的分析配置或进程组。离线交互报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃当前草稿。是否继续下载？')) return
     void perform('正在生成 HTML 报告…', async (signal) => {
-      const response = await apiResponse(`${sessionPath(activeId)}/report${reportStyle === 'compact' ? '?style=compact' : ''}`, { signal })
+      const response = await apiResponse(`${sessionPath(activeId)}/report${!isQnx && reportStyle === 'compact' ? '?style=compact' : ''}`, { signal })
       if (response.headers.get('content-type')?.split(';')[0]?.trim() !== 'text/html') throw new Error('本地服务返回了无效报告格式，请重试。')
       const filename = downloadFilename(response, '.html')
       const blob = await response.blob()
@@ -143,7 +144,7 @@ function Workspace() {
         {sessions.data?.length === 0 && <p className="sidebar-hint">还没有会话，导入日志后将在此保留。</p>}
         <nav className="session-list" aria-label="历史分析会话">{sessions.data?.map((session) => (
           <button key={session.id} className={`session-item ${activeId === session.id ? 'active' : ''}`} disabled={guard.busy} aria-current={activeId === session.id ? 'page' : undefined} onClick={() => { if (activeId === session.id || !guard.confirm()) return; setSelected(session.id); setError(''); setNotice('') }}>
-            <strong>{session.name}</strong><small>{createdLabel(session.created)}</small><span>{session.summary.files.length} 个文件 · {session.summary.cycles} 个周期</span>
+            <strong>{session.name}</strong><small>{createdLabel(session.created)}</small><span>{session.summary.files.length} 个文件 · {session.summary.cycles} 个{session.summary.source_format === 'qnx' ? '时间点 · QNX' : '周期'}</span>
           </button>
         ))}</nav>
         <div className="sidebar-footer">日志留在本机<br />离线导入 / 趋势分析 / HTML 报告</div>
@@ -151,13 +152,13 @@ function Workspace() {
       <main>
         <header className="topbar"><span>性能工作台 <b>/</b> {currentView.label}</span><div className="app-info"><span className="app-version" title={appVersion.error ? `版本读取失败：${appVersion.error}` : '当前应用版本'}>{appVersion.data ? `JDPerf v${appVersion.data.version}` : appVersion.loading ? '版本读取中…' : '版本暂不可用'}</span><span className="badge">本地服务 · 127.0.0.1</span></div></header>
         <div className="main-content">
-          <div className="page-heading"><div><p className="eyebrow">ANDROID / {currentView.label}</p><h1>{currentView.label}</h1><p>{currentView.description}{active && (view === 'analysis' || view === 'report') ? ` · 当前会话：${active.name}` : ''}</p></div>
+          <div className="page-heading"><div><p className="eyebrow">{view === 'analysis' || view === 'report' ? (active ? (isQnx ? 'QNX' : 'ANDROID') : 'PERFORMANCE') : 'PERFORMANCE'} / {currentView.label}</p><h1>{currentView.label}</h1><p>{isQnx && (view === 'analysis' || view === 'report') ? 'QNX 静态 SVG 分析 · 离线 HTML 报告下载' : currentView.description}{active && (view === 'analysis' || view === 'report') ? ` · 当前会话：${active.name}` : ''}</p></div>
             <div className="actions">{(view === 'analysis' || view === 'report') && <>
-              <label>报告样式 <select value={reportStyle} disabled={!activeId || guard.busy} onChange={(event) => {
+              {active && !isQnx && <label>报告样式 <select value={reportStyle} disabled={guard.busy} onChange={(event) => {
                 const next = event.target.value as ReportStyle
                 if (next !== reportStyle && window.confirm('切换样式将清空报告内的搜索、曲线选择与合并结果，不影响原始数据或未保存配置。是否继续？')) setReportStyle(next)
-              }}><option value="default">原版完整报告</option><option value="compact">简洁组合图</option></select></label>
-              <button className="primary" disabled={!activeId || guard.busy} onClick={exportReport}>导出当前样式 HTML</button>
+              }}><option value="default">原版完整报告</option><option value="compact">简洁组合图</option></select></label>}
+              <button className="primary" disabled={!active || guard.busy} onClick={exportReport}>{isQnx ? '导出 QNX 静态 HTML' : '导出当前样式 HTML'}</button>
               <button className="danger" disabled={!activeId || guard.busy} onClick={deleteSession}>删除会话</button>
             </>}</div>
           </div>
@@ -166,14 +167,14 @@ function Workspace() {
             <details className="panel local-import">
               <summary>导入本地日志 <span>已有日志文件时展开</span></summary>
             <form className="import-form capture-import" onSubmit={importFiles}>
-              <h2>导入本地日志</h2><p>每次最多 5 个文件，单文件最大 1 GB，仅发送给本地分析服务。大文件解析需要较长时间及足够磁盘空间。</p>
+              <h2>导入本地日志</h2><p>支持 Android 性能日志及 QNX 归一化日志 perf_qnx.log，可离线导入；QNX 原始 tar 归档不能直接作为分析日志上传。每次最多 5 个文件，单文件最大 1 GB，仅发送给本地分析服务。大文件解析需要较长时间及足够磁盘空间。</p>
               <label className="file-picker">选择日志文件<input ref={fileInput} type="file" multiple disabled={guard.busy} onChange={(event) => setFiles(Array.from(event.target.files || []))} /></label>
               {files.length > 0 && <div className="file-selection"><strong>已选择 {files.length} 个文件</strong><ul>{files.map((file, index) => <li key={index} title={file.name}>{file.name} · {formatMemory(file.size / 1024)}</li>)}</ul></div>}
               <button className="primary" type="submit" disabled={!files.length || guard.busy}>{busy.startsWith('正在本地') ? '正在解析…' : '导入并分析'}</button>
             </form>
             </details>
           </ViewPanel>
-          {guard.dirty && <div className="banner warning" role="status">有未保存的进程组或人工分析配置，请在对应表单保存以保留用于分析。离线交互报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃草稿。</div>}
+          {guard.dirty && <div className="banner warning" role="status">有未保存的进程组或人工分析配置，请在对应表单保存以保留用于分析。离线报告直接取原始数据，不包含人工配置或进程组；下载不会保存或丢弃草稿。</div>}
           {busy &&<div className="banner info" role="status">{busy} 请勿关闭页面。</div>}
           {error && <div className="banner error" role="alert">{error}</div>}
           {notice && <div className="banner success" role="status">{notice}</div>}

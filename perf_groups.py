@@ -5,6 +5,27 @@ import uuid
 from perf_metrics import INCREMENTS, METHOD, NUMERIC, metadata, resource_settings, round_metric, scale_metric
 
 
+class QnxIsolationError(ValueError):
+    """A QNX session was passed to an Android-only analysis operation."""
+
+
+def reject_qnx_session(session):
+    if session["summary"].get("source_format") == "qnx":
+        raise QnxIsolationError("QNX 会话不支持 Android 分析、分组、报告配置、对比或准入；请使用 QNX 独立报告。")
+
+
+def reject_qnx_if_present(store, session_id):
+    """Drafts outlive sessions; lightweight job stores may not expose sessions."""
+    lookup = getattr(store, "session", None)
+    if lookup is None:
+        return
+    try:
+        session = lookup(session_id)
+    except KeyError:
+        return
+    reject_qnx_session(session)
+
+
 def normalize_group(config, group_id):
     return dict(config, id=group_id, members=[dict(
         service_category="未分类", related_service="") | member
@@ -14,8 +35,10 @@ def normalize_group(config, group_id):
 class GroupStore:
     @staticmethod
     def _require_session(db, session_id):
-        if db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+        row = db.execute("SELECT summary FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if row is None:
             raise KeyError(session_id)
+        reject_qnx_session({"summary": json.loads(row[0])})
 
     @staticmethod
     def _read_group(db, session_id, group_id):
