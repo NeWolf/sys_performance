@@ -1,4 +1,5 @@
 """Device-owned Top lifecycle, wire protocol and archive safety regressions."""
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -19,7 +20,8 @@ from fastapi.testclient import TestClient
 from perf_adb import AdbController, AdbError
 from perf_api import create_app
 from perf_store import Store
-from perf_top_capture import MAX_ARCHIVE_BYTES, REMOTE_ROOT, TopCapture
+from perf_top_capture import (MAX_ARCHIVE_BYTES, REMOTE_ROOT, REBOOT_WARNING,
+                              RECOVERY_WARNING, CLEAR_WARNING, TopCapture)
 
 TOP = b"PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ ARGS\n1 root 20 0 1G 20M 1M S 12.5 1.0 0:01 app\n"
 RAW = "========== Top 采集 #1 时间: 2026-09-22 12:34:56 ==========\n".encode() + TOP + b"\n\n"
@@ -27,8 +29,24 @@ RAW = "========== Top 采集 #1 时间: 2026-09-22 12:34:56 ==========\n".encode
 
 class Device:
     """Fake the wire, not the controller: locking and decode stay real."""
-    def __init__(self, adb):
+    def __init__(self, adb, root):
         self.adb = adb
+        self.root = root
+        self.remote = root / "shared"
+        self.legacy = root / "legacy"
+        self.remote.mkdir()
+        payload = Path(__file__).with_name("device_top_capture.sh").read_bytes()
+        payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        self.cache = self.remote / ("control-" + hashlib.sha256(payload).hexdigest() + ".sh")
+        self.cache.write_bytes(payload)
+        self.version = "toybox 0.8.9-android"
+        self.version_status = 0
+        self.ls_error = None
+        self.ls_status = 1
+        self.hash_error = None
+        self.script_hash_error = None
+        self.before_shell = None
+        self.before_push = None
         self.jobs = {}
         self.commands = []
         self.payload = RAW
@@ -40,44 +58,93 @@ class Device:
         adb.shell = Mock(side_effect=self.shell)
         adb.run = Mock(side_effect=self.run)
 
+    def checked_shell(self, serial, command, output=None, *, via_stdin=False):
+        # Run the controller's complete guard in a real shell/filesystem. Only
+        # Android toybox output formatting and the device action are emulated.
+        if self.before_shell:
+            self.before_shell(command)
+        command = command.replace(REMOTE_ROOT, str(self.remote)).replace(
+            "/data/local/tmp/sysmonitor_top_capture", str(self.legacy))
+        command = command.replace("/system/bin/toybox", "test_toybox")
+        invocation = None
+        if "; sh " in command:
+            command, invocation = command.rsplit("; sh ", 1)
+        helper = (
+            "import hashlib, os, sys\n"
+            "action = sys.argv[1]\n"
+            "if action == '--version':\n"
+            f" print({self.version!r}); sys.exit({self.version_status!r})\n"
+            "elif action == 'ls':\n"
+            " path = sys.argv[-1]\n"
+            f" forced = {self.ls_error!r}\n"
+            " if forced:\n"
+            f"  print('ls: ' + path + ': ' + forced, file=sys.stderr); sys.exit({self.ls_status!r})\n"
+            " try: os.lstat(path)\n"
+            " except OSError as exc:\n"
+            "  print('ls: ' + path + ': ' + exc.strerror, file=sys.stderr); sys.exit(1)\n"
+            " print(path)\n"
+            "elif action == 'sha256sum':\n"
+            f" forced = {self.hash_error!r}\n"
+            " if forced == 'missing': sys.exit(127)\n"
+            " data = sys.stdin.buffer.read()\n"
+            f" if data != b'abc': forced = {self.script_hash_error!r} or forced\n"
+            " if forced == 'missing': sys.exit(127)\n"
+            " print((forced or hashlib.sha256(data).hexdigest()) + '  -')\n"
+            "else: sys.exit(127)\n"
+        )
+        shim = 'test_toybox() { ' + shlex.quote(sys.executable) + ' -c ' + shlex.quote(helper) + ' "$@"; }; '
+        result = subprocess.run(["sh", "-s"], input=AdbController.shell_input(shim + command).decode(),
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise AdbError(result.stderr.strip(), 502)
+        if invocation is not None:
+            return self.action(serial, shlex.split(invocation)[1:], output)
+        return result.stdout.strip()
+
     def shell(self, serial, command, **kwargs):
         assert self.adb.lock.locked()
+        assert not kwargs.get("root"), "Top must not use su"
         if command == "id -u":
-            return "0"
-        if command.startswith("[ ! -L"):
-            return "ready"
-        args = shlex.split(command)[2:]
-        return self.action(serial, args)
+            return "2000"
+        return self.checked_shell(serial, command)
 
     def run(self, *args, **kwargs):
         assert self.adb.lock.locked()
-        if args[2] in ("root", "wait-for-device"):
+        assert args[2] not in {"root", "unroot", "wait-for-device", "reconnect"}, "Top must not restart adbd"
+        if args[2] == "push":
+            if self.before_push:
+                self.before_push(args)
+            target = Path(args[4].replace(REMOTE_ROOT, str(self.remote)))
+            target.write_bytes(Path(args[3]).read_bytes())
             return ""
-        command = shlex.split(args[-1])[2]
-        if kwargs.get("output") is None:
-            return self.shell(args[1], command)
-        return self.action(args[1], shlex.split(command)[2:], kwargs.get("output"))
+        assert args[-1] == "sh -s", "Top guard must not enter process argv"
+        payload = kwargs["input_data"].decode("utf-8")
+        assert payload.startswith("(\n") and payload.endswith("\n)\n")
+        return self.checked_shell(args[1], payload[2:-3], kwargs.get("output"), via_stdin=True)
 
     def action(self, serial, args, output=None):
         self.commands.append((serial, args))
         action = args[0]
         job = self.jobs.get(serial)
         if job and job[0] == "corrupt" and action != "start":
-            if action in {"stop", "clear", "pull"} and job[1] != args[1]:
+            if action in {"stop", "clear", "pull", "pull-live", "clear-live"} and job[1] != args[1]:
                 raise AdbError("Capture identity changed", 502)
-            if action == "clear":
-                assert job[2] == "inactive"
-                job[3] = "cleaned"
-            if action == "pull":
+            if action in {"clear", "clear-live"}:
+                raise AssertionError("Corrupt tasks must never be cleared automatically")
+            if action in {"pull", "pull-live"}:
                 raise AssertionError("Corrupt logs must not be pulled")
             return "\n".join(job)
         if action == "start":
             identity, count, interval, title = args[1:]
             self.jobs[serial] = [identity, "running", "0", count, interval, "0", "none", title]
-        elif action == "pull":
+        elif action in {"pull", "pull-live"}:
             output.write(self.payload)
             if self.fail_pull:
                 raise AdbError("disconnected", 502)
+        elif action == "clear-live":
+            if "clear_unconfirmed" not in self.jobs[serial]:
+                self.jobs[serial].append("clear_unconfirmed")
+            self.payload = b""
         elif action == "clear":
             if self.jobs[serial][-1] != "cleaned":
                 self.jobs[serial].append("cleaned")
@@ -88,16 +155,22 @@ class Device:
         elif action == "status":
             delay = self.stop_pending.get(serial)
             if delay is not None and delay >= 0:
-                if delay == 0 and not self.unconfirmed:
+                if delay == 0 and not self.unconfirmed and "rebooted" not in self.jobs[serial]:
                     self.jobs[serial][1] = "stopped"
                     self.stop_pending.pop(serial)
                 else:
                     self.stop_pending[serial] = max(0, delay - 1)
         else:
             raise AssertionError(action)
-        result = "\n".join(self.jobs[serial]).strip() if serial in self.jobs else "idle"
+        fields = list(self.jobs[serial]) if serial in self.jobs else ["idle"]
+        cleared = "clear_unconfirmed" in fields
+        if cleared:
+            fields.remove("clear_unconfirmed")
+        result = "\n".join(fields).strip()
         if self.unconfirmed and action == "status" and serial in self.jobs:
-            result = "\n".join(self.jobs[serial]) + "\n1700000045\nunconfirmed"
+            result = "\n".join(fields) + "\n1700000045\nunconfirmed"
+        if cleared:
+            result += "\nclear_unconfirmed"
         return result
 
     def finish(self, serial="device-1"):
@@ -110,16 +183,19 @@ class TopCaptureTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.adb = AdbController(self.root / "adb", executable="fake-adb")
-        self.device = Device(self.adb)
+        self.device = Device(self.adb, self.root)
+        legacy_patch = patch("perf_top_capture.LEGACY_ROOT", str(self.device.legacy))
+        legacy_patch.start()
+        self.addCleanup(legacy_patch.stop)
         self.store = Mock()
         self.store.import_files.return_value = {"id": "session-1", "duplicate": False}
         self.import_lock = threading.Lock()
         self.top = self.controller()
 
     def controller(self):
-        top = TopCapture(self.adb, self.root / "top", self.store, self.import_lock)
+        top = TopCapture(self.adb, self.root / "top_logs", self.store, self.import_lock)
         self.addCleanup(top.close)
         return top
 
@@ -127,6 +203,18 @@ class TopCaptureTests(unittest.TestCase):
         with self.assertRaises(AdbError) as caught:
             function(*args)
         self.assertEqual(caught.exception.status, code)
+
+    @contextmanager
+    def stop_timeout(self):
+        # Advance only controller time at polling sleeps. Real guard subprocesses
+        # still run, but their host startup cost cannot consume the test budget.
+        clock = Mock(wraps=time)
+        clock.monotonic.return_value = 0.0
+        def advance(seconds):
+            clock.monotonic.return_value += seconds
+        clock.sleep.side_effect = advance
+        with patch("perf_top_capture.time", clock), patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+            yield
 
     def finished(self):
         state = self.top.start("device-1", count=1, title=" test ")
@@ -140,6 +228,94 @@ class TopCaptureTests(unittest.TestCase):
 
     def naming_metadata(self, path):
         return json.loads(path.with_suffix(".name.json").read_text(encoding="utf-8"))
+
+    def rebooted_job(self, size=None):
+        identity = self.top.start("device-1", count=-1)["id"]
+        self.device.jobs["device-1"] = [identity, "running", "1", "-1", "1",
+            str(len(RAW) if size is None else size), "none", "", "100", "0", "500", "rebooted"]
+        return identity
+
+    def test_reboot_stop_confirms_once_without_polling_or_log_operations(self):
+        identity = self.rebooted_job()
+        self.device.commands.clear()
+        with patch("perf_top_capture.time.sleep") as sleep:
+            state = self.top.stop("device-1", identity)
+        sleep.assert_not_called()
+        self.assertEqual([args[0] for _, args in self.device.commands], ["stop", "status"])
+        self.assertEqual(state["error"], "device_rebooted")
+        self.assertEqual(state["status"], "error")
+        self.assertFalse(state["running"])
+        self.assertTrue(state["connected"])
+        self.assertEqual(state["started_at"], 100)
+        self.assertIsNone(state["ended_at"])
+        self.assertIsNone(state["elapsed_seconds"])
+        self.assertEqual(state["warning"], REBOOT_WARNING)
+
+    def test_reboot_protocol_rejects_conflicting_or_duplicate_markers(self):
+        self.rebooted_job()
+        fields = self.device.jobs["device-1"]
+        invalid = [fields + ["rebooted"], fields[:-1] + ["unconfirmed", "rebooted"],
+                   fields[:-1] + ["rebooted", "cleaned"]]
+        for status in ("stopped", "completed", "error"):
+            invalid.append([fields[0], status] + fields[2:])
+        ended = fields.copy()
+        ended[9] = "400"
+        invalid.append(ended)
+        for values in invalid:
+            with self.subTest(values=values):
+                self.error(502, self.top._decode, "device-1", "\n".join(values))
+        busy = self.top._decode("device-1", "\n".join(fields + ["control_busy"]))
+        self.assertTrue(busy["running"])
+        self.assertFalse(busy["connected"])
+        self.assertIn("控制锁", busy["connection_error"])
+
+    def test_reboot_pull_preserves_tail_and_warning_across_restart_and_import(self):
+        identity = self.rebooted_job()
+        self.device.payload = RAW + b"partial uncommitted sample"
+        state = self.top.pull("device-1", identity)
+        path = self.top.archive_path(identity)
+        self.assertEqual(path.read_bytes(), self.device.payload)
+        self.assertIn(REBOOT_WARNING, state["warning"])
+        self.assertIn("字节数不一致", state["warning"])
+        marker = json.loads(path.with_suffix(".warning.json").read_text())
+        self.assertEqual(marker["reason"], "device_rebooted")
+        restarted = self.controller()
+        restored = restarted.status("device-1")
+        self.assertTrue(restored["archive"])
+        self.assertEqual(restored["warning"], state["warning"])
+        self.assertIsNone(restored["elapsed_seconds"])
+        restarted.import_capture(identity)
+        self.assertTrue(restarted._import_done.wait(5))
+        imported = restarted.status("device-1")
+        self.assertEqual(imported["status"], "imported")
+        self.assertEqual(imported["error"], "device_rebooted")
+        self.assertEqual(imported["warning"], state["warning"])
+        self.assertNotIn("clear", [args[0] for _, args in self.device.commands])
+
+    def test_reboot_pull_with_equal_or_zero_recorded_bytes_keeps_warning(self):
+        for size in (len(RAW), 0):
+            with self.subTest(size=size):
+                identity = self.rebooted_job(size=size)
+                state = self.top.pull("device-1", identity)
+                self.assertIn(REBOOT_WARNING, state["warning"])
+                self.assertEqual("字节数不一致" in state["warning"], size == 0)
+                self.assertEqual(self.top.archive_path(identity).read_bytes(), RAW)
+                restored = self.controller().status("device-1")
+                self.assertEqual(restored["warning"], state["warning"])
+                self.assertTrue(restored["archive"])
+
+    def test_reboot_warning_metadata_is_strict_and_merges_without_duplicates(self):
+        path = self.root / "archive.txt"
+        marker = path.with_suffix(".warning.json")
+        valid = dict(size=1, before=1, after=1, reason="device_rebooted")
+        marker.write_text(json.dumps(valid))
+        self.assertEqual(self.top._saved_warning(path, 1), REBOOT_WARNING)
+        for change in ({"reason": "unknown"}, {"extra": 1}, {"size": True},
+                       {"before": -1}, {"after": MAX_ARCHIVE_BYTES + 1}, {"size": 2}):
+            marker.write_text(json.dumps(dict(valid, **change)))
+            self.assertIsNone(self.top._saved_warning(path, 1))
+        self.assertEqual(self.top._merge_warnings(REBOOT_WARNING, REBOOT_WARNING, "other"),
+                         REBOOT_WARNING + "\nother")
 
     def test_model_metadata_does_not_affect_ascii_download_name(self):
         model = "中文车机"
@@ -408,7 +584,7 @@ class TopCaptureTests(unittest.TestCase):
                                      'attachment; filename="' + download + '"')
                 self.assertEqual(marker.read_bytes(), saved)
 
-    def test_each_device_operation_roots_once_before_task_access(self):
+    def test_each_device_operation_uses_shell_without_elevation(self):
         calls = Mock()
         calls.attach_mock(self.adb.run, "run")
         calls.attach_mock(self.adb.shell, "shell")
@@ -416,14 +592,11 @@ class TopCaptureTests(unittest.TestCase):
         def check(operation):
             calls.reset_mock()
             result = operation()
-            first = calls.mock_calls[:3]
-            self.assertEqual([(item[0], item.args) for item in first], [
-                ("run", ("-s", "device-1", "root")),
-                ("run", ("-s", "device-1", "wait-for-device")),
-                ("shell", ("device-1", "id -u")),
-            ])
-            roots = [item for item in self.adb.run.call_args_list if item.args[2] == "root"]
-            self.assertEqual(len(roots), 1)
+            for call in self.adb.run.call_args_list:
+                self.assertNotIn(call.args[2], {"root", "unroot", "wait-for-device", "reconnect"})
+            for call in self.adb.shell.call_args_list:
+                self.assertFalse(call.kwargs.get("root"))
+                self.assertNotIn("su 0", call.args[1])
             self.assertFalse(self.adb.lock.locked())
             return result
 
@@ -438,11 +611,13 @@ class TopCaptureTests(unittest.TestCase):
         self.top.status()
         calls.assert_not_called()
 
-    def test_root_failure_blocks_operations_and_preserves_cached_task(self):
+    def test_permission_failure_blocks_operations_and_preserves_cached_task(self):
         identity = self.top.start("device-1")["id"]
         before = list(self.device.commands)
-        for failure in (AdbError("root denied", 502), AdbError("root timeout", 504)):
+        for failure in (AdbError("旧任务目录不可访问，采集状态未确认", 502),
+                        AdbError("shell timeout，采集状态未确认", 504)):
             with self.subTest(failure=str(failure)):
+                self.adb.shell.side_effect = failure
                 self.adb.run.side_effect = failure
                 for operation in (
                     lambda: self.top.start("device-1"),
@@ -450,7 +625,7 @@ class TopCaptureTests(unittest.TestCase):
                     lambda: self.top.pull("device-1", identity),
                     lambda: self.top.clear("device-1", identity),
                 ):
-                    with self.assertRaisesRegex(AdbError, "自动获取 root 权限失败"):
+                    with self.assertRaisesRegex(AdbError, "采集状态未确认"):
                         operation()
                     self.assertFalse(self.adb.lock.locked())
                 state = self.top.status("device-1")
@@ -459,33 +634,51 @@ class TopCaptureTests(unittest.TestCase):
                 self.assertFalse(state["connected"])
                 self.assertIn("采集状态未确认", state["connection_error"])
                 self.assertEqual(self.device.commands, before)
+        self.adb.shell.side_effect = self.device.shell
         self.adb.run.side_effect = self.device.run
         self.assertTrue(self.top.status("device-1")["connected"])
 
-    def test_root_reconnect_timeout_never_reads_task(self):
-        def run(*args, **kwargs):
-            if args[2] == "wait-for-device":
-                raise AdbError("reconnect timeout", 504)
-            return self.device.run(*args, **kwargs)
-
-        self.adb.run.side_effect = run
-        self.error(504, self.top.start, "device-1")
-        self.adb.shell.assert_not_called()
+    def test_shell_failure_never_uploads_or_reads_task(self):
+        self.adb.shell.side_effect = AdbError("permission denied", 502)
+        self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
         self.assertFalse(self.device.commands)
         self.assertFalse(self.adb.lock.locked())
-        self.assertEqual([c.args[2] for c in self.adb.run.call_args_list],
-                         ["root", "wait-for-device"])
-        self.assertTrue(all(c.kwargs["timeout"] == 30
-                            for c in self.adb.run.call_args_list))
 
-    def test_root_zero_exit_without_uid_zero_is_rejected(self):
-        # Some production devices print a refusal but adb exits successfully.
-        self.adb.shell.return_value = "2000"
-        self.adb.shell.side_effect = None
-        self.error(403, self.top.start, "device-1")
-        self.adb.shell.assert_called_once_with("device-1", "id -u")
-        self.assertFalse(self.device.commands)
+    def test_shell_uid_2000_can_start_without_root_command(self):
+        with self.adb.device("device-1"):
+            self.assertEqual(self.device.shell("device-1", "id -u"), "2000")
+        self.assertTrue(self.top.start("device-1")["running"])
+        self.adb.run.assert_not_called()
         self.assertFalse(self.adb.lock.locked())
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "requires unprivileged POSIX shell")
+    def test_inaccessible_old_directory_or_script_blocks_upload(self):
+        remote = self.root / "legacy"
+        remote.mkdir()
+        payload = self.top.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        script = remote / ("control-" + hashlib.sha256(payload).hexdigest() + ".sh")
+        script.write_bytes(payload)
+        archive = remote / "raw.txt"
+        archive.write_bytes(RAW)
+        adb = Mock()
+        self.top.adb = adb
+
+        adb.shell.side_effect = self.device.checked_shell
+        for directory_mode, script_mode in ((0o600, 0o600), (0o500, 0o600), (0o700, 0o000)):
+            with self.subTest(directory_mode=directory_mode, script_mode=script_mode):
+                script.chmod(script_mode)
+                remote.chmod(directory_mode)
+                try:
+                    with patch("perf_top_capture.REMOTE_ROOT", str(remote)):
+                        with self.assertRaisesRegex(AdbError, "采集状态未确认"):
+                            self.top._command("device-1", "status")
+                    adb.run.assert_not_called()
+                finally:
+                    remote.chmod(0o700)
+                    script.chmod(0o600)
+                self.assertEqual(archive.read_bytes(), RAW)
+                self.assertEqual(script.read_bytes(), payload)
 
     def test_script_upload_normalizes_line_endings_before_hashing(self):
         normalized = self.top.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
@@ -497,9 +690,14 @@ class TopCaptureTests(unittest.TestCase):
             with self.subTest(newline=newline):
                 original = normalized.replace(b"\n", newline)
                 source.write_bytes(original)
+                self.top._deployments.clear()
                 adb = Mock()
                 self.top.adb = adb
-                adb.shell.side_effect = ["", "", "idle"]
+                adb.shell.side_effect = self.device.checked_shell
+                cache = self.device.cache
+                if cache.exists():
+                    cache.rename(self.root / ("saved-" + str(len(original))))
+                self.device.commands.clear()
                 uploaded = []
 
                 def push(*args, **kwargs):
@@ -511,12 +709,13 @@ class TopCaptureTests(unittest.TestCase):
                     self.assertNotIn(b"\r", local.read_bytes())
                     self.assertTrue(args[4].startswith(remote + "."))
                     self.assertEqual(kwargs["timeout"], 30)
+                    Path(args[4].replace(REMOTE_ROOT, str(self.device.remote))).write_bytes(local.read_bytes())
 
                 adb.run.side_effect = push
                 self.assertEqual(self.top._command("device-1", "status"), "idle")
                 adb.run.assert_called_once()
                 self.assertIn(remote, adb.shell.call_args_list[0].args[1])
-                self.assertEqual(adb.shell.call_args.args[1], "sh " + remote + " status")
+                self.assertTrue(adb.shell.call_args.args[1].endswith("; sh " + remote +" status"))
                 self.assertFalse(uploaded[0].exists())
                 self.assertEqual(source.read_bytes(), original)
 
@@ -527,7 +726,9 @@ class TopCaptureTests(unittest.TestCase):
         self.top.script = source
         adb = Mock()
         self.top.adb = adb
-        adb.shell.side_effect = ["ready", "idle"]
+        cached = self.device.remote / ("control-" + hashlib.sha256(normalized).hexdigest() + ".sh")
+        cached.write_bytes(normalized)
+        adb.shell.side_effect = self.device.checked_shell
         with patch("perf_top_capture.tempfile.TemporaryDirectory") as temporary:
             self.assertEqual(self.top._command("device-1", "status"), "idle")
         temporary.assert_not_called()
@@ -536,12 +737,13 @@ class TopCaptureTests(unittest.TestCase):
         self.assertIn(remote, adb.shell.call_args_list[0].args[1])
         self.assertNotIn(hashlib.sha256(source.read_bytes()).hexdigest(),
                          adb.shell.call_args_list[0].args[1])
-        self.assertEqual(adb.shell.call_args.args[1], "sh " + remote + " status")
+        self.assertTrue(adb.shell.call_args.args[1].endswith("; sh " + remote +" status"))
 
     def test_script_upload_failure_does_not_publish_or_execute(self):
         adb = Mock()
         self.top.adb = adb
-        adb.shell.return_value = ""
+        self.device.cache.rename(self.root / "saved-cache")
+        adb.shell.side_effect = self.device.checked_shell
         uploaded = []
 
         def failed_push(*args, **kwargs):
@@ -555,6 +757,286 @@ class TopCaptureTests(unittest.TestCase):
             self.top._command("device-1", "status")
         adb.shell.assert_called_once()
         self.assertFalse(uploaded[0].exists())
+
+    def test_legacy_current_presence_never_touches_old_directory(self):
+        for kind in ("file", "directory", "symlink", "dangling"):
+            with self.subTest(kind=kind):
+                legacy = self.root / ("legacy-" + kind)
+                legacy.mkdir()
+                current = legacy / "current"
+                if kind == "directory":
+                    current.mkdir()
+                elif kind in {"symlink", "dangling"}:
+                    current.symlink_to(self.device.cache if kind == "symlink" else legacy / "missing")
+                else:
+                    current.write_text("old identity")
+                before = legacy.stat().st_mtime_ns
+                with patch("perf_top_capture.LEGACY_ROOT", str(legacy)):
+                    self.error(502, self.top.start, "device-1")
+                self.assertEqual(legacy.stat().st_mtime_ns, before)
+                self.adb.run.assert_not_called()
+                self.assertFalse(self.device.commands)
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "requires unprivileged POSIX shell")
+    def test_legacy_search_only_allows_only_confirmed_absence(self):
+        self.device.legacy.mkdir()
+        current = self.device.legacy / "current"
+        current.write_text("old identity")
+        self.device.legacy.chmod(0o100)
+        try:
+            self.error(502, self.top.start, "device-1")
+            current.rename(self.root / "old-current")
+        except PermissionError:
+            self.device.legacy.chmod(0o700)
+            current.rename(self.root / "old-current")
+        finally:
+            self.device.legacy.chmod(0o100)
+        try:
+            self.assertTrue(self.top.status("device-1")["connected"])
+            self.device.legacy.chmod(0o000)
+            self.error(502, self.top.start, "device-1")
+        finally:
+            self.device.legacy.chmod(0o700)
+        self.assertEqual((self.root / "old-current").read_text(), "old identity")
+
+    def test_legacy_invalid_ancestor_or_unknown_ls_error_fails_closed(self):
+        for kind in ("file", "symlink"):
+            legacy = self.root / ("ancestor-" + kind)
+            if kind == "file":
+                legacy.write_text("not a directory")
+            else:
+                legacy.symlink_to(self.root / "absent")
+            with self.subTest(kind=kind), patch("perf_top_capture.LEGACY_ROOT", str(legacy)):
+                self.error(502, self.top.start, "device-1")
+        for message in ("Permission denied", "Not a directory", "Input/output error",
+                        "No such file or directory extra", "不存在"):
+            with self.subTest(message=message):
+                self.device.ls_error = message
+                self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
+        self.assertFalse(self.device.commands)
+
+    def test_unverified_toybox_and_unusable_hash_fail_closed(self):
+        self.device.version = "toybox 0.8.10-android"
+        self.error(502, self.top.start, "device-1")
+        self.device.version = "toybox 0.8.9-android"
+        for failure in ("missing", "0" * 64, "not a hash"):
+            with self.subTest(failure=failure):
+                self.device.hash_error = failure
+                self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
+        self.assertFalse(self.device.commands)
+
+    def test_guard_rejects_failed_version_and_ambiguous_absence_status(self):
+        self.device.version_status = 1
+        self.error(502, self.top.start, "device-1")
+        self.device.version_status = 0
+        self.device.ls_error = "No such file or directory"
+        self.device.ls_status = 2
+        self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
+        self.assertFalse(self.device.commands)
+
+    def test_script_hash_read_failure_after_valid_probe_blocks_execution(self):
+        for failure in ("missing", "0" * 64, "not a hash"):
+            with self.subTest(failure=failure):
+                self.device.script_hash_error = failure
+                self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
+        self.assertFalse(self.device.commands)
+
+    def test_bad_cache_is_never_overwritten_or_executed(self):
+        self.device.cache.write_bytes(b"tampered")
+        self.error(502, self.top.start, "device-1")
+        self.assertEqual(self.device.cache.read_bytes(), b"tampered")
+        self.device.cache.rename(self.root / "bad-cache")
+        for target in (self.root / "bad-cache", self.root / "missing"):
+            self.device.cache.symlink_to(target)
+            self.error(502, self.top.start, "device-1")
+            self.assertTrue(self.device.cache.is_symlink())
+            self.device.cache.rename(self.root / ("link-" + target.name))
+        self.device.cache.mkdir()
+        self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
+        self.assertFalse(self.device.commands)
+
+    def test_uploaded_bytes_and_publish_races_are_checked(self):
+        for failure in ("bad-upload", "cache-race", "legacy-race"):
+            with self.subTest(failure=failure):
+                if self.device.cache.exists():
+                    self.device.cache.rename(self.root / ("cache-" + failure))
+                def mutate(command):
+                    if "mv -n " not in command:
+                        return
+                    if failure == "bad-upload":
+                        for staged in self.device.remote.glob("*.sh.*"):
+                            staged.write_bytes(b"partial upload")
+                    elif failure == "cache-race":
+                        self.device.cache.write_bytes(b"unexpected cache")
+                    else:
+                        self.device.legacy.mkdir()
+                        (self.device.legacy / "current").write_text("old task")
+                self.device.before_shell = mutate
+                self.error(502, self.top.start, "device-1")
+                self.assertFalse(self.device.commands)
+                if failure == "cache-race":
+                    self.assertEqual(self.device.cache.read_bytes(), b"unexpected cache")
+                elif failure == "legacy-race":
+                    self.assertEqual((self.device.legacy / "current").read_text(), "old task")
+
+    def test_execution_rechecks_legacy_and_hash_including_stream_and_deadline(self):
+        for failure in ("hash", "legacy"):
+            for mode in ("normal", "stream", "deadline"):
+                with self.subTest(failure=failure, mode=mode):
+                    legacy = self.root / (failure + "-" + mode)
+                    payload = self.top.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                    self.device.cache.write_bytes(payload)
+                    def mutate(command):
+                        if "; sh " not in command:
+                            return
+                        if failure == "hash":
+                            self.device.cache.write_bytes(b"changed before execution")
+                        else:
+                            legacy.mkdir()
+                            (legacy / "current").write_text("old task")
+                    self.device.before_shell = mutate
+                    output = io.BytesIO() if mode == "stream" else None
+                    deadline = time.monotonic() + 10 if mode == "deadline" else None
+                    with patch("perf_top_capture.LEGACY_ROOT", str(legacy)), self.adb.device("device-1"):
+                        with self.assertRaises(AdbError):
+                            self.top._command("device-1", "status", output=output, deadline=deadline)
+                    if output is not None:
+                        self.assertEqual(output.getvalue(), b"")
+                    self.assertFalse(self.device.commands)
+
+    def test_warm_poll_skips_preflight_but_rechecks_guard_for_each_device(self):
+        for serial, expected_calls in (("device-1", 2), ("device-2", 2), ("device-1", 1)):
+            self.adb.shell.reset_mock()
+            self.assertTrue(self.top.status(serial)["connected"])
+            self.assertEqual(self.adb.shell.call_count, expected_calls)
+            for call in self.adb.shell.call_args_list:
+                self.assertTrue(call.kwargs["via_stdin"])
+            execution = self.adb.shell.call_args.args[1]
+            self.assertIn("legacy_safe;", execution)
+            self.assertIn("verify_script", execution)
+            self.assertIn("SHA256 工具输出无效", execution)
+        self.adb.run.assert_not_called()
+
+    def test_warm_guard_failure_evicts_hint_without_replaying_action(self):
+        for failure in ("hash", "legacy", "version", "missing"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                self.top.status("device-1")
+                original = self.device.cache.read_bytes()
+                if failure == "hash":
+                    self.device.cache.write_bytes(b"tampered")
+                elif failure == "legacy":
+                    self.device.legacy.mkdir()
+                    (self.device.legacy / "current").write_text("old task")
+                elif failure == "version":
+                    self.device.version = "unknown toybox"
+                else:
+                    self.device.cache.rename(self.root / "saved-cache")
+                before = list(self.device.commands)
+                self.adb.shell.reset_mock()
+                with self.adb.device("device-1"), self.assertRaises(AdbError):
+                    self.top._command("device-1", "status")
+                self.assertEqual(self.adb.shell.call_count, 1)
+                self.assertFalse(self.top._deployments)
+                self.assertEqual(self.device.commands, before)
+                self.adb.run.assert_not_called()
+                if failure == "hash":
+                    self.assertEqual(self.device.cache.read_bytes(), b"tampered")
+                if failure == "missing":
+                    self.assertTrue(self.top.status("device-1")["connected"])
+                    self.assertEqual(self.device.cache.read_bytes(), original)
+
+    def test_updated_script_gets_new_deployment_without_overwriting_worker(self):
+        self.top.status("device-1")
+        original = self.device.cache.read_bytes()
+        updated = original + b"\n# changed version\n"
+        source = self.root / "updated.sh"
+        source.write_bytes(updated)
+        self.top.script = source
+        self.adb.shell.reset_mock()
+        self.assertTrue(self.top.status("device-1")["connected"])
+        self.assertEqual(self.adb.shell.call_count, 3)
+        self.assertEqual(self.device.cache.read_bytes(), original)
+        new_cache = self.device.remote / ("control-" + hashlib.sha256(updated).hexdigest() + ".sh")
+        self.assertEqual(new_cache.read_bytes(), updated)
+        self.adb.shell.reset_mock()
+        self.top.status("device-1")
+        self.adb.shell.assert_called_once()
+
+    def test_reconnect_does_not_trust_warm_hint_or_replay_failed_action(self):
+        self.top.status("device-1")
+        self.adb.shell.side_effect = AdbError("transport disconnected", 502)
+        with self.adb.device("device-1"), self.assertRaises(AdbError):
+            self.top._command("device-1", "status")
+        self.assertFalse(self.top._deployments)
+        self.adb.shell.side_effect = self.device.shell
+        self.adb.shell.reset_mock()
+        self.assertTrue(self.top.status("device-1")["connected"])
+        self.assertEqual(self.adb.shell.call_count, 2)
+        # A disconnect/reconnect invisible to the host still gets full guards.
+        self.device.cache.write_bytes(b"replaced while disconnected")
+        with self.adb.device("device-1"), self.assertRaises(AdbError):
+            self.top._command("device-1", "status")
+        self.adb.run.assert_not_called()
+
+    def test_stdin_transport_has_short_argv_for_normal_stream_and_deadline(self):
+        # Exercise the real AdbController.shell wrapper, not just its mock.
+        self.adb.shell.side_effect = lambda *args, **kwargs: AdbController.shell(self.adb, *args, **kwargs)
+        identity = self.finished()
+        for mode in ("normal", "stream", "deadline"):
+            with self.subTest(mode=mode):
+                self.adb.run.reset_mock()
+                output = io.BytesIO() if mode == "stream" else None
+                deadline = time.monotonic() + 5 if mode == "deadline" else None
+                with self.adb.device("device-1"):
+                    self.top._command("device-1", "pull" if output else "status",
+                                      *([identity] if output else []), output=output, deadline=deadline)
+                self.adb.run.assert_called_once()
+                call = self.adb.run.call_args
+                self.assertEqual(call.args, ("-s", "device-1", "shell", "-T", "sh -s"))
+                self.assertIn(b"verify_script", call.kwargs["input_data"])
+                if output is not None:
+                    self.assertEqual(output.getvalue(), RAW)
+                if deadline is not None:
+                    self.assertGreater(call.kwargs["timeout"], 0)
+                    self.assertLessEqual(call.kwargs["timeout"], 5)
+
+    def test_mutation_applied_before_disconnect_is_not_replayed(self):
+        for action in ("start", "stop", "clear"):
+            with self.subTest(action=action):
+                self.setUp()
+                identity = self.finished()
+                original = self.device.action
+                def disconnected(serial, args, output=None):
+                    result = original(serial, args, output)
+                    if args[0] == action:
+                        raise AdbError("disconnected after action took effect", 502)
+                    return result
+                args = ("f" * 32, 10, 1, "title") if action == "start" else (identity,)
+                before = len(self.device.commands)
+                with patch.object(self.device, "action", side_effect=disconnected), self.adb.device("device-1"):
+                    with self.assertRaises(AdbError):
+                        self.top._command("device-1", action, *args)
+                self.assertEqual(len(self.device.commands), before + 1)
+                self.assertFalse(self.top._deployments)
+                if action == "start":
+                    self.assertEqual(self.device.jobs["device-1"][0], "f" * 32)
+                elif action == "stop":
+                    self.assertIn("device-1", self.device.stop_pending)
+                else:
+                    self.assertEqual(self.device.jobs["device-1"][-1], "cleaned")
+
+    def test_deployment_check_unknown_response_does_not_upload(self):
+        self.adb.shell.return_value = ""
+        self.adb.shell.side_effect = None
+        self.error(502, self.top.start, "device-1")
+        self.adb.run.assert_not_called()
+        self.assertFalse(self.device.commands)
 
     def test_clear_keeps_local_archive_across_refresh_and_restart(self):
         state = self.pulled()
@@ -584,7 +1066,7 @@ class TopCaptureTests(unittest.TestCase):
         self.error(409, self.top.clear, "device-1", "f" * 32)
         self.error(400, self.top.clear, "device-1", "../outside")
         self.device.stop_delay = -1
-        with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+        with self.stop_timeout():
             self.error(504, self.top.stop, "device-1", identity)
             self.error(504, self.top.clear, "device-1", identity)
         self.adb.devices.return_value = []
@@ -594,17 +1076,20 @@ class TopCaptureTests(unittest.TestCase):
 
     def test_corrupt_protocol_and_safe_actions(self):
         identity = "c" * 32
-        self.device.jobs["device-1"] = ["corrupt", identity, "inactive", "present"]
+        self.device.jobs["device-1"] = ["corrupt", identity, "unconfirmed", "present"]
         state = self.top.status("device-1")
         self.assertTrue(state["state_corrupt"])
-        self.assertTrue(state["connected"])
-        self.assertFalse(state["running"])
+        self.assertFalse(state["connected"])
+        self.assertTrue(state["running"])
         for key in ("count", "target_count", "interval", "bytes", "remote_path"):
             self.assertIsNone(state[key])
-        self.error(409, self.top.pull, "device-1", identity)
+        with self.stop_timeout():
+            self.error(409, self.top.pull, "device-1", identity)
         self.assertFalse(any(args[0] == "pull" for _, args in self.device.commands))
-        self.assertTrue(self.top.clear("device-1", identity)["remote_cleaned"])
-        self.assertNotEqual(self.top.start("device-1")["id"], identity)
+        with self.stop_timeout():
+            self.error(504, self.top.clear, "device-1", identity)
+        self.error(409, self.top.start, "device-1")
+        self.assertFalse(any(args[0] in {"clear", "start"} for _, args in self.device.commands))
         for raw in (f"corrupt\n{identity}\nfree\npresent", "corrupt\n../x\ninactive\npresent",
                     f"corrupt\n{identity}\ninactive\npresent\nextra"):
             self.error(502, self.top._decode, "device-1", raw)
@@ -616,7 +1101,7 @@ class TopCaptureTests(unittest.TestCase):
         self.assertFalse(state["connected"])
         self.assertTrue(state["running"])
         self.error(409, self.top.start, "device-1")
-        with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+        with self.stop_timeout():
             self.error(504, self.top.stop, "device-1", identity)
             self.error(504, self.top.clear, "device-1", identity)
         actions = [args[0] for _, args in self.device.commands]
@@ -627,14 +1112,24 @@ class TopCaptureTests(unittest.TestCase):
     def test_corrupt_state_preserves_existing_local_archive_after_restart(self):
         state = self.pulled()
         identity = state["id"]
-        self.device.jobs["device-1"] = ["corrupt", identity, "inactive", "present"]
+        self.device.jobs["device-1"] = ["corrupt", identity, "unconfirmed", "present"]
         restored = self.controller()
         state = restored.status("device-1")
         self.assertTrue(state["archive"])
         self.assertIn("无法核对", state["warning"])
         self.assertNotIn("None", state["warning"])
         self.assertEqual(restored.archive_path(identity).read_bytes(), RAW)
-        restored.clear("device-1", identity)
+        self.device.commands.clear()
+        self.adb.run.reset_mock()
+        self.adb.shell.reset_mock()
+        self.adb.devices.reset_mock()
+        self.assertEqual(restored.import_capture(identity)["id"], "session-1")
+        self.adb.run.assert_not_called()
+        self.adb.shell.assert_not_called()
+        self.adb.devices.assert_not_called()
+        self.assertEqual(self.device.commands, [])
+        with self.stop_timeout():
+            self.error(504, restored.clear, "device-1", identity)
         self.assertEqual(restored.archive_path(identity).read_bytes(), RAW)
 
     def test_clear_without_local_archive_does_not_invent_one(self):
@@ -724,7 +1219,7 @@ class TopCaptureTests(unittest.TestCase):
     def test_stop_timeout_keeps_retry_available_and_never_pulls(self):
         identity = self.top.start("device-1")["id"]
         self.device.stop_delay = -1
-        with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+        with self.stop_timeout():
             self.error(504, self.top.pull, "device-1", identity)
         state = self.top.status()
         self.assertFalse(state["stopping"])
@@ -750,7 +1245,7 @@ class TopCaptureTests(unittest.TestCase):
         self.assertEqual(state["id"], identity)
         self.assertFalse(state["connected"])
         self.assertTrue(state["running"])
-        with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+        with self.stop_timeout():
             self.error(504, restarted.pull, "device-1", identity)
         self.assertTrue(any(args[0] == "stop" for _, args in self.device.commands))
         self.assertFalse(any(args[0] == "pull" for _, args in self.device.commands))
@@ -797,7 +1292,8 @@ class TopCaptureTests(unittest.TestCase):
         self.assertTrue(self.adb.run.call_args_list)
         for call in self.adb.run.call_args_list:
             self.assertGreater(call.kwargs["timeout"], 0)
-            limit = 30 if call.args[2] in {"root", "wait-for-device"} else 10
+            self.assertEqual(call.args[2], "shell")
+            limit = 10
             self.assertLessEqual(call.kwargs["timeout"], limit)
 
     def test_explicit_pull_import_and_poll_preserves_metadata(self):
@@ -859,6 +1355,16 @@ class TopCaptureTests(unittest.TestCase):
         recovered.import_capture(identity)
         self.assertEqual(self.store.import_files.call_args.args[0][0][0], name)
         self.assertEqual(path.read_bytes(), RAW)
+        self.assertFalse(hasattr(self.store.import_files.call_args.args[0][0][1],
+                                 "_capture_log_directory"))
+        real = self.controller()
+        real.store = Store(self.root / "legacy.sqlite3")
+        real.status("device-1")
+        real.import_capture(identity)
+        with real.store.connect() as db:
+            rows = db.execute("SELECT path,kind FROM storage_assets").fetchall()
+            self.assertEqual([(r["path"], r["kind"]) for r in rows], [(str(path), "file")])
+        self.assertTrue(path.with_suffix(".name.json").is_file())
 
     def test_legacy_task_fallback_filename_stays_stable_after_restart(self):
         identity = self.finished()
@@ -951,7 +1457,12 @@ class TopCaptureTests(unittest.TestCase):
     def test_failed_pull_never_publishes_and_can_retry(self):
         identity = self.finished()
         self.device.fail_pull = True
+        self.device.payload = RAW[:len(RAW) // 2]
+        before = len(self.device.commands)
         self.error(502, self.top.pull, "device-1", identity)
+        self.assertEqual(sum(args[0] == "pull" for _, args in self.device.commands[before:]), 1)
+        self.assertFalse(self.top._deployments)
+        self.store.import_files.assert_not_called()
         self.assertEqual(list(self.top.archive_root.rglob("*.txt")), [])
         self.device.fail_pull = False
         self.device.payload = b""
@@ -1167,6 +1678,54 @@ class TopCaptureTests(unittest.TestCase):
         self.error(404, self.top.archive_path)
         self.assertEqual(other.read_bytes(), RAW)
 
+    def test_real_store_tracks_complete_directories_on_duplicate(self):
+        self.top.store = Store(self.root / "store.sqlite3")
+        folders, ids = [], []
+        for _ in range(2):
+            identity = self.pulled()["id"]
+            path = self.top.archive_path(identity)
+            self.assertTrue(path.with_suffix(".name.json").is_file())
+            folders.append(str(path.parent))
+            ids.append(self.top.import_capture(identity)["id"])
+        self.assertEqual(ids[0], ids[1])
+        with self.top.store.connect() as db:
+            rows = db.execute("SELECT path,kind FROM storage_assets").fetchall()
+            self.assertEqual({(r["path"], r["kind"]) for r in rows},
+                             {(p, "directory") for p in folders})
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM session_logs").fetchone()[0], 2)
+
+    def test_deleted_session_cache_is_revalidated_under_import_lock(self):
+        self.top.store = Store(self.root / "store.sqlite3")
+        identity = self.pulled()["id"]
+        first = self.top.import_capture(identity)
+        self.import_lock.acquire()
+        try:
+            self.error(409, self.top.import_capture, identity)
+        finally:
+            self.import_lock.release()
+        # Emulate deletion with retained logs, without filesystem deletion.
+        with self.top.store.connect() as db:
+            db.execute("DELETE FROM sessions WHERE id=?", (first["id"],))
+        second = self.top.import_capture(identity)
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertFalse(second["duplicate"])
+        self.assertTrue(self.top.import_capture(identity)["duplicate"])
+        self.assertFalse(self.import_lock.locked())
+        path = self.top.archive_path(identity)
+        path.parent.rename(self.root / "removed-capture")
+        self.error(404, self.top.import_capture, identity)
+        self.assertFalse(path.parent.exists())
+        self.assertFalse(self.import_lock.locked())
+
+    def test_cached_session_lookup_failure_releases_import_lock(self):
+        identity = self.pulled()["id"]
+        self.top.import_capture(identity)
+        self.store.session.side_effect = OSError("database unavailable")
+        with self.assertRaises(OSError):
+            self.top.import_capture(identity)
+        self.assertFalse(self.import_lock.locked())
+        self.assertFalse(self.top._state["importing"])
+
     def test_import_lock_retry_and_close_wait(self):
         state = self.pulled()
         self.import_lock.acquire()
@@ -1276,6 +1835,138 @@ class TopCaptureTests(unittest.TestCase):
         self.top.pull("device-1", identity)
         self.assertEqual(pending.read_bytes(), b"existing private file")
 
+    def test_recovery_pull_after_timeout_persists_without_stop_or_overwrite(self):
+        identity = self.top.start("device-1", count=-1)["id"]
+        self.device.stop_delay = -1
+        with self.stop_timeout():
+            self.error(504, self.top.pull, "device-1", identity)
+        self.device.commands.clear()
+        state = self.top.pull("device-1", identity, allow_unconfirmed=True)
+        self.assertTrue(state["running"])
+        self.assertEqual(state["bytes"], 0)
+        self.assertIn(RECOVERY_WARNING, state["warning"])
+        self.assertEqual([args[0] for _, args in self.device.commands],
+                         ["status", "pull-live", "status"])
+        path = self.top.archive_path(identity)
+        self.assertEqual(path.read_bytes(), RAW)
+        self.assertIs(json.loads(path.with_suffix(".warning.json").read_text())["recovery"], True)
+        self.store.import_files.assert_not_called()
+        restarted = self.controller()
+        self.assertEqual(restarted.status("device-1")["warning"], state["warning"])
+        self.device.payload = RAW + b"new sample"
+        self.device.commands.clear()
+        restarted.pull("device-1", identity, allow_unconfirmed=True)
+        self.assertNotIn("pull-live", [args[0] for _, args in self.device.commands])
+        self.assertEqual(path.read_bytes(), RAW)
+        self.assertEqual(restarted.import_capture(identity)["id"], "session-1")
+        self.store.import_files.assert_called_once()
+
+    def test_recovery_clear_warning_survives_restart_and_later_pull(self):
+        identity = self.top.start("device-1", count=-1)["id"]
+        self.device.commands.clear()
+        state = self.top.clear("device-1", identity, allow_unconfirmed=True)
+        self.assertEqual([args[0] for _, args in self.device.commands],
+                         ["status", "clear-live", "status"])
+        self.assertTrue(state["running"])
+        self.assertFalse(state["remote_cleaned"])
+        self.assertIn(CLEAR_WARNING, state["warning"])
+        restarted = self.controller()
+        self.assertIn(CLEAR_WARNING, restarted.status("device-1")["warning"])
+        self.assertIsNone(restarted.status()["archive"])
+        self.device.payload = RAW
+        state = restarted.pull("device-1", identity, allow_unconfirmed=True)
+        self.assertIn(CLEAR_WARNING, state["warning"])
+        self.assertIn(RECOVERY_WARNING, state["warning"])
+        self.assertIn(CLEAR_WARNING, self.controller().status("device-1")["warning"])
+
+    def test_recovery_rejects_invalid_confirmation_corruption_and_identity(self):
+        identity = self.top.start("device-1")["id"]
+        for method in (self.top.pull, self.top.clear):
+            for value in (1, "true", None):
+                with self.assertRaises(ValueError):
+                    method("device-1", identity, allow_unconfirmed=value)
+            with self.assertRaises(AdbError):
+                method("device-1", "e" * 32, allow_unconfirmed=True)
+        self.device.jobs["device-1"] = ["corrupt", identity, "unconfirmed", "present", "clear_unconfirmed"]
+        self.assertIn(CLEAR_WARNING, self.controller().status("device-1")["warning"])
+        for method in (self.top.pull, self.top.clear):
+            with self.assertRaises(AdbError) as caught:
+                method("device-1", identity, allow_unconfirmed=True)
+            self.assertEqual(caught.exception.status, 409)
+
+    def test_recovery_warning_metadata_requires_literal_flags(self):
+        path = self.root / "recovery.txt"
+        marker = path.with_suffix(".warning.json")
+        valid = dict(size=1, before=1, after=1, recovery=True, cleared=True)
+        marker.write_text(json.dumps(valid))
+        warning = self.top._saved_warning(path, 1)
+        self.assertIn(RECOVERY_WARNING, warning)
+        self.assertIn(CLEAR_WARNING, warning)
+        for key in ("recovery", "cleared"):
+            for value in (False, 1, "true", None):
+                marker.write_text(json.dumps(dict(valid, **{key: value})))
+                self.assertIsNone(self.top._saved_warning(path, 1))
+
+    def test_recovery_pull_rechecks_identity_and_state_before_publication(self):
+        identity = self.top.start("device-1")["id"]
+        original = self.device.action
+        baseline = list(self.device.jobs["device-1"])
+        for change in ("identity", "corrupt", "cleaned", "oversize"):
+            with self.subTest(change=change):
+                self.device.jobs["device-1"] = list(baseline)
+
+                def changed(serial, args, output=None):
+                    result = original(serial, args, output)
+                    if args[0] == "pull-live":
+                        if change == "identity":
+                            self.device.jobs[serial][0] = "e" * 32
+                        elif change == "corrupt":
+                            self.device.jobs[serial] = ["corrupt", identity, "unconfirmed", "present"]
+                        elif change == "cleaned":
+                            self.device.jobs[serial].append("cleaned")
+                        else:
+                            output.truncate(MAX_ARCHIVE_BYTES + 1)
+                    return result
+
+                self.device.action = changed
+                with self.assertRaises(AdbError):
+                    self.top.pull("device-1", identity, allow_unconfirmed=True)
+                self.assertNotIn(identity, self.top._archives)
+                self.assertFalse(list(self.top.archive_root.rglob("*.txt")))
+        self.store.import_files.assert_not_called()
+
+    def test_recovery_empty_or_failed_transfer_never_publishes(self):
+        identity = self.top.start("device-1")["id"]
+        for payload, failure in ((b"", False), (RAW, True)):
+            self.device.payload, self.device.fail_pull = payload, failure
+            with self.assertRaises(AdbError):
+                self.top.pull("device-1", identity, allow_unconfirmed=True)
+            self.error(409, self.top.archive_path)
+            self.assertNotIn(identity, self.top._archives)
+        self.assertFalse(list(self.top.archive_root.rglob("*.txt")))
+
+    def test_api_recovery_requires_strict_opt_in_and_skips_stop(self):
+        identity = self.top.start("device-1", count=-1)["id"]
+        self.device.stop_delay = -1
+        with patch("perf_api.TopCapture", return_value=self.top):
+            app = create_app(self.root / "api-recovery.sqlite3")
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            client.headers.update({"X-Session-Token": client.get("/api/token").json()["token"]})
+            task = {"confirm": True, "serial": "device-1", "capture_id": identity}
+            for operation in ("pull", "clear"):
+                url = "/api/top/" + operation
+                for invalid in (1, "true", None):
+                    self.assertEqual(client.post(url, json=dict(task, allow_unconfirmed=invalid)).status_code, 422)
+                with self.stop_timeout():
+                    self.assertEqual(client.post(url, json=task).status_code, 504)
+                self.device.commands.clear()
+                response = client.post(url, json=dict(task, allow_unconfirmed=True))
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(response.json()["running"])
+                self.assertNotIn("stop", [args[0] for _, args in self.device.commands])
+            self.assertEqual(client.post("/api/top/stop", json=dict(task, allow_unconfirmed=True)).status_code, 422)
+            self.store.import_files.assert_not_called()
+
     def test_api_protocol_auth_confirmation_and_explicit_pull(self):
         with patch("perf_api.TopCapture", return_value=self.top):
             app = create_app(self.root / "api.sqlite3")
@@ -1302,7 +1993,7 @@ class TopCaptureTests(unittest.TestCase):
                     self.assertEqual(client.post(url, json=invalid).status_code, 422)
                 self.assertEqual(client.post(url, json=dict(task, capture_id="f" * 32)).status_code, 409)
             self.device.stop_delay = -1
-            with patch("perf_top_capture.STOP_TIMEOUT_SECONDS", 0.01):
+            with self.stop_timeout():
                 self.assertEqual(client.post("/api/top/clear", json=task).status_code, 504)
                 self.assertFalse(any(args[0] == "clear" for _, args in self.device.commands))
                 self.assertEqual(client.post("/api/top/pull", json=task).status_code, 504)
@@ -1371,15 +2062,19 @@ class DeviceScriptTests(unittest.TestCase):
         import sys
         self.command("truncate", shlex.quote(sys.executable) +
                      ' -c \'import sys; f=open(sys.argv[2], "a+b"); f.truncate(int(sys.argv[1])); f.close()\' "$2" "$3"')
-        # Real POSIX advisory locking on inherited descriptors, also on macOS.
-        self.command("flock", shlex.quote(sys.executable) +
-                     ' -c \'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)\' "$2"')
+        # Any accidental reintroduction of flock must fail even on this host.
+        self.command("flock", 'echo "flock must not be used" >&2; exit 99')
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
-                        TOP_FIXTURE=str(self.fixture), WORKER_LOCK=str(self.job / "worker.lock"))
+                        TOP_FIXTURE=str(self.fixture), JOB=str(self.job))
         self.proc = self.root / "proc"
         (self.proc / "1" / "fd").mkdir(parents=True)
         (self.proc / "1" / "cmdline").write_bytes(b"init\0")
         (self.proc / "mounts").write_text(f"proc {self.proc} proc rw 0 0\n")
+        self.boot_id = "12345678-1234-1234-1234-123456789abc"
+        self.other_boot = "abcdef12-abcd-abcd-abcd-abcdef123456"
+        self.boot_path = self.proc / "sys/kernel/random/boot_id"
+        self.boot_path.parent.mkdir(parents=True)
+        self.boot_path.write_text(self.boot_id + "\n")
         self.proc_stat(1)
         (self.proc / "self").symlink_to("99999")
         # macOS readlink does not offer Android's multi-operand contract.
@@ -1387,8 +2082,8 @@ class DeviceScriptTests(unittest.TestCase):
             "import os,sys\nrc=0\nfor p in sys.argv[1:]:\n"
             " try: print(os.readlink(p))\n except OSError: rc=1\nsys.exit(rc)"
         ) + ' "$@"')
-        self.command("readlink", 'case "$1" in /proc/*/fd/0) echo "$WORKER_LOCK";; '
-                     '/proc/*/fd/[12]) echo /dev/null;; *) ' + self.batch_readlink + ';; esac')
+        self.command("readlink", 'case "$1" in /proc/*/fd/[012]) echo /dev/null;; '
+                     '*) ' + self.batch_readlink + ';; esac')
 
     def proc_stat(self, pid, start=100):
         path = self.proc / str(pid)
@@ -1403,30 +2098,35 @@ class DeviceScriptTests(unittest.TestCase):
         path.chmod(0o700)
 
     def write_script(self, limit=MAX_ARCHIVE_BYTES):
-        # macOS /dev/fd reports devfs inodes, unlike Linux /proc descriptors.
-        # Compare the actual inherited fd via fstat rather than mocking identity.
-        import sys
-        self.command("same_stdin", shlex.quote(sys.executable) + " -c " + shlex.quote(
-            "import os,sys; a=os.stat(sys.argv[1]); b=os.fstat(0); "
-            "sys.exit((a.st_dev,a.st_ino)!=(b.st_dev,b.st_ino))"
-        ) + ' "$1"')
-        self.script.write_text(self.source.replace("ROOT=" + REMOTE_ROOT,
-                               "ROOT=" +shlex.quote(str(self.root))).replace(
-                                   "MAX_BYTES=1000000000", "MAX_BYTES=" + str(limit)).replace(
-                                       "PROC=/proc", "PROC=" + shlex.quote(str(self.proc))).replace(
-                                           '[ "$DIR/worker.lock" -ef /proc/$$/fd/0 ]',
-                                           'same_stdin "$DIR/worker.lock"').replace(
-                                               '[ "$DIR/worker.lock" -ef /proc/self/fd/0 ]',
-                                               'same_stdin "$DIR/worker.lock"'))
+        import re
+        self.script.write_text(re.sub(r"^ROOT=.*$", "ROOT=" + shlex.quote(str(self.root)),
+                self.source, count=1, flags=re.MULTILINE).replace(
+            "MAX_BYTES=1000000000", "MAX_BYTES=" + str(limit)).replace(
+            "PROC=/proc", "PROC=" + shlex.quote(str(self.proc))))
+
+    def prepare_worker(self, target=1, interval=1):
+        """Model launch publication without recycling a permanent claim."""
+        if (self.job / "worker.claim").exists() or (self.job / "done").exists():
+            self.identity = format(int(self.identity, 16) + 1, "032x")
+            self.job = self.root / self.identity
+            self.job.mkdir()
+        self.env["JOB"] = str(self.job)
+        (self.job / "boot").write_text(self.identity + "\n" + self.boot_id + "\n")
+        (self.root / "current").write_text(self.identity)
+        fields = [self.identity, "starting", "0", str(target), str(interval),
+                  "0", "none", "", "100", "0"]
+        (self.job / "state").write_text("\n".join(fields) + "\n")
 
     def worker(self, limit=MAX_ARCHIVE_BYTES, target=1, interval=1):
-        (self.job / "worker.lock").touch()
+        self.prepare_worker(target, interval)
         self.write_script(limit)
         result = subprocess.run(["sh", str(self.script), "worker", self.identity,
                                  str(target), str(interval), ""], env=self.env,
                                 capture_output=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.job / "done").read_text().strip(), self.identity)
+        self.assertTrue((self.job / "worker.claim").is_dir())
+        self.assertFalse((self.job / "worker.lock").exists())
         return (self.job / "state").read_text().splitlines()
 
     def simulated_timing(self, sample_ms=650, append_ms=150):
@@ -1553,14 +2253,13 @@ class DeviceScriptTests(unittest.TestCase):
     def prepare_clear(self):
         self.worker()
         (self.root / "current").write_text(self.identity)
-        # Exercise the lock call contract on macOS; native flock is Android-only.
-        self.command("flock", '[ "$1" = -n ] && [ "$2" = 0 ]')
 
     def test_launch_creates_timestamp_named_archive(self):
         self.write_script()
         identity = "e" * 32
         job = self.root / identity
         self.command("timeout", 'sleep 1; exit 124')
+        self.command("setsid", 'exec "$@"')
         self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
         result = self.shell("launch", identity, "1", "1", "")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1588,15 +2287,22 @@ class DeviceScriptTests(unittest.TestCase):
         self.assertEqual(archive.stat().st_size, 0)
         self.assertEqual((self.job / "archive_name").read_text(), name + "\n")
 
-    def test_timestamp_archive_recovery_truncates_partial_sample(self):
+    def test_timestamp_archive_orphan_preserves_partial_sample(self):
         self.orphan()
         name = "Top20261009123456.txt"
         (self.job / "raw.txt").rename(self.job / name)
         (self.job / "archive_name").write_text(name + "\n")
         status = self.shell("status")
         self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertEqual((self.job / name).read_bytes(), RAW)
+        self.assertEqual((self.job / name).read_bytes(), RAW + b"partial uncommitted sample")
+        self.assert_pending_receipt(status)
         self.assertIn("archive=" + name, status.stdout.splitlines())
+        state = (self.job / "state").read_bytes()
+        for mode in ("pull", "clear"):
+            self.assertNotEqual(self.shell(mode, self.identity).returncode, 0)
+        self.assertEqual((self.job / "state").read_bytes(), state)
+        self.assertEqual((self.job / name).read_bytes(), RAW + b"partial uncommitted sample")
+        self.assertFalse((self.job / "done").exists())
 
     def test_archive_name_rejects_traversal_and_symlinks(self):
         self.prepare_clear()
@@ -1617,6 +2323,7 @@ class DeviceScriptTests(unittest.TestCase):
         for name in ("raw.txt", "sample", "header", "state", "done"):
             content = (self.job / name).read_bytes().replace(self.identity.encode(), b"a" * 32)
             (historical / name).write_bytes(content)
+        (historical / "worker.claim").mkdir()
         untouched = self.root / "sysmonitor.log"
         untouched.write_bytes(b"keep sysmonitor")
         control = self.script.read_bytes()
@@ -1650,48 +2357,80 @@ class DeviceScriptTests(unittest.TestCase):
         (self.job / "state").write_text(state.replace("completed", "running"))
         self.assertNotEqual(self.clear_command().returncode, 0)
         (self.job / "state").write_text(state)
-        self.command("flock", "exit 1")
+        (self.root / "control.busy").mkdir()
         self.assertNotEqual(self.clear_command().returncode, 0)
-        self.command("flock", "exit 0")
+        (self.root / "control.busy").rename(self.root / "checked-control")
         (self.job / "cleaned").symlink_to(self.fixture)
         self.assertNotEqual(self.clear_command().returncode, 0)
         self.assertEqual((self.job / "raw.txt").read_bytes(), original)
         self.assertEqual(self.fixture.read_bytes(), TOP)
 
     def test_clear_rejects_unsafe_or_unfinished_historical_tasks(self):
-        for kind in ("symlink", "unfinished", "linked_archive"):
+        self.prepare_clear()
+        valid = self.root / ("a" * 32)
+        valid.mkdir()
+        names = ("raw.txt", "sample", "header", "state", "done")
+        for name in names:
+            (valid / name).write_bytes((self.job / name).read_bytes().replace(
+                self.identity.encode(), valid.name.encode()))
+        (valid / "worker.claim").mkdir()
+        # This valid task sorts before the invalid historical task: no task may
+        # be partially cleared before the entire preflight has succeeded.
+        before = {(job, name): (job / name).read_bytes()
+                  for job in (valid, self.job) for name in names}
+        for kind in ("symlink", "unfinished", "linked_archive", "corrupt_state",
+                     "missing_done", "wrong_done", "linked_done"):
             with self.subTest(kind=kind):
-                self.prepare_clear()
-                original = (self.job / "raw.txt").read_bytes()
-                other = self.root / ({"symlink": "a", "unfinished": "b", "linked_archive": "c"}[kind] * 32)
+                other = self.root / ("b" * 32)
                 if kind == "symlink":
                     other.symlink_to(self.job, target_is_directory=True)
                 else:
                     other.mkdir()
+                    (other / "worker.claim").mkdir()
+                    for name in names:
+                        if name == "done" and kind in ("missing_done", "linked_done"):
+                            continue
+                        if name == "raw.txt" and kind == "linked_archive":
+                            continue
+                        data = (self.job / name).read_bytes().replace(
+                            self.identity.encode(), other.name.encode())
+                        if name == "state" and kind == "unfinished":
+                            data = data.replace(b"completed", b"running")
+                        elif name == "state" and kind == "corrupt_state":
+                            data = b"damaged metadata\n"
+                        elif name == "done" and kind == "wrong_done":
+                            data = b"f" * 32 + b"\n"
+                        (other / name).write_bytes(data)
                     if kind == "linked_archive":
                         (other / "raw.txt").symlink_to(self.fixture)
+                    elif kind == "linked_done":
+                        (other / "done").symlink_to(self.job / "done")
+                invalid_before = {p.name: p.read_bytes() for p in other.iterdir()
+                                  if p.is_file()}
                 self.assertNotEqual(self.clear_command().returncode, 0)
-                self.assertEqual((self.job / "raw.txt").read_bytes(), original)
+                for (job, name), data in before.items():
+                    self.assertEqual((job / name).read_bytes(), data)
+                    self.assertFalse((job / "cleaned").exists())
+                self.assertEqual({p.name: p.read_bytes() for p in other.iterdir()
+                                  if p.is_file()}, invalid_before)
+                self.assertFalse((other / "cleaned").exists())
                 self.assertEqual(self.fixture.read_bytes(), TOP)
-                # Retain fixtures without leaving them in the task-ID namespace.
                 other.rename(self.root / (kind + "-checked"))
 
     def shell(self, mode, *args):
         return subprocess.run(["sh", str(self.script), mode, *args], env=self.env,
                               capture_output=True, text=True, timeout=4)
 
-    def orphan(self, legacy=False, lines=10, status="running"):
+    def orphan(self, lines=10, status="running"):
         self.write_script()
         (self.root / "current").write_text(self.identity)
         fields = [self.identity, status, "1", "-1", "1", str(len(RAW)),
                   "none", "", "100", "0"]
         (self.job / "state").write_text("\n".join(fields[:lines]) + "\n")
         (self.job / "raw.txt").write_bytes(RAW + b"partial uncommitted sample")
-        if not legacy:
-            (self.job / "worker.lock").touch()
 
     def reject_worker_entry(self, *flags, stdin=None):
-        paths = [self.job / name for name in ("raw.txt", "state", "done")]
+        paths = [self.job / name for name in ("raw.txt", "state", "done", "ready", "sample", "header", "state.new")]
         before = {p: p.read_bytes() if p.exists() else None for p in paths}
         result = subprocess.run(["sh", str(self.script), "worker", self.identity,
                                  "1", "1", "", *flags], env=self.env, stdin=stdin,
@@ -1699,19 +2438,313 @@ class DeviceScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr)
         for path, content in before.items():
             self.assertEqual(path.read_bytes() if path.exists() else None, content)
-        for name in ("ready", "sample", "header", "state.new"):
-            self.assertFalse((self.job / name).exists(), name)
+
+    def record_boot(self, value=None):
+        (self.job / "boot").write_text(self.identity + "\n" + (value or self.boot_id) + "\n")
+
+    def test_live_clear_only_truncates_current_logs_and_never_unlocks(self):
+        self.orphan()
+        self.record_boot()
+        (self.job / "worker.claim").mkdir()
+        for name in ("sample", "header"):
+            (self.job / name).write_bytes(b"partial")
+        history = self.root / ("e" * 32)
+        history.mkdir()
+        (history / "raw.txt").write_bytes(RAW)
+        metadata = {name: (self.job / name).read_bytes() for name in ("state", "boot")}
+        result = self.shell("clear-live", self.identity)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("raw.txt", "sample", "header"):
+            self.assertEqual((self.job / name).read_bytes(), b"")
+        self.assertEqual((history / "raw.txt").read_bytes(), RAW)
+        for name, data in metadata.items():
+            self.assertEqual((self.job / name).read_bytes(), data)
+        self.assertTrue((self.job / "worker.claim").is_dir())
+        self.assertTrue((self.job / "clear_unconfirmed").is_file())
+        self.assertFalse((self.job / "done").exists())
+        self.assertFalse((self.job / "cleaned").exists())
+        status = self.shell("status")
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", status.stdout)
+        self.assertTrue(decoded["running"])
+        self.assertIn(CLEAR_WARNING, decoded["warning"])
+        self.assertNotEqual(self.shell("launch", "f" * 32, "1", "1", "").returncode, 0)
+        # A previously deployed worker can still publish an old-style receipt.
+        fields = metadata["state"].decode().splitlines()
+        fields[1] = "completed"
+        (self.job / "state").write_text("\n".join(fields) + "\n")
+        (self.job / "done").write_text(self.identity + "\n")
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", self.shell("status").stdout)
+        self.assertTrue(decoded["running"])
+        self.assertNotEqual(self.shell("launch", "f" * 32, "1", "1", "").returncode, 0)
+        self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+
+    def test_live_operations_reject_unsafe_files_identity_and_busy_locks(self):
+        self.orphan()
+        archive = (self.job / "raw.txt").read_bytes()
+        for operation in ("pull-live", "clear-live"):
+            self.assertNotEqual(self.shell(operation, "f" * 32).returncode, 0)
+        for name in ("control.busy", "commit.busy"):
+            lock = (self.root if name == "control.busy" else self.job) / name
+            lock.mkdir()
+            operations = ("pull-live", "clear-live") if name == "control.busy" else ("clear-live",)
+            for operation in operations:
+                self.assertNotEqual(self.shell(operation, self.identity).returncode, 0)
+                self.assertTrue(lock.is_dir())
+            lock.rename(lock.with_name("checked-" + name))
+        for name in ("raw.txt", "sample", "header", "clear_unconfirmed"):
+            path = self.job / name
+            saved = path.with_name("saved-" + name)
+            if path.exists():
+                path.rename(saved)
+            for kind in ("link", "directory"):
+                if kind == "link":
+                    path.symlink_to(self.fixture)
+                else:
+                    path.mkdir()
+                operations = ("pull-live", "clear-live") if name == "raw.txt" else ("clear-live",)
+                for operation in operations:
+                    self.assertNotEqual(self.shell(operation, self.identity).returncode, 0)
+                path.rename(path.with_name(kind + "-" + name))
+            if saved.exists():
+                saved.rename(path)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+        self.assertEqual(self.fixture.read_bytes(), TOP)
+        self.assertFalse((self.job / "clear_unconfirmed").exists())
+
+    def test_live_pull_rejects_oversize_and_read_failures(self):
+        self.orphan()
+        archive = (self.job / "raw.txt").read_bytes()
+        self.write_script(limit=len(archive) - 1)
+        self.assertNotEqual(self.shell("pull-live", self.identity).returncode, 0)
+        self.write_script()
+        reader = ("import sys; from pathlib import Path; p=Path(sys.argv[3]); "
+                  "sys.exit(7) if p.name == 'raw.txt' else None; "
+                  "sys.stdout.buffer.write(p.open('rb').read(int(sys.argv[2])))")
+        self.command("head", shlex.quote(sys.executable) + " -c " + shlex.quote(reader) + ' "$@"')
+        self.assertNotEqual(self.shell("pull-live", self.identity).returncode, 0)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+
+    def test_live_clear_partial_failure_marks_before_truncating(self):
+        self.orphan()
+        (self.job / "sample").write_bytes(b"keep")
+        original = (self.bin / "truncate").read_text().splitlines()[1]
+        self.command("truncate", '[ -f "$JOB/clear_unconfirmed" ] || exit 88; '
+                     '[ -d "$JOB/commit.busy" ] || exit 89; '
+                     'case "$3" in */sample) exit 1;; esac; ' + original)
+        result = self.shell("clear-live", self.identity)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), b"")
+        self.assertEqual((self.job / "sample").read_bytes(), b"keep")
+        self.assertTrue((self.job / "clear_unconfirmed").exists())
+        self.assertFalse((self.job / "commit.busy").exists())
+        self.assertFalse((self.root / "control.busy").exists())
+        (self.job / "state").write_text("broken\n")
+        status = self.shell("status")
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", status.stdout)
+        self.assertTrue(decoded["state_corrupt"])
+        self.assertIn(CLEAR_WARNING, decoded["warning"])
+
+    def test_finish_and_live_clear_are_serialized_in_both_orders(self):
+        for first in ("clear", "finish"):
+            with self.subTest(first=first):
+                self.prepare_worker()
+                entered = self.root / (first + "-entered")
+                resume = self.root / (first + "-resume")
+                gate = ("from pathlib import Path; import time; "
+                        f"Path({str(entered)!r}).touch(); deadline=time.monotonic()+5\n"
+                        f"while not Path({str(resume)!r}).exists():\n"
+                        " if time.monotonic()>deadline: raise SystemExit(77)\n"
+                        " time.sleep(0.01)\n")
+                self.command("test_gate", shlex.quote(sys.executable) + " -c " + shlex.quote(gate))
+                original = self.source
+                anchor = "    commit_lock\n    trap release_commit EXIT"
+                replacement = ("    test_gate || exit 77\n" + anchor if first == "clear" else
+                               anchor + "\n    test_gate || exit 77")
+                self.source = original.replace(anchor, replacement, 1)
+                self.write_script()
+                self.source = original
+                process = subprocess.Popen(["sh", str(self.script), "worker", self.identity,
+                    "1", "1", ""], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 4
+                    while not entered.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(entered.exists(), "worker did not reach terminal publication gate")
+                    before = (self.job / "raw.txt").read_bytes()
+                    result = self.shell("clear-live", self.identity)
+                    if first == "clear":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertTrue((self.job / "commit.busy").is_dir())
+                        self.assertFalse((self.job / "clear_unconfirmed").exists())
+                        self.assertEqual((self.job / "raw.txt").read_bytes(), before)
+                finally:
+                    resume.touch()
+                    output, error = process.communicate(timeout=8)
+                if first == "clear":
+                    self.assertNotEqual(process.returncode, 0, error)
+                    self.assertFalse((self.job / "done").exists())
+                else:
+                    self.assertEqual(process.returncode, 0, error)
+                    self.assertTrue((self.job / "done").exists())
+                    self.assertEqual(self.shell("clear-live", self.identity).returncode, 0)
+                self.assertEqual((self.job / "raw.txt").read_bytes(), b"")
+                self.assertTrue((self.job / "worker.claim").is_dir())
+                self.assertFalse((self.job / "commit.busy").exists())
+                decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", self.shell("status").stdout)
+                self.assertTrue(decoded["running"])
+                self.assertIn(CLEAR_WARNING, decoded["warning"])
+
+    def test_live_pull_is_bounded_to_initial_length_during_growth(self):
+        self.orphan()
+        archive = (self.job / "raw.txt").read_bytes()
+        reader = ("import sys; from pathlib import Path; p=Path(sys.argv[3]); "
+                  "p.open('ab').write(b'growing') if p.name == 'raw.txt' else None; "
+                  "sys.stdout.buffer.write(p.open('rb').read(int(sys.argv[2])))")
+        self.command("head", shlex.quote(sys.executable) + " -c " + shlex.quote(reader) + ' "$@"')
+        result = self.shell("pull-live", self.identity)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.encode(), archive)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), archive + b"growing")
+        self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+
+    def test_reboot_status_is_read_only_and_pull_keeps_uncommitted_tail(self):
+        self.orphan()
+        self.record_boot()
+        before = {p.name: p.read_bytes() for p in self.job.iterdir() if p.is_file()}
+        self.assertNotIn("rebooted", self.shell("status").stdout.splitlines())
+        self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+        self.boot_path.write_text(self.other_boot + "\n")
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(status.stdout.splitlines()[-1], "rebooted")
+        self.assertEqual(status.stdout.splitlines()[1], "running")
+        self.assertEqual({p.name: p.read_bytes() for p in self.job.iterdir() if p.is_file()}, before)
+        pulled = self.shell("pull", self.identity)
+        self.assertEqual(pulled.returncode, 0, pulled.stderr)
+        self.assertEqual(pulled.stdout.encode(), before["raw.txt"])
+        self.assertFalse((self.job / "done").exists())
+        self.assertFalse((self.job / "cleaned").exists())
+        self.assertEqual((self.job / "state").read_bytes(), before["state"])
+        cleared = self.shell("clear", self.identity)
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual((self.job / "raw.txt").stat().st_size, 0)
+        self.assertTrue((self.job / "cleaned").exists())
+        self.assertFalse((self.job / "done").exists())
+        self.assertEqual((self.job / "state").read_bytes(), before["state"])
+
+    def test_boot_metadata_missing_invalid_or_symlink_is_not_reboot_proof(self):
+        self.orphan()
+        self.boot_path.write_text(self.other_boot + "\n")
+        boot = self.job / "boot"
+        good = self.identity + "\n" + self.boot_id + "\n"
+        values = [None, good[:-1], good + "x", "e" * 32 + good[32:],
+                  good.replace(self.boot_id, self.boot_id.upper()), good.replace("-", "x", 1)]
+        for index, value in enumerate(values):
+            with self.subTest(value=value):
+                if value is not None:
+                    boot.write_text(value)
+                self.assertNotIn("rebooted", self.shell("status").stdout.splitlines())
+                self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+                self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+                self.assertFalse((self.job / "done").exists())
+                self.assertEqual((self.job / "raw.txt").read_bytes(), RAW + b"partial uncommitted sample")
+                if value is not None:
+                    boot.rename(self.root / f"invalid-boot-{index}")
+        target = self.root / "boot-target"
+        target.write_text(good)
+        boot.symlink_to(target)
+        self.assertNotIn("rebooted", self.shell("status").stdout.splitlines())
+        self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+        self.assertEqual(target.read_text(), good)
+
+    def test_live_boot_missing_invalid_or_symlink_blocks_recovery_and_launch(self):
+        self.orphan()
+        self.record_boot()
+        saved = self.boot_path.with_name("saved")
+        self.boot_path.rename(saved)
+        for value in (None, "invalid", self.other_boot.upper(), self.other_boot + "extra"):
+            with self.subTest(value=value):
+                if value is not None:
+                    self.boot_path.write_text(value + "\n")
+                self.assertNotIn("rebooted", self.shell("status").stdout.splitlines())
+                self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+                self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+                self.assertFalse((self.root / ("e" * 32)).exists())
+        self.boot_path.rename(self.boot_path.with_name("invalid"))
+        self.boot_path.symlink_to(saved)
+        self.assertNotIn("rebooted", self.shell("status").stdout.splitlines())
+        # No previous task: boot validation itself must reject launch.
+        (self.root / "current").rename(self.root / "saved-current")
+        self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+        self.assertFalse((self.root / ("e" * 32)).exists())
+
+    def test_worker_rejects_changed_or_missing_boot_before_claim(self):
+        self.prepare_worker()
+        self.write_script()
+        self.boot_path.write_text(self.other_boot + "\n")
+        self.reject_worker_entry()
+        self.assertFalse((self.job / "worker.claim").exists())
+        self.boot_path.write_text(self.boot_id + "\n")
+        (self.job / "boot").rename(self.job / "saved-boot")
+        self.reject_worker_entry()
+        self.assertFalse((self.job / "worker.claim").exists())
+
+    def test_reboot_does_not_bypass_control_lock_or_missing_terminal_receipt(self):
+        self.orphan()
+        self.record_boot()
+        self.boot_path.write_text(self.other_boot + "\n")
+        busy = self.root / "control.busy"
+        busy.mkdir()
+        (busy / "owner").write_text("preserve")
+        status = self.shell("status")
+        self.assertEqual(status.stdout.splitlines()[-2:], ["rebooted", "control_busy"])
+        for action in ("stop", "pull", "clear"):
+            self.assertNotEqual(self.shell(action, self.identity).returncode, 0)
+            self.assertEqual((busy / "owner").read_text(), "preserve")
+        busy.rename(self.root / "retained-lock")
+        self.orphan(status="completed")
+        status = self.shell("status")
+        self.assertIn("unconfirmed", status.stdout.splitlines())
+        self.assertNotIn("rebooted", status.stdout.splitlines())
+        self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+        (self.job / "done").write_text(self.identity + "\n")
+        status = self.shell("status")
+        self.assertNotIn("unconfirmed", status.stdout.splitlines())
+        self.assertNotIn("rebooted", status.stdout.splitlines())
+        self.assertEqual(self.shell("pull", self.identity).returncode, 0)
+
+    def test_launch_after_reboot_preserves_old_task_and_records_current_boot(self):
+        self.orphan()
+        self.record_boot()
+        before = {p.name: p.read_bytes() for p in self.job.iterdir() if p.is_file()}
+        identity = "e" * 32
+        job = self.root / identity
+        self.assertNotEqual(self.shell("launch", identity, "1", "1", "").returncode, 0)
+        self.assertFalse(job.exists())
+        self.boot_path.write_text(self.other_boot + "\n")
+        self.command("timeout", 'sleep 1; exit 124')
+        self.command("setsid", 'exec "$@"')
+        self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
+        result = self.shell("launch", identity, "1", "1", "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((job / "boot").read_text(), identity + "\n" + self.other_boot + "\n")
+        self.assertEqual({p.name: p.read_bytes() for p in self.job.iterdir() if p.is_file()}, before)
+        self.assertFalse((self.job / "done").exists())
+        self.assertFalse((self.job / "cleaned").exists())
 
     def test_byte_reads_work_without_head_c(self):
-        self.orphan()
+        self.worker()
+        archive = (self.job / "raw.txt").read_bytes()
         self.command("head", 'case "$1" in -c) echo "head: unsupported -c" >&2; exit 1;; esac; exec /usr/bin/head "$@"')
         status = self.shell("status")
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(status.stdout.splitlines()[0], self.identity)
-        self.assertEqual(status.stdout.splitlines()[1], "error")
+        self.assertEqual(status.stdout.splitlines()[1], "completed")
         pulled = self.shell("pull", self.identity)
         self.assertEqual(pulled.returncode, 0, pulled.stderr)
-        self.assertEqual(pulled.stdout.encode(), RAW)
+        self.assertEqual(pulled.stdout.encode(), archive)
         self.assertEqual(self.shell("clear", self.identity).returncode, 0)
 
     def test_fallback_byte_reader_preserves_block_boundaries(self):
@@ -1727,6 +2760,119 @@ class DeviceScriptTests(unittest.TestCase):
                     env=self.env, capture_output=True, timeout=4)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, payload[:limit])
+
+    def test_status_idle_busy_and_dangling_current(self):
+        self.write_script()
+        idle = self.shell("status")
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        self.assertEqual(idle.stdout.strip(), "idle")
+        busy = self.root / "control.busy"
+        self.assertFalse(busy.exists())
+        busy.mkdir()
+        (busy / "owner").write_text("preserve")
+        result = self.shell("status")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("idle", result.stdout)
+        self.assertEqual((busy / "owner").read_text(), "preserve")
+        busy.rename(self.root / "retained-busy")
+        (self.root / "current").symlink_to(self.root / "missing")
+        result = self.shell("status")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("idle", result.stdout)
+        self.assertTrue((self.root / "current").is_symlink())
+        self.assertFalse(busy.exists())
+
+    def test_status_validates_and_prints_one_snapshot(self):
+        self.orphan()
+        original = (self.job / "state").read_text()
+        replacement = self.job / "replacement"
+        replacement.write_text("corrupt replacement\n")
+        # Replace the published state immediately after the bounded read.
+        self.command("head", 'if [ "$1" = -c ] && [ "$2" = 0 ]; then exit 0; fi\n'
+                     '/usr/bin/head "$@"; rc=$?\n'
+                     'if [ "$rc" = 0 ] && [ "$1" = -c ] && [ "$2" = 2049 ] && '
+                     '[ "$3" = "$JOB/state" ] && [ -f "$JOB/replacement" ]; then '
+                     '/bin/mv "$JOB/replacement" "$JOB/state" || exit 1; fi\nexit "$rc"')
+        result = self.shell("status")
+        self.assert_pending_receipt(result)
+        self.assertTrue(result.stdout.startswith(original))
+        self.assertEqual((self.job / "state").read_text(), "corrupt replacement\n")
+        self.assertFalse((self.root / "control.busy").exists())
+        result = self.shell("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[:3],
+                         ["corrupt", self.identity, "unconfirmed"])
+        self.assertFalse((self.root / "control.busy").exists())
+
+    def test_status_observes_retained_control_lock_without_authorizing_mutation(self):
+        self.orphan(status="completed")
+        (self.job / "done").write_text(self.identity)
+        before = {p.name: p.read_bytes() for p in self.job.iterdir()}
+        busy = self.root / "control.busy"
+        busy.mkdir()
+        (busy / "state").write_text("interrupted legacy query")
+        inode = busy.stat().st_ino
+        result = self.shell("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], "control_busy")
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout.strip())
+        self.assertEqual(decoded["count"], 1)
+        self.assertFalse(decoded["connected"])
+        self.assertTrue(decoded["running"])
+        self.assertIn("控制锁", decoded["connection_error"])
+        for mode in ("stop", "pull", "clear", "start", "launch"):
+            args = ("e" * 32, "1", "1", "") if mode in {"start", "launch"} else (self.identity,)
+            self.assertNotEqual(self.shell(mode, *args).returncode, 0)
+        self.assertEqual(busy.stat().st_ino, inode)
+        self.assertEqual((busy / "state").read_text(), "interrupted legacy query")
+        self.assertEqual({p.name: p.read_bytes() for p in self.job.iterdir()}, before)
+        self.assertEqual(list(self.root.glob("status.*")), [])
+        (self.job / "state").write_text("corrupt\n")
+        result = self.shell("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout.strip())
+        self.assertTrue(decoded["state_corrupt"])
+        self.assertTrue(decoded["running"])
+        self.assertIn("控制锁", decoded["connection_error"])
+
+    def test_interrupted_status_does_not_block_next_query_or_stop(self):
+        import signal
+        self.orphan()
+        before = (self.job / "raw.txt").read_bytes()
+        for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=sig):
+                entered = self.root / ("snapshot-entered-" + str(sig))
+                release = self.root / ("snapshot-release-" + str(sig))
+                self.command("head", 'if [ "$1" = -c ] && [ "$2" = 0 ]; then exit 0; fi\n'
+                       'if [ "$1" = -c ] && [ "$2" = 2049 ] && '
+                             '/bin/mkdir ' + shlex.quote(str(entered)) + ' 2>/dev/null; then\n'
+                             'while [ ! -f ' + shlex.quote(str(release)) + ' ]; do sleep .02; done\n'
+                             'fi\nexec /usr/bin/head "$@"')
+                process = subprocess.Popen(["sh", str(self.script), "status"], env=self.env,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           start_new_session=True)
+                try:
+                    self.wait_for_path(entered, process)
+                    self.assertFalse((self.root / "control.busy").exists())
+                    process.send_signal(sig)
+                    # Even while the first reader's child is alive, polling and
+                    # a cooperative stop request are independent of its scratch.
+                    self.assert_pending_receipt(self.shell("status"))
+                    self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+                finally:
+                    release.touch()
+                    process.wait(timeout=5)
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                self.assertNotEqual(process.returncode, 0)
+                self.assert_pending_receipt(self.shell("status"))
+                self.assertFalse((self.root / "control.busy").exists())
+                self.assertFalse((self.job / "done").exists())
+                self.assertEqual((self.job / "raw.txt").read_bytes(), before)
+                self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+                self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
 
     def test_current_accepts_only_optional_lf(self):
         self.orphan()
@@ -1764,131 +2910,259 @@ class DeviceScriptTests(unittest.TestCase):
                     self.assertFalse((self.job / "stop").exists())
                     self.assertFalse((self.job / "done").exists())
 
-    def test_worker_rejects_forged_inheritance_and_missing_lock(self):
-        self.orphan()
-        lock = self.job / "worker.lock"
-        lock.write_bytes(b"do not truncate lock")
-        for name in (os.devnull, self.fixture, self.job / "raw.txt"):
-            with self.subTest(stdin=str(name)), open(name, "rb") as stream:
-                self.reject_worker_entry("locked", stdin=stream)
-        self.assertEqual(lock.read_bytes(), b"do not truncate lock")
-        # A stale inherited descriptor must not stand in for the current inode.
-        with lock.open("rb") as inherited:
-            lock.rename(self.job / "old-lock")
-            lock.write_bytes(b"replacement")
-            self.reject_worker_entry("locked", stdin=inherited)
-            lock.rename(self.job / "replacement-lock")
-            for flags in ((), ("locked",)):
-                with self.subTest(flags=flags):
-                    self.reject_worker_entry(*flags, stdin=inherited)
-                    self.assertFalse(lock.exists())
-        # Preserve an existing completion marker as well, even for bad entries.
-        (self.job / "done").write_text(self.identity + "\n")
-        self.reject_worker_entry("locked")
-        self.assertFalse(lock.exists())
+    def wait_for_path(self, path, process, timeout=5):
+        deadline = time.monotonic() + timeout
+        while not path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertTrue(path.exists(), f"Missing {path.name}; exit={process.poll()}")
 
-    def test_worker_rejects_conflicting_or_unsafe_lock(self):
-        import fcntl
-        self.orphan()
-        lock = self.job / "worker.lock"
-        lock.write_bytes(b"existing lock contents")
-        with lock.open("rb") as owner, lock.open("rb") as other:
-            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.reject_worker_entry()
-            self.reject_worker_entry("locked", stdin=other)
-        self.assertEqual(lock.read_bytes(), b"existing lock contents")
-        self.command("flock", "exit 2")
-        with lock.open("rb") as inherited:
-            self.reject_worker_entry("locked", stdin=inherited)
-            self.reject_worker_entry()
-        lock.rename(self.job / "real-lock")
-        lock.symlink_to(self.job / "real-lock")
-        with lock.open("rb") as stream:
-            self.reject_worker_entry("locked", stdin=stream)
-            self.reject_worker_entry()
-        self.assertEqual(lock.read_bytes(), b"existing lock contents")
+    def test_control_directory_conflicts_never_steal_or_modify(self):
+        self.prepare_clear()
+        before = {n: (self.job / n).read_bytes() for n in ("state", "raw.txt")}
+        busy = self.root / "control.busy"
+        for kind in ("directory", "file", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "directory":
+                    busy.mkdir()
+                    (busy / "owner").write_text("interrupted owner")
+                elif kind == "file":
+                    busy.write_text("do not replace")
+                else:
+                    busy.symlink_to(self.fixture)
+                inode = busy.lstat().st_ino
+                for mode in ("start", "launch", "clear"):
+                    args = (self.identity,) if mode == "clear" else ("e" * 32, "1", "1", "")
+                    self.assertNotEqual(self.shell(mode, *args).returncode, 0)
+                    self.assertEqual(busy.lstat().st_ino, inode)
+                    self.assertEqual({n: (self.job / n).read_bytes() for n in before}, before)
+                    self.assertFalse((self.root / ("e" * 32)).exists())
+                self.assertEqual(self.fixture.read_bytes(), TOP)
+                busy.rename(self.root / (kind + "-busy-checked"))
 
-    def test_worker_accepts_real_inherited_lock(self):
-        import fcntl
-        self.orphan(status="starting")
-        (self.job / "raw.txt").write_bytes(b"")
-        lock = self.job / "worker.lock"
-        with lock.open("rb") as inherited:
-            fcntl.flock(inherited, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = subprocess.run(["sh", str(self.script), "worker", self.identity,
-                                     "1", "1", "", "locked"], env=self.env,
-                                    stdin=inherited, capture_output=True, timeout=8)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            with lock.open("rb") as competitor:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    def test_control_directory_normal_exit_releases_but_signals_preserve(self):
+        import signal
+        self.write_script()
+        functions = self.script.read_text().split("MODE=$1\n", 1)[0]
+        busy = self.root / "control.busy"
+        for code in (0, 1):
+            result = subprocess.run(["sh", "-c", functions + f'\ncontrol_lock; exit {code}'],
+                                    env=self.env, capture_output=True, timeout=4)
+            self.assertEqual(result.returncode, code, result.stderr)
+            self.assertFalse(busy.exists())
+        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig):
+                entered = self.root / ("control-entered-" + str(sig))
+                code = functions + '\ncontrol_lock\n: > "$1"\nwhile :; do sleep .02; done\n'
+                process = subprocess.Popen(["sh", "-c", code, "control", str(entered)],
+                                           env=self.env, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+                try:
+                    self.wait_for_path(entered, process)
+                    inode = busy.stat().st_ino
+                    process.send_signal(sig)
+                    process.wait(timeout=5)
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertTrue(busy.is_dir())
+                    self.assertEqual(busy.stat().st_ino, inode)
+                    retry = subprocess.run(["sh", "-c", functions + '\ncontrol_lock'],
+                                           env=self.env, capture_output=True, timeout=4)
+                    self.assertNotEqual(retry.returncode, 0)
+                    self.assertEqual(busy.stat().st_ino, inode)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
+                    if busy.exists():
+                        busy.rename(self.root / ("retained-control-" + str(sig)))
+
+    def test_start_and_launch_share_atomic_control_directory(self):
+        self.write_script()
+        entered = self.root / "launch-entered"
+        release = self.root / "launch-release"
+        self.command("setsid", 'exec "$@"')
+        self.command("timeout", 'sleep 1; exit 124')
+        # Hold the successful atomic mkdir, outside the timeout capability probe.
+        # Contenders use real mkdir and must fail without entering this barrier.
+        self.command("mkdir", '/bin/mkdir "$@"; rc=$?\n'
+                     'if [ "$rc" -eq 0 ] && [ "$1" = ' +
+                     shlex.quote(str(self.root / "control.busy")) + ' ]; then\n: > ' +
+                     shlex.quote(str(entered)) + '\nwhile [ ! -f ' +
+                     shlex.quote(str(release)) + ' ]; do sleep .02; done\nfi\nexit "$rc"')
+        self.command("nohup", 'for arg do case "$arg" in ' + "e" * 32 +
+                     ') touch "$JOB/ready";; esac; done')
+        identity = "e" * 32
+        job = self.root / identity
+        env = dict(self.env, JOB=str(job))
+        process = subprocess.Popen(["sh", str(self.script), "start", identity, "1", "1", ""],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.wait_for_path(entered, process)
+            busy = self.root / "control.busy"
+            self.assertTrue(busy.is_dir())
+            inode = busy.stat().st_ino
+            for mode in ("start", "launch"):
+                result = self.shell(mode, "f" * 32, "1", "1", "")
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(busy.stat().st_ino, inode)
+                self.assertFalse((self.root / ("f" * 32)).exists())
+            self.assertFalse((self.root / "current").exists())
+        finally:
+            release.touch()
+            process.wait(timeout=12)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual((self.root / "current").read_text().strip(), identity)
+        self.assertFalse((self.root / "control.busy").exists())
+        self.assertFalse((job / "worker.lock").exists())
+
+    def test_worker_requires_matching_current_and_starting_state(self):
+        self.prepare_worker()
+        self.write_script()
+        state = (self.job / "state").read_bytes()
+        for status in ("running", "completed", "stopped", "error"):
+            with self.subTest(status=status):
+                (self.job / "state").write_bytes(state.replace(b"starting", status.encode()))
+                self.reject_worker_entry()
+        (self.job / "state").write_bytes(state)
+        (self.root / "current").write_text("e" * 32)
+        self.reject_worker_entry()
+        (self.root / "current").rename(self.root / "saved-current")
+        self.reject_worker_entry()
+
+    def test_worker_claim_conflicts_preserve_starting_task(self):
+        self.prepare_worker()
+        self.write_script()
+        claim = self.job / "worker.claim"
+        for kind in ("directory", "file", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "directory":
+                    claim.mkdir()
+                elif kind == "file":
+                    claim.write_text("occupied")
+                else:
+                    claim.symlink_to(self.fixture)
+                inode = claim.lstat().st_ino
+                self.reject_worker_entry()
+                self.assertEqual(claim.lstat().st_ino, inode)
+                self.assertEqual(self.fixture.read_bytes(), TOP)
+                claim.rename(self.job / (kind + "-claim-checked"))
+
+    def test_concurrent_workers_claim_once_and_publish_done_before_terminal(self):
+        self.prepare_worker()
+        self.write_script()
+        entered = self.root / "terminal-entered"
+        release = self.root / "terminal-release"
+        # Pause the real state publication, not the worker or receipt logic.
+        self.command("mv", 'if [ "$1" = "$JOB/state.new" ] && '
+                     'grep -q "^completed$" "$1"; then\n: > ' + shlex.quote(str(entered)) +
+                     '\nwhile [ ! -f ' + shlex.quote(str(release)) +
+                     ' ]; do sleep .02; done\nfi\nexec /bin/mv "$@"')
+        argv = ["sh", str(self.script), "worker", self.identity, "1", "1", ""]
+        processes = []
+        try:
+            for _ in range(2):
+                processes.append(subprocess.Popen(argv, env=self.env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            deadline = time.monotonic() + 6
+            while not entered.exists() and time.monotonic() < deadline:
+                if all(p.poll() is not None for p in processes):
+                    break
+                time.sleep(.02)
+            self.assertTrue(entered.exists(), [p.poll() for p in processes])
+            self.assertTrue((self.job / "worker.claim").is_dir())
+            self.assertEqual((self.job / "done").read_text().strip(), self.identity)
+            self.assertEqual((self.job / "state").read_text().splitlines()[1], "running")
+            before = (self.job / "raw.txt").read_bytes()
+            self.assertEqual(before.count(b"========== Top"), 1)
+            self.assertTrue(before.endswith(TOP + b"\n\n"))
+            self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
+            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+            self.assertEqual((self.job / "raw.txt").read_bytes(), before)
+        finally:
+            release.touch()
+            for process in processes:
+                process.wait(timeout=12)
+        self.assertEqual(sum(p.returncode == 0 for p in processes), 1)
         state = (self.job / "state").read_text().splitlines()
         self.assertEqual(state[1:3], ["completed", "1"])
-        self.assertEqual((self.job / "done").read_text().strip(), self.identity)
-        self.assertEqual(len((self.job / "raw.txt").read_bytes()), int(state[5]))
+        self.assertEqual(int(state[5]), len(before))
+        self.assertEqual((self.job / "raw.txt").read_bytes(), before)
+        self.assertEqual(self.shell("pull", self.identity).stdout.encode(), before)
 
-    def test_orphan_recovery_commits_only_state_bytes_for_both_formats(self):
-        for lines in (8, 10):
-            with self.subTest(lines=lines):
-                self.orphan(lines=lines)
-                self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
-                before = time.monotonic()
-                self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-                self.assertLess(time.monotonic() - before, 2)
+    def test_worker_claim_is_permanent_and_rejects_reentry(self):
+        self.worker()
+        claim = self.job / "worker.claim"
+        self.assertTrue(claim.is_dir())
+        inode = claim.stat().st_ino
+        before = {p.name: p.read_bytes() for p in self.job.iterdir() if p.is_file()}
+        self.assertNotEqual(self.shell("worker", self.identity, "1", "1", "").returncode, 0)
+        self.assertEqual(claim.stat().st_ino, inode)
+        self.assertEqual({p.name: p.read_bytes() for p in self.job.iterdir() if p.is_file()}, before)
+        self.assertEqual(self.shell("clear", self.identity).returncode, 0)
+        self.assertTrue(claim.is_dir())
+        self.assertNotEqual(self.shell("worker", self.identity, "1", "1", "").returncode, 0)
+
+    def test_proc_visibility_and_pid_reuse_never_authorize_recovery(self):
+        self.orphan()
+        before = {n: (self.job / n).read_bytes() for n in ("state", "raw.txt")}
+        self.proc.rename(self.root / "original-proc")
+        self.proc.mkdir()
+        self.assertEqual(list(self.proc.iterdir()), [])
+        for condition in ("empty", "reused_pid", "hidden"):
+            with self.subTest(condition=condition):
+                if condition == "reused_pid":
+                    self.proc_stat(123, start=999999)
+                    (self.proc / "123" / "cmdline").write_bytes(b"unrelated\0")
+                elif condition == "hidden":
+                    self.proc.rename(self.root / "hidden-proc")
                 result = self.shell("status")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                state = (self.job / "state").read_text().splitlines()
-                self.assertEqual(state[1:3], ["stopped", "1"])
-                self.assertEqual(len(state), 10)
-                self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
-                self.assertEqual((self.job / "done").read_text().strip(), self.identity)
-                self.assertEqual(self.shell("pull", self.identity).stdout.encode(), RAW)
+                self.assert_pending_receipt(result)
+                self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+                for mode in ("pull", "clear"):
+                    self.assertNotEqual(self.shell(mode, self.identity).returncode, 0)
+                self.assertEqual({n: (self.job / n).read_bytes() for n in before}, before)
+                self.assertFalse((self.job / "done").exists())
 
-    def test_status_recovers_orphan_without_claiming_requested_stop(self):
-        self.orphan()
-        result = self.shell("status")
+    def test_append_failure_preserves_partial_bytes_without_done(self):
+        self.prepare_worker()
+        self.write_script()
+        self.command("cat", 'case "$1" in */header) printf "partial append"; exit 1;; '
+                     '*) exec /bin/cat "$@";; esac')
+        result = self.shell("worker", self.identity, "1", "1", "")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.job / "worker.claim").is_dir())
+        self.assertFalse((self.job / "done").exists())
+        self.assertEqual((self.job / "raw.txt").read_bytes(), b"partial append")
+        before = (self.job / "state").read_bytes()
+        status = self.shell("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assert_pending_receipt(status)
+        for mode in ("pull", "clear"):
+            self.assertNotEqual(self.shell(mode, self.identity).returncode, 0)
+        self.assertEqual((self.job / "state").read_bytes(), before)
+        self.assertEqual((self.job / "raw.txt").read_bytes(), b"partial append")
+
+    def assert_pending_receipt(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], "error")
-        self.assertEqual(result.stdout.splitlines()[6], "interrupted")
-        self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
+        decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout.strip())
+        # Successful state reads are connected, not proof of a live worker.
+        # Every state lacking a terminal receipt remains unsafe to pull/clear.
+        self.assertTrue(decoded["running"])
+        self.assertEqual(decoded["connected"], decoded["status"] in {"starting", "running"})
 
-    def test_control_lock_rejects_unsafe_file_before_task_access(self):
-        self.orphan()
-        original = (self.job / "raw.txt").read_bytes()
-        # A directory used as a lock must fail before reading invalid current.
-        (self.root / "current").write_bytes(b"invalid")
-        (self.root / "control.lock").mkdir()
-        for mode, args in (("status", ()), ("stop", (self.identity,)),
-                           ("pull", (self.identity,)), ("clear", (self.identity,))):
-            with self.subTest(mode=mode):
-                result = self.shell(mode, *args)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Unsafe control lock", result.stderr)
-                self.assertNotIn("Invalid current capture identity", result.stderr)
-                self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-                self.assertFalse((self.job / "stop").exists())
-                self.assertFalse((self.job / "done").exists())
-
-    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses mode permissions")
-    def test_control_lock_permission_failure_never_continues(self):
-        self.orphan()
-        original = (self.job / "raw.txt").read_bytes()
-        lock = self.root / "control.lock"
-        lock.write_bytes(b"preserve lock inode and contents")
-        lock.chmod(0o400)
-        for mode, args in (("status", ()), ("stop", (self.identity,)),
-                           ("pull", (self.identity,)), ("clear", (self.identity,))):
-            with self.subTest(mode=mode):
-                result = self.shell(mode, *args)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("control lock permission denied", result.stderr)
-                self.assertIn("state unconfirmed", result.stderr)
-                self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-                self.assertFalse((self.job / "stop").exists())
-                self.assertFalse((self.job / "done").exists())
-        lock.chmod(0o600)
-        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-        self.assertEqual(lock.read_bytes(), b"preserve lock inode and contents")
+    def test_orphans_never_recover_or_truncate(self):
+        for lines in (8, 10):
+            for status in ("starting", "running", "completed", "stopped", "error"):
+                with self.subTest(lines=lines, status=status):
+                    self.orphan(lines=lines, status=status)
+                    before = {n: (self.job / n).read_bytes() for n in ("state", "raw.txt")}
+                    self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+                    self.assert_pending_receipt(self.shell("status"))
+                    for mode in ("pull", "clear"):
+                        self.assertNotEqual(self.shell(mode, self.identity).returncode, 0)
+                    self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+                    self.assertEqual({n: (self.job / n).read_bytes() for n in before}, before)
+                    self.assertFalse((self.job / "done").exists())
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses mode permissions")
     def test_unreadable_capture_metadata_never_reports_idle_or_changes_logs(self):
@@ -1921,55 +3195,14 @@ class DeviceScriptTests(unittest.TestCase):
             self.assertFalse((self.job / "stop").exists())
             self.assertFalse((self.job / "done").exists())
 
-    def test_live_lifetime_lock_and_control_lock_block_recovery(self):
-        import fcntl
-        self.orphan(status="starting")
-        original = (self.job / "raw.txt").read_bytes()
-        with (self.job / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-            status = self.shell("status")
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertEqual(status.stdout.splitlines()[1], "starting")
-            self.assertFalse((self.job / "done").exists())
-            self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-            self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
-        with (self.root / "control.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertNotEqual(self.shell("status").returncode, 0)
-            self.assertNotEqual(self.shell("stop", self.identity).returncode, 0)
-            self.assertFalse((self.job / "done").exists())
-        self.assertEqual(self.shell("status").returncode, 0)
-        self.assertTrue((self.job / "done").exists())
-
-    def test_legacy_orphan_recovery_and_exact_live_worker_identity(self):
-        self.orphan(legacy=True, lines=8)
-        command = ["sh", str(self.root / ("control-" + "a" * 64 + ".sh")),
-                   "worker", self.identity, "-1", "1", ""]
-        (self.proc / "1" / "cmdline").write_bytes("\0".join(command).encode() + b"\0")
-        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-        result = self.shell("status")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], "running")
-        self.assertFalse((self.job / "done").exists())
-        command[1] = str(self.root / "unrecognised-controller.sh")
-        (self.proc / "1" / "cmdline").write_bytes("\0".join(command).encode() + b"\0")
-        self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-        self.assertFalse((self.job / "done").exists())
-        command[3] += "f"  # Similar ID is not this worker.
-        (self.proc / "1" / "cmdline").write_bytes("\0".join(command).encode() + b"\0")
-        result = self.shell("status")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], "stopped")
-        self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
-
-    def test_signals_wait_for_live_child_before_publishing_done(self):
+    def test_abnormal_signals_wait_for_child_without_confirming_done(self):
         import signal
         import sys
         for phase in ("top", "append"):
             for sig in (signal.SIGTERM, signal.SIGINT):
                 with self.subTest(phase=phase, signal=sig):
-                    self.orphan(status="starting")
+                    self.prepare_worker()
+                    self.write_script()
                     (self.job / "raw.txt").write_bytes(b"")
                     entered = self.job / "child-entered"
                     release = self.job / "child-release"
@@ -1978,7 +3211,7 @@ class DeviceScriptTests(unittest.TestCase):
                     # waits for the test. Signals target only our Popen child.
                     code = (
                         "import os,sys,time\nfrom pathlib import Path\n"
-                        "job=Path(os.environ['WORKER_LOCK']).parent\n"
+                        "job=Path(os.environ['JOB'])\n"
                         "data=b''.join(Path(p).read_bytes() for p in sys.argv[1:])\n"
                         "half=len(data)//2\nos.write(1,data[:half])\n"
                         "(job/'child-entered').write_text(str(os.getpid()))\n"
@@ -1995,16 +3228,14 @@ class DeviceScriptTests(unittest.TestCase):
                     if phase == "top":
                         self.command("top", writer + ' "$TOP_FIXTURE"')
                     else:
-                        self.command("cat", writer + ' "$@"')
+                        self.command("cat", 'case "$1" in */header) ' + writer +
+                                     ' "$@";; *) exec /bin/cat "$@";; esac')
                     with open(os.devnull, "wb") as output:
                         process = subprocess.Popen(
                             ["sh", str(self.script), "worker", self.identity, "1", "1", ""],
                             env=self.env, stdout=output, stderr=output)
                         try:
-                            deadline = time.monotonic() + 5
-                            while not entered.exists() and time.monotonic() < deadline:
-                                time.sleep(.02)
-                            self.assertTrue(entered.exists())
+                            self.wait_for_path(entered, process)
                             original = (self.job / "raw.txt").read_bytes()
                             state = (self.job / "state").read_bytes()
                             process.send_signal(sig)
@@ -2018,37 +3249,35 @@ class DeviceScriptTests(unittest.TestCase):
                         finally:
                             release.touch()
                             process.wait(timeout=12)
-                    self.assertEqual(process.returncode, 0)
+                    self.assertNotEqual(process.returncode, 0)
                     self.assertTrue(exited.exists())
-                    state = (self.job / "state").read_text().splitlines()
-                    self.assertEqual(state[1], "stopped")
-                    self.assertEqual(state[6], "interrupted")
-                    self.assertEqual(state[2], "0" if phase == "top" else "1")
+                    self.assertFalse((self.job / "done").exists())
+                    self.assertTrue((self.job / "worker.claim").is_dir())
                     raw = (self.job / "raw.txt").read_bytes()
-                    self.assertEqual(len(raw), int(state[5]))
                     if phase == "append":
                         self.assertTrue(raw.endswith(TOP + b"\n\n"))
-                    self.assertEqual((self.job / "done").read_text().strip(), self.identity)
-                    self.job.rename(self.root / f"checked-{phase}-{sig}")
-                    self.job.mkdir()
+                    snapshot = (self.job / "state").read_bytes()
+                    self.assert_pending_receipt(self.shell("status"))
+                    for mode in ("pull", "clear"):
+                        self.assertNotEqual(self.shell(mode, self.identity).returncode, 0)
+                    self.assertEqual((self.job / "state").read_bytes(), snapshot)
+                    self.assertEqual((self.job / "raw.txt").read_bytes(), raw)
 
     def test_real_worker_remains_active_until_cooperative_stop(self):
-        self.orphan()
-        # The mocked top still runs as a real shell child and holds stdin's
-        # lifetime lock. Never signal the worker or infer any process ID.
+        self.prepare_worker(target=-1)
+        self.write_script()
+        # Stop through the task marker, never by discovering or signalling a PID.
         self.command("top", 'sleep 1; cat "$TOP_FIXTURE"')
         with open(os.devnull, "wb") as output:
             process = subprocess.Popen(["sh", str(self.script), "worker", self.identity,
                                         "-1", "1", ""], env=self.env,
                                        stdout=output, stderr=output)
             try:
-                deadline = time.monotonic() + 3
-                while not (self.job / "ready").exists() and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                self.assertTrue((self.job / "ready").exists())
+                self.wait_for_path(self.job / "ready", process, timeout=3)
                 status = self.shell("status")
                 self.assertEqual(status.returncode, 0, status.stderr)
                 self.assertEqual(status.stdout.splitlines()[1], "running")
+                self.assert_pending_receipt(status)
                 self.assertFalse((self.job / "done").exists())
                 self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
                 self.assertEqual(self.shell("stop", self.identity).returncode, 0)
@@ -2060,360 +3289,27 @@ class DeviceScriptTests(unittest.TestCase):
         self.assertEqual(len((self.job / "raw.txt").read_bytes()),
                          int((self.job / "state").read_text().splitlines()[5]))
 
-    def test_inherited_writer_lock_survives_controller_exit(self):
-        import fcntl
-        self.orphan()
-        with (self.job / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            child = subprocess.Popen(["sh", "-c", "sleep 2"], stdin=lock)
-        try:
-            self.assertEqual(self.shell("status").stdout.splitlines()[1], "running")
-            self.assertFalse((self.job / "done").exists())
-        finally:
-            child.wait(timeout=5)
-        self.assertEqual(self.shell("status").returncode, 0)
-        self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
-
-    def test_legacy_unknown_visibility_and_delayed_launch_refuse_recovery(self):
-        self.orphan(legacy=True)
-        original = (self.job / "raw.txt").read_bytes()
-        (self.proc / "mounts").write_text(f"proc {self.proc} proc rw,hidepid=2 0 0\n")
-        result = self.shell("status")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[-1], "unconfirmed")
-        self.assertIn("retry", result.stderr)
-        self.assertFalse((self.job / "done").exists())
-        self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-        self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
-        (self.proc / "mounts").write_text(f"proc {self.proc} proc rw 0 0\n")
-        (self.proc / "1" / "cmdline").rename(self.proc / "unreadable-cmdline")
-        self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-        (self.proc / "unreadable-cmdline").rename(self.proc / "1" / "cmdline")
-        self.orphan(legacy=True, status="starting")
-        self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-        self.assertFalse((self.job / "done").exists())
-
-    def test_legacy_hidepid_group_exemption_keeps_access_checks(self):
-        self.orphan(legacy=True)
-        self.command("id", 'echo "2000 3009 3011"')
-        original = (self.job / "raw.txt").read_bytes()
-        for options in ("hidepid=2,gid=309", "hidepid=4,gid=3009",
-                        "hidepid=invisible,gid=3009,subset=pid"):
-            with self.subTest(options=options):
-                (self.proc / "mounts").write_text(f"proc {self.proc} proc rw,{options} 0 0\n")
-                self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-                self.assertFalse((self.job / "done").exists())
-                self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-        (self.proc / "mounts").write_text(f"proc {self.proc} proc rw,gid=3009,hidepid=invisible 0 0\n")
-        command = self.proc / "1" / "cmdline"
-        command.rename(self.proc / "hidden-cmdline")
-        self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-        self.assertFalse((self.job / "done").exists())
-        (self.proc / "hidden-cmdline").rename(command)
-        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-        self.assertEqual(self.shell("status").stdout.splitlines()[1], "stopped")
-        self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
-
-    def test_legacy_orphan_append_child_prevents_truncation(self):
-        self.orphan(legacy=True)
-        (self.proc / "1" / "cmdline").write_bytes(b"cat\0header\0sample\0")
-        descriptor = self.proc / "1" / "fd" / "7"
-        descriptor.symlink_to(self.job / "raw.txt")
-        original = (self.job / "raw.txt").read_bytes()
-        result = self.shell("status")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.job / "done").exists())
-        self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-        descriptor.rename(self.proc / "closed-fd")
-        self.assertEqual(self.shell("status").returncode, 0)
-        self.assertEqual((self.job / "raw.txt").read_bytes(), RAW)
-
-    def scan_legacy(self, expected):
-        function = self.source.split("legacy_quiet()", 1)[1].split("\nrecover()", 1)[0]
-        script = ("ROOT=" + shlex.quote(str(self.root)) + "\nPROC=" +
-                  shlex.quote(str(self.proc)) + "\nID=" + self.identity +
-                  "\nDIR=$ROOT/$ID\nlegacy_quiet()" + function + "\nlegacy_quiet\n")
-        state = (self.job / "state").read_bytes()
-        raw = (self.job / "raw.txt").read_bytes()
-        result = subprocess.run(["sh"], input=script, env=self.env,
-                                capture_output=True, text=True, timeout=4)
-        self.assertEqual(result.returncode, expected, result.stderr)
-        self.assertEqual((self.job / "state").read_bytes(), state)
-        self.assertEqual((self.job / "raw.txt").read_bytes(), raw)
-        self.assertFalse((self.job / "worker.lock").exists())
-        self.assertFalse((self.job / "done").exists())
-
-    def race_readlink(self, body):
-        import sys
-        code = ("import os,sys\nfrom pathlib import Path\n" +
-                "proc=Path(" + repr(str(self.proc)) + ")\n" +
-                "job=Path(" + repr(str(self.job)) + ")\n" + body + "\n" +
-                "rc=0\nfor p in sys.argv[1:]:\n"
-                " try: print(os.readlink(p))\n except OSError: rc=1\nsys.exit(rc)\n")
-        self.command("readlink", shlex.quote(sys.executable) + " -c " +
-                     shlex.quote(code) + ' "$@"')
-
-    def test_legacy_closed_fd_gets_one_local_retry(self):
-        self.orphan(legacy=True)
-        (self.proc / "1/fd/7").symlink_to("/dev/null")
-        self.race_readlink("p=proc/'1/fd/7'\nif p.is_symlink(): p.rename(proc/'closed')")
-        self.scan_legacy(0)
-
-    def test_legacy_live_unreadable_fd_and_unknown_batch_failure_refuse(self):
-        self.orphan(legacy=True)
-        (self.proc / "1/fd/7").symlink_to("/dev/null")
-        for body in ('echo 99999; echo 99999; exit 1',
-                     self.batch_readlink + '; exit 1'):
-            with self.subTest(body=body):
-                self.command("readlink", body)
-                self.scan_legacy(2)
-
-    def test_legacy_closed_fd_does_not_hide_another_unreadable_fd(self):
-        self.orphan(legacy=True)
-        for fd in (7, 8):
-            (self.proc / f"1/fd/{fd}").symlink_to("/dev/null")
-        self.race_readlink("(proc/'1/fd/7').rename(proc/'closed')\n"
-                           "print('99999\\n99999\\n99999'); sys.exit(1)")
-        self.scan_legacy(2)
-
-    def test_legacy_retry_exhaustion_remains_unconfirmed(self):
-        self.orphan(legacy=True)
-        (self.proc / "1/fd/7").symlink_to("/dev/null")
-        self.race_readlink("p=proc/'1/fd/7'\n"
-                           "if p.is_symlink():\n p.rename(proc/'closed7')\n"
-                           " (proc/'1/fd/8').symlink_to('/dev/null')\n"
-                           "else: (proc/'1/fd/8').rename(proc/'closed8')")
-        self.scan_legacy(2)
-
-    def test_legacy_vanished_process_and_pid_reuse_are_distinct(self):
-        self.orphan(legacy=True)
-        p = self.proc_stat(2)
-        (p / "cmdline").write_bytes(b"cat\0")
-        (p / "fd").mkdir()
-        (p / "fd/7").symlink_to("/dev/null")
-        self.race_readlink("(proc/'2').rename(proc/'departed')")
-        self.scan_legacy(0)
-        (self.proc / "departed").rename(p)
-        self.race_readlink("p=proc/'2/stat'\np.write_text(p.read_text().replace('100', '101'))")
-        self.scan_legacy(2)
-
-    def test_legacy_cmdline_and_fd_listing_identity_races(self):
-        self.orphan(legacy=True)
-        p = self.proc_stat(2)
-        (p / "cmdline").write_bytes(b"cat\0")
-        (p / "fd").mkdir()
-        for command in ("tr", "ls"):
-            executable = "/bin/ls" if command == "ls" else "/usr/bin/tr"
-            for race in ("vanished", "reused", "unreadable", "unknown"):
-                with self.subTest(command=command, race=race):
-                    self.proc_stat(2)
-                    marker = self.proc / (command + "-" + race)
-                    departed = self.proc / "departed"
-                    if race == "vanished":
-                        action = "mv " + shlex.quote(str(p)) + " " + shlex.quote(str(departed))
-                    elif race == "reused":
-                        action = "printf '%s\\n' " + shlex.quote(
-                            "2 (cat) S " + "0 " * 18 + "101 0") + " > " + shlex.quote(str(p / "stat"))
-                    elif race == "unreadable":
-                        action = "mv " + shlex.quote(str(p / "stat")) + " " + shlex.quote(str(marker) + "-stat")
-                    else:
-                        action = "exit 1"
-                    # The first invocation scans init; the second scans PID 2.
-                    self.command(command, "if [ -e " + shlex.quote(str(marker)) +
-                                 " ]; then " + action + "; else : > " +
-                                 shlex.quote(str(marker)) + "; fi\nexec " + executable + ' "$@"')
-                    self.scan_legacy(0 if race == "vanished" else 2)
-                    self.command(command, "exec " + executable + ' "$@"')
-                    if race == "vanished":
-                        departed.rename(p)
-
-    def test_legacy_stat_missing_or_malformed_is_not_disappearance(self):
-        self.orphan(legacy=True)
-        stat = self.proc / "1/stat"
-        for value in ("1 (comm) S 0\n", "1 (comm) S " + "0 " * 18 + "bad\n"):
-            stat.write_text(value)
-            self.scan_legacy(2)
-        stat.rename(self.proc / "unreadable-stat")
-        self.scan_legacy(2)
-
-    def test_legacy_added_identity_is_scanned_including_orphan_writer(self):
-        self.orphan(legacy=True)
-        (self.proc / "1/fd/7").symlink_to("/dev/null")
-        self.race_readlink("p=proc/'2'\nif not p.exists():\n"
-                           " (p/'fd').mkdir(parents=True)\n"
-                           " (p/'stat').write_text('2 (cat) S '+ '0 '*18+'200 0\\n')\n"
-                           " (p/'cmdline').write_bytes(b'cat\\0')\n"
-                           " (p/'fd/1').symlink_to(job/'raw.txt')")
-        self.scan_legacy(1)
-        (self.proc / "2/fd/1").rename(self.proc / "closed-writer")
-        self.scan_legacy(0)
-
-    def test_legacy_unbounded_new_identities_refuse(self):
-        self.orphan(legacy=True)
-        (self.proc / "1/fd/7").symlink_to("/dev/null")
-        self.race_readlink("n=2\nwhile (proc/str(n)).exists(): n+=1\np=proc/str(n)\n"
-                           "(p/'fd').mkdir(parents=True)\n"
-                           "(p/'stat').write_text(str(n)+' (cat) S '+'0 '*18+'200 0\\n')\n"
-                           "(p/'cmdline').write_bytes(b'cat\\0')\n"
-                           "(p/'fd/1').symlink_to('/dev/null')")
-        self.scan_legacy(2)
-
-    def test_legacy_partial_batch_keeps_writer_reference_protection(self):
-        self.orphan(legacy=True)
-        for name in ('raw.txt', 'sample', 'header'):
-            for deleted in ('', ' (deleted)'):
-                with self.subTest(name=name, deleted=deleted):
-                    self.command("readlink", "printf '%s\\n' 99999 " +
-                                 shlex.quote(str(self.job / name) + deleted) +
-                                 " 99999; exit 1")
-                    if not (self.proc / '1/fd/7').is_symlink():
-                        (self.proc / '1/fd/7').symlink_to('/dev/null')
-                    self.scan_legacy(1)
-
-    def test_corrupt_idle_status_and_launch_leave_old_files_untouched(self):
-        self.orphan()
-        state = b"\0" * 81
-        (self.job / "state").write_bytes(state)
-        archive = (self.job / "raw.txt").read_bytes()
-        inode = (self.job / "worker.lock").stat().st_ino
-        status = self.shell("status")
-        self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertEqual(status.stdout.splitlines(),
-                         ["corrupt", self.identity, "inactive", "present"])
-        identity = "e" * 32
-        job = self.root / identity
-        self.command("timeout", 'sleep 1; exit 124')
-        self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
-        launched = self.shell("launch", identity, "1", "1", "")
-        self.assertEqual(launched.returncode, 0, launched.stderr)
-        self.assertEqual((self.root / "current").read_text(), identity)
-        self.assertEqual((self.job / "state").read_bytes(), state)
-        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-        self.assertEqual((self.job / "worker.lock").stat().st_ino, inode)
-        self.assertFalse((self.job / "done").exists())
-
-    def test_corrupt_live_lock_blocks_launch_clear_but_allows_stop(self):
-        import fcntl
-        self.orphan()
-        (self.job / "state").write_bytes(b"\0" * 81)
-        archive = (self.job / "raw.txt").read_bytes()
-        with (self.job / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertEqual(self.shell("status").stdout.splitlines(),
-                             ["corrupt", self.identity, "unconfirmed", "present"])
-            self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
-            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
-            self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-            self.assertTrue((self.job / "stop").is_file())
-        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-        self.assertFalse((self.job / "done").exists())
-        self.assertFalse((self.root / ("e" * 32)).exists())
-
-    def test_corrupt_missing_linked_lock_and_bad_archive_block_bypass(self):
-        self.orphan(legacy=True)
-        (self.job / "state").write_bytes(b"broken")
-        archive = (self.job / "raw.txt").read_bytes()
-        for kind in ("missing", "linked", "archive"):
-            with self.subTest(kind=kind):
-                if kind == "linked":
-                    (self.job / "worker.lock").symlink_to(self.fixture)
-                elif kind == "archive":
-                    (self.job / "worker.lock").rename(self.job / "saved-link")
-                    (self.job / "worker.lock").touch()
-                    (self.job / "archive_name").write_text("../fixture")
-                self.assertEqual(self.shell("status").stdout.splitlines()[2], "unconfirmed")
-                self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
-                self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
-                self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-                self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-                self.assertEqual(self.fixture.read_bytes(), TOP)
-
-    def test_terminal_state_with_live_lock_is_unconfirmed(self):
-        import fcntl
-        self.orphan(status="completed")
-        (self.job / "done").write_text(self.identity)
-        archive = (self.job / "raw.txt").read_bytes()
-        with (self.job / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-            self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
-            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
-        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-
-    def test_terminal_publication_during_busy_recovery_is_unconfirmed(self):
-        import fcntl
-        import sys
-        self.orphan()
-        archive = (self.job / "raw.txt").read_bytes()
-        # Publish terminal state exactly when recovery attempts the busy lock.
-        # The parent retains the real lifetime lock through status and decode.
-        self.command("flock", shlex.quote(sys.executable) + " -c " + shlex.quote(
-            "import fcntl,os,sys\nfrom pathlib import Path\n"
-            f"job=Path({str(self.job)!r})\n"
-            "if os.fstat(0).st_ino == (job/'worker.lock').stat().st_ino:\n"
-            " p=job/'state'; fields=p.read_text().splitlines()\n"
-            " fields[1]='completed'; fields[9]='101'\n"
-            " p.write_text('\\n'.join(fields)+'\\n')\n"
-            " (job/'done').write_text(fields[0]+'\\n')\n"
-            "try: fcntl.flock(0, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-            "except BlockingIOError: sys.exit(1)"
-        ))
-        with (self.job / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = self.shell("status")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines()[1], "completed")
-            self.assertEqual(result.stdout.splitlines()[-1], "unconfirmed")
-            decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout)
-            self.assertTrue(decoded["running"])
-            self.assertFalse(decoded["connected"])
-        self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-        self.assertNotEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
-
-    def test_legacy_terminal_publication_during_busy_recovery_is_unconfirmed(self):
-        self.orphan(legacy=True)
-        # Deterministic legacy scan result: a writer remains while state changes.
-        source = self.script.read_text().replace("MODE=$1\n", """legacy_quiet() {
-    sed s/running/completed/ "$DIR/state" > "$DIR/state.new"
-    mv "$DIR/state.new" "$DIR/state"
-    printf '%s\\n' "$ID" > "$DIR/done"
-    return 1
-}
-MODE=$1
-""")
-        self.script.write_text(source)
-        result = self.shell("status")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[1], "completed")
-        self.assertEqual(result.stdout.splitlines()[-1], "unconfirmed")
-
     def test_numeric_identity_corruption_never_recovers_archive(self):
-        import fcntl
         self.identity = "0" * 31 + "1"
         self.job = self.root / self.identity
         self.job.mkdir()
         self.orphan()
         fields = (self.job / "state").read_text().splitlines()
         archive = (self.job / "raw.txt").read_bytes()
-        inode = (self.job / "worker.lock").stat().st_ino
         for bad_id in ("1", "01", "0" * 30 + "1", "0" * 32 + "1"):
             with self.subTest(identity=bad_id):
                 fields[0] = bad_id
                 state = "\n".join(fields) + "\n"
                 (self.job / "state").write_text(state)
-                for busy in (False, True):
-                    with (self.job / "worker.lock").open("r+") as lock:
-                        if busy:
-                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        result = self.shell("status")
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(result.stdout.splitlines(), ["corrupt", self.identity,
-                                         "unconfirmed" if busy else "inactive", "present"])
-                    self.assertEqual((self.job / "state").read_text(), state)
-                    self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-                    self.assertEqual((self.job / "worker.lock").stat().st_ino, inode)
-                    self.assertFalse((self.job / "done").exists())
+                result = self.shell("status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["corrupt", self.identity,
+                                 "unconfirmed", "present"])
+                for mode in ("pull", "clear"):
+                    self.assertNotEqual(self.shell(mode, self.identity).returncode, 0)
+                self.assertEqual((self.job / "state").read_text(), state)
+                self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
+                self.assertFalse((self.job / "done").exists())
         fields[0] = self.identity
         fields[1] = "completed"
         (self.job / "state").write_text("\n".join(fields) + "\n")
@@ -2423,38 +3319,29 @@ MODE=$1
         self.assertEqual(decoded["id"], self.identity)
         self.assertFalse(decoded["state_corrupt"])
 
-    def test_missing_final_newline_uses_corrupt_lock_protocol(self):
-        import fcntl
+    def test_missing_final_newline_never_confirms_or_recovers(self):
         self.orphan(status="completed")
         (self.job / "done").write_text(self.identity)
         state = (self.job / "state").read_bytes()[:-1]
         (self.job / "state").write_bytes(state)
         archive = (self.job / "raw.txt").read_bytes()
-        inode = (self.job / "worker.lock").stat().st_ino
-        with (self.job / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertEqual(self.shell("status").stdout.splitlines(),
-                             ["corrupt", self.identity, "unconfirmed", "present"])
-            self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
-            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
-            self.assertEqual(self.shell("stop", self.identity).returncode, 0)
+        self.assertEqual(self.shell("status").stdout.splitlines(),
+                     ["corrupt", self.identity, "unconfirmed", "present"])
+        self.assertNotEqual(self.shell("launch", "e" * 32, "1", "1", "").returncode, 0)
+        self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
+        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
         result = self.shell("status")
         self.assertEqual(result.stdout.splitlines(),
-                         ["corrupt", self.identity, "inactive", "present"])
+                 ["corrupt", self.identity, "unconfirmed", "present"])
         decoded = TopCapture._decode(TopCapture.__new__(TopCapture), "device-1", result.stdout)
-        self.assertFalse(decoded["running"])
+        self.assertTrue(decoded["running"])
         self.assertTrue(decoded["state_corrupt"])
-        job = self.root / ("e" * 32)
-        self.command("timeout", 'sleep 1; exit 124')
-        self.command("nohup", 'touch ' + shlex.quote(str(job / "ready")))
-        result = self.shell("launch", job.name, "1", "1", "")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(decoded["connected"])
+        self.assertNotEqual(self.shell("pull", self.identity).returncode, 0)
         self.assertEqual((self.job / "state").read_bytes(), state)
         self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
-        self.assertEqual((self.job / "worker.lock").stat().st_ino, inode)
 
     def test_shell_and_python_state_constraints_agree(self):
-        import fcntl
         self.orphan(status="completed")
         (self.job / "done").write_text(self.identity)
         baseline = (self.job / "state").read_text().splitlines()
@@ -2487,17 +3374,13 @@ MODE=$1
                     if not expected_valid:
                         with self.assertRaises(AdbError):
                             decoder._decode("device-1", state + "102\n")
-                    for busy in (False, True):
-                        with (self.job / "worker.lock").open("r+") as lock:
-                            if busy:
-                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            result = self.shell("status")
-                            self.assertEqual(result.returncode, 0, result.stderr)
-                            decoded = decoder._decode("device-1", result.stdout)
-                            self.assertEqual(decoded.get("state_corrupt", False), not expected_valid)
-                            self.assertEqual(decoded["running"], busy)
-                            self.assertEqual(decoded["connected"], not busy)
-                            self.assertEqual(decoded["id"], self.identity)
+                    result = self.shell("status")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    decoded = decoder._decode("device-1", result.stdout)
+                    self.assertEqual(decoded.get("state_corrupt", False), not expected_valid)
+                    self.assertEqual(decoded["running"], not expected_valid)
+                    self.assertEqual(decoded["connected"], expected_valid)
+                    self.assertEqual(decoded["id"], self.identity)
                     self.assertEqual((self.job / "state").read_text(), state)
                     self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
 
@@ -2528,75 +3411,21 @@ MODE=$1
                 self.assertEqual((self.job / "raw.txt").read_bytes(), archive)
                 self.assertFalse((self.job / "done").exists())
 
-    def test_corrupt_clear_holds_locks_and_preserves_metadata(self):
-        import sys
-        self.orphan()
-        (self.job / "state").write_bytes(b"\0" * 81)
-        for name in ("sample", "header"):
-            (self.job / name).write_bytes(b"unfinished")
-        historical = self.root / ("a" * 32)
-        historical.mkdir()
-        for name in ("state", "raw.txt", "sample", "header", "worker.lock"):
-            (historical / name).write_bytes((self.job / name).read_bytes())
-        self.assertEqual(self.shell("stop", self.identity).returncode, 0)
-        preserved = [self.root / "current", self.root / "control.lock", self.script]
-        preserved += [job / name for job in (historical, self.job) for name in ("state", "worker.lock")]
-        before = {p: (p.read_bytes(), p.stat().st_ino) for p in preserved}
-        self.command("truncate", shlex.quote(sys.executable) + " -c " + shlex.quote(
-            "import fcntl,sys\nfrom pathlib import Path\n"
-            "p=Path(sys.argv[2])\n"
-            "for lock in (p.parent/'worker.lock', p.parent.parent/'control.lock'):\n"
-            " with lock.open('r') as f:\n"
-            "  try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-            "  except BlockingIOError: pass\n"
-            "  else: raise AssertionError('lock not held: '+str(lock))\n"
-            "with p.open('r+b') as f: f.truncate(int(sys.argv[1]))"
-        ) + ' "$2" "$3"')
-        result = self.shell("clear", self.identity)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        for p, expected in before.items():
-            self.assertEqual((p.read_bytes(), p.stat().st_ino), expected)
-        for job in (historical, self.job):
-            for name in ("raw.txt", "sample", "header"):
-                self.assertEqual((job / name).stat().st_size, 0)
-            self.assertTrue((job / "cleaned").is_file())
-            self.assertFalse((job / "done").exists())
-        self.assertEqual(self.shell("status").stdout.splitlines(),
-                         ["corrupt", self.identity, "inactive", "cleaned"])
-
-    def test_historical_live_lock_and_stale_identity_prevent_corrupt_clear(self):
-        import fcntl
-        self.orphan()
-        (self.job / "state").write_bytes(b"broken")
-        historical = self.root / ("e" * 32)
-        historical.mkdir()
-        (historical / "state").write_bytes(b"broken")
-        (historical / "worker.lock").touch()
-        (historical / "raw.txt").write_bytes(b"still writing")
-        original = (self.job / "raw.txt").read_bytes()
-        self.assertNotEqual(self.shell("clear", "f" * 32).returncode, 0)
-        with (historical / "worker.lock").open("r+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertNotEqual(self.shell("clear", self.identity).returncode, 0)
-            self.assertEqual((self.job / "raw.txt").read_bytes(), original)
-            self.assertEqual((historical / "raw.txt").read_bytes(), b"still writing")
-            self.assertFalse((self.job / "cleaned").exists())
-
     def test_recovery_rejects_short_archive_invalid_state_and_symlink(self):
         self.orphan()
         (self.job / "raw.txt").write_bytes(b"short")
-        self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
+        self.assert_pending_receipt(self.shell("status"))
         self.assertEqual((self.job / "raw.txt").read_bytes(), b"short")
         self.assertFalse((self.job / "done").exists())
         self.orphan()
         state = (self.job / "state").read_text()
         (self.job / "state").write_text(state.replace(str(len(RAW)), "-1"))
         self.assertEqual(self.shell("status").stdout.splitlines(),
-                         ["corrupt", self.identity, "inactive", "present"])
+                         ["corrupt", self.identity, "unconfirmed", "present"])
         (self.job / "state").write_text(state)
         (self.job / "raw.txt").rename(self.job / "safe-archive")
         (self.job / "raw.txt").symlink_to(self.fixture)
-        self.assertEqual(self.shell("status").stdout.splitlines()[-1], "unconfirmed")
+        self.assert_pending_receipt(self.shell("status"))
         self.assertEqual(self.fixture.read_bytes(), TOP)
         self.assertFalse((self.job / "done").exists())
 
@@ -2640,10 +3469,12 @@ MODE=$1
         self.assertEqual((self.job / "raw.txt").stat().st_size, 0)
 
     def test_detachment_failure_and_cooperative_stop(self):
-        self.orphan()
-        self.command("readlink", 'case "$1" in /proc/*/fd/0) echo "$WORKER_LOCK";; *) echo /dev/pts/1;; esac')
+        self.prepare_worker()
+        self.write_script()
+        self.command("readlink", 'echo /dev/pts/1')
         self.reject_worker_entry()
-        self.command("readlink", 'case "$1" in /proc/*/fd/0) echo "$WORKER_LOCK";; /proc/*/fd/[12]) echo /dev/null;; *) exec /usr/bin/readlink "$@";; esac')
+        self.command("readlink", 'case "$1" in /proc/*/fd/[012]) echo /dev/null;; *) exec /usr/bin/readlink "$@";; esac')
+        self.prepare_worker(target=-1)
         (self.job / "stop").touch()
         state = self.worker(target=-1)
         self.assertEqual(state[1:3], ["stopped", "0"])

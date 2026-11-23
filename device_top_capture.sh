@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # Rootless collector. State is data only: never source/eval device metadata.
-ROOT=/data/local/tmp/sysmonitor_top_capture
+ROOT=/storage/emulated/0/Download/sysmonitor_top_capture
 MAX_BYTES=1000000000
 MAX_SAMPLE=8388608
 PROC=/proc
@@ -40,7 +40,7 @@ archive_name() {
 }
 current() {
     [ -f "$ROOT/current" ] && [ ! -L "$ROOT/current" ] || fail 'Unsafe current pointer'
-    [ -r "$ROOT/current" ] || fail 'Top current pointer permission denied; use the original capture user; state unconfirmed'
+    [ -r "$ROOT/current" ] || fail 'Top current pointer permission denied; preserve task data for manual inspection; state unconfirmed'
     SIZE=$(wc -c < "$ROOT/current") || fail 'Cannot read current capture identity'
     # Accept the original no-newline format and one optional LF, not a prefix.
     { [ "$SIZE" -eq 32 ] || [ "$SIZE" -eq 33 ]; } || fail 'Invalid current capture identity'
@@ -53,8 +53,18 @@ state() {
     printf '%s\n' "$ID" "$STATUS" "$COUNT" "$TARGET" "$INTERVAL" "$BYTES" "$ERROR" "$TITLE" "$STARTED_AT" "$ENDED_AT" > "$DIR/state.new" &&
         mv "$DIR/state.new" "$DIR/state" || exit 1
 }
+abort_worker() {
+    # Preserve evidence and the permanent claim. No receipt, rollback or recovery.
+    exit 1
+}
 finish() {
-    # A signal during append must never publish a partial sample.
+    [ "${INTERRUPTED:-0}" -eq 0 ] || abort_worker
+    # Serialize terminal publication against recovery clear in new workers.
+    commit_lock
+    trap release_commit EXIT
+    trap 'trap - EXIT; exit 1' HUP INT TERM
+    [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || abort_worker
+    # Only normal cooperative completion may publish a terminal receipt.
     trap '' TERM INT
     [ ! -L "$DIR/$ARCHIVE_NAME" ] || exit 1
     truncate -s "$BYTES" "$DIR/$ARCHIVE_NAME" || exit 1
@@ -74,22 +84,37 @@ monotonic_ms() {
         printf "%.0f\n", $1 * 1000; valid=1; exit
     } END { if (!valid) exit 1 }' "$PROC/uptime"
 }
+commit_lock() {
+    # Never steal a lock from an interrupted finish/clear operation.
+    mkdir "$DIR/commit.busy" 2>/dev/null || fail 'Task commit is active or interrupted'
+}
+release_commit() {
+    rmdir "$DIR/commit.busy" 2>/dev/null || :
+}
+release_control() {
+    # Only the process that created this directory installs this trap.
+    rmdir "$ROOT/control.busy" 2>/dev/null || :
+}
+control_busy() {
+    [ -e "$ROOT/control.busy" ] || [ -L "$ROOT/control.busy" ]
+}
+release_snapshot() {
+    rm -f "$STATE_FILE" || return 1
+    rmdir "$SNAPSHOT_DIR" 2>/dev/null || :
+}
 control_lock() {
-    [ ! -L "$ROOT/control.lock" ] || fail 'Unsafe control lock'
-    if [ -e "$ROOT/control.lock" ]; then
-        [ -f "$ROOT/control.lock" ] || fail 'Unsafe control lock'
-        [ -w "$ROOT/control.lock" ] || fail 'Top control lock permission denied; use the original capture user; state unconfirmed'
-    fi
-    # Check creation/open in a subshell: redirection failure on exec may kill
-    # the shell outright. Never truncate or replace an existing lock inode.
-    ( : >> "$ROOT/control.lock" ) || fail 'Cannot open Top control lock; check capture user and permissions; state unconfirmed'
-    exec 0>> "$ROOT/control.lock" || fail 'Cannot open Top control lock; state unconfirmed'
-    flock -n 0 || fail 'Another device operation is active; retry'
+    # FUSE supports atomic mkdir, not flock. Never steal a stale directory:
+    # an interrupted controller may still have children touching task data.
+    mkdir "$ROOT/control.busy" 2>/dev/null ||
+        fail 'Another device operation is active or interrupted; state unconfirmed'
+    trap release_control EXIT
+    # A signal may leave a foreground child alive. Keep the directory reserved.
+    trap 'trap - EXIT; exit 1' HUP INT TERM
 }
 state_validity() (
     # 0 = valid, 1 = corrupt data, 2 = unreadable/unsafe/tool failure.
-    [ -f "$DIR/state" ] && [ -r "$DIR/state" ] && [ ! -L "$DIR/state" ] || exit 2
-    SIZE=$(wc -c < "$DIR/state") || exit 2
+    [ -f "${STATE_FILE:-$DIR/state}" ] && [ -r "${STATE_FILE:-$DIR/state}" ] && [ ! -L "${STATE_FILE:-$DIR/state}" ] || exit 2
+    SIZE=$(wc -c < "${STATE_FILE:-$DIR/state}") || exit 2
     case "$SIZE" in ''|*[!0-9[:space:]]*) exit 2;; esac
     [ "$SIZE" -le 2048 ] || exit 1
     LC_ALL=C awk -v id="$ID" -v max="$MAX_BYTES" -v size="$SIZE" '
@@ -134,11 +159,11 @@ state_validity() (
         # bytes on awk implementations that discard them while parsing input.
         { bytes+=length($0)+1 }
         END { exit (bad || bytes!=size+0 || (NR!=8 && NR!=10)) ? 42 : 0 }
-    ' "$DIR/state"
+    ' "${STATE_FILE:-$DIR/state}"
     case $? in 0) exit 0;; 42) exit 1;; *) exit 2;; esac
 )
 validate_state() {
-    state_validity || fail 'Invalid or unreadable state; retry recovery'
+    state_validity || fail 'Invalid or unreadable state; no automatic recovery; preserve task data'
 }
 load_state() {
     validate_state
@@ -149,244 +174,66 @@ load_state() {
         IFS= read -r ERROR; IFS= read -r TITLE
         IFS= read -r STARTED_AT || STARTED_AT=0
         IFS= read -r ENDED_AT || ENDED_AT=0
-    } < "$DIR/state"
+    } < "${STATE_FILE:-$DIR/state}"
     archive_name "$DIR"
 }
-# A corrupt task has no trustworthy committed byte count: never recover/truncate
-# its archive. It may be bypassed only with a verified modern lifetime lock.
-# Keep its files for manual deletion; query and launch both hold control.lock.
-lock_worker() {
-    [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] || return 1
-    exec 0< "$DIR/worker.lock" || return 1
-    flock -n 0 || return 1
-    [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] &&
-        [ "$DIR/worker.lock" -ef /proc/self/fd/0 ]
-}
-worker_inactive() ( lock_worker )
-inactive_invalid_state() (
-    [ -f "$DIR/state" ] && [ -r "$DIR/state" ] && [ ! -L "$DIR/state" ] || return 1
-    worker_inactive || return 1
-    # Only invalid state data, not archive metadata errors, permits bypass.
-    state_validity >/dev/null 2>&1
-    [ "$?" -eq 1 ]
+# A boot identity is kernel-provided, never inferred from wall time or PIDs.
+boot_identity() (
+    [ ! -L "$PROC/sys/kernel/random/boot_id" ] &&
+        [ -r "$PROC/sys/kernel/random/boot_id" ] || exit 1
+    VALUE=$(read_bytes 38 "$PROC/sys/kernel/random/boot_id") || exit 1
+    [ ${#VALUE} -eq 36 ] || exit 1
+    printf '%s\n' "$VALUE" | LC_ALL=C awk '
+        /^[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$/ {
+            n=split($0,a,"-"); if (n==5 && length(a[1])==8 && length(a[2])==4 &&
+                length(a[3])==4 && length(a[4])==4 && length(a[5])==12) ok=1
+        } END { exit !ok }' || exit 1
+    printf '%s\n' "$VALUE"
 )
+task_boot() (
+    [ ! -L "$DIR/boot" ] && [ -f "$DIR/boot" ] && [ -r "$DIR/boot" ] || exit 1
+    [ "$(wc -c < "$DIR/boot")" -eq 70 ] || exit 1
+    { IFS= read -r OWNER; IFS= read -r BOOT; } < "$DIR/boot" || exit 1
+    [ "$OWNER" = "$ID" ] || exit 1
+    # Validate exactly the same canonical UUID shape as the kernel value.
+    printf '%s\n' "$BOOT" | LC_ALL=C awk '
+        length($0)==36 && /^[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$/ {
+            n=split($0,a,"-"); if (n==5 && length(a[1])==8 && length(a[2])==4 &&
+                length(a[3])==4 && length(a[4])==4 && length(a[5])==12) ok=1
+        } END { exit !ok }' || exit 1
+    printf '%s\n' "$BOOT"
+)
+rebooted() (
+    # New workers refuse to enter a task belonging to another boot. This proof
+    # therefore excludes old writers without touching state, done or the archive.
+    case "$STATUS" in starting|running) ;; *) exit 1;; esac
+    SAVED_BOOT=$(task_boot) && LIVE_BOOT=$(boot_identity) || exit 1
+    [ "$SAVED_BOOT" != "$LIVE_BOOT" ]
+)
+confirmed_inactive() {
+    confirmed_terminal || rebooted
+}
 confirmed_terminal() {
+    # Old workers do not honor commit.busy/clear_unconfirmed. Never trust a
+    # receipt after recovery clear, including one published by an old worker.
+    [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || return 1
     case "$STATUS" in stopped|completed|error) ;; *) return 1;; esac
     [ ! -L "$DIR/done" ] && [ -f "$DIR/done" ] &&
         [ "$(read_bytes 34 "$DIR/done")" = "$ID" ]
 }
-legacy_quiet() (
-    ARCHIVE_NAME=${ARCHIVE_NAME:-raw.txt}
-    # No PID is ever signalled. Hidden/inaccessible proc entries cannot prove
-    # absence. Older workers have no inherited lock, so inspect open files too:
-    # an orphaned cat may still append after the worker itself has disappeared.
-    [ -d "$PROC/1" ] && [ -r "$PROC/mounts" ] || return 2
-    GROUP_IDS=$(id -G) || return 2
-    awk -v proc="$PROC" -v groups="$GROUP_IDS" '
-        $2==proc && $3=="proc" {
-            found=1; hidden="0"; gid=""; subset=0
-            n=split($4, options, ",")
-            for (i=1; i<=n; i++) {
-                split(options[i], pair, "=")
-                if (pair[1]=="hidepid") hidden=pair[2]
-                if (pair[1]=="gid") gid=pair[2]
-                if (pair[1]=="subset" && pair[2]!="all") subset=1
-            }
-            exempt=0
-            n=split(groups, ids, /[[:space:]]+/)
-            for (i=1; i<=n; i++) if (gid ~ /^[0-9]+$/ && ids[i]==gid) exempt=1
-            if (subset) bad=1
-            if (hidden!="0" && hidden!="off" &&
-                !((hidden=="1" || hidden=="2" || hidden=="noaccess" || hidden=="invisible") && exempt)) bad=1
-        }
-        END { exit (!found || bad) }
-    ' "$PROC/mounts" || return 2
-    # Helpers are private to this subshell. comm may contain spaces and ')'.
-    # 3 means a visibly vanished PID; unreadability is never absence.
-    identity() {
-        START=
-        if ! { IFS= read -r STAT < "$PROCESS/stat"; } 2>/dev/null; then
-            [ -r "$PROC" ] && [ -x "$PROC" ] && [ ! -e "$PROCESS" ] && return 3
-            return 2
-        fi
-        case "$STAT" in "${PROCESS##*/} ("*') '*) ;; *) return 2;; esac
-        REST=${STAT##*) }
-        set -f
-        set -- $REST
-        set +f
-        [ "$#" -ge 20 ] || return 2
-        shift 19
-        START=$1
-        case "$START" in ''|*[!0-9]*) return 2;; esac
-    }
-    snapshot() {
-        SNAP=
-        for PROCESS in "$PROC"/[0-9]*; do
-            identity; CHECK=$?
-            [ "$CHECK" -ne 3 ] || continue
-            [ "$CHECK" -eq 0 ] || return 2
-            SNAP="$SNAP ${PROCESS##*/}:$START"
-        done
-        [ -n "$SNAP" ]
-    }
-    # This is bounded observation, not a lifetime lock or a stop receipt.
-    # The legacy running chain has one worker shell and inherited cat writers;
-    # a vanished worker can leave such children, hence the added-identity pass.
-    # Assumes that known chain does not respawn or exec from unrelated tasks.
-    # Arbitrary future opens/execs and processes born AND gone between snapshots
-    # cannot be excluded by proc polling, however many quiet scans are repeated.
-    # Keep legacy starting rejected by the caller; never manufacture a lock.
-    SEEN=' '
-    ROUND=0
-    while [ "$ROUND" -lt 3 ]; do
-        snapshot || return 2
-        NEW=0
-        for TOKEN in $SNAP; do
-            PROCESS=$PROC/${TOKEN%%:*}
-            EXPECTED=${TOKEN#*:}
-            case "$SEEN" in *" $TOKEN "*) continue;; esac
-            case "$SEEN" in *" ${TOKEN%%:*}:"*) return 2;; esac
-            [ "$ROUND" -lt 2 ] || return 2
-            NEW=1
-            SEEN="$SEEN$TOKEN "
-            identity; CHECK=$?
-            [ "$CHECK" -ne 3 ] || continue
-            [ "$CHECK" -eq 0 ] && [ "$START" = "$EXPECTED" ] || return 2
-            ARGS=$(tr '\000' '\n' < "$PROCESS/cmdline" 2>/dev/null); CHECK=$?
-            identity; LIVE=$?
-            [ "$LIVE" -ne 3 ] || continue
-            [ "$LIVE" -eq 0 ] && [ "$START" = "$EXPECTED" ] && [ "$CHECK" -eq 0 ] || return 2
-            # Exact argv tokens, without two extra awk processes per PID.
-            INDEX=0; SHELL=0; CONTROLLER=0; WORKER=0; PREVIOUS=
-            while IFS= read -r ARG; do
-                INDEX=$((INDEX + 1))
-                case "$INDEX:$ARG" in 1:sh|1:/system/bin/sh) SHELL=1;; esac
-                if [ "$INDEX" -eq 2 ]; then
-                    HASH=${ARG#"$ROOT/control-"}; HASH=${HASH%.sh}
-                    case "$HASH" in ''|*[!0-9a-f]*) ;; *)
-                        [ "${#HASH}" -ne 64 ] || [ "$ARG" != "$ROOT/control-$HASH.sh" ] || CONTROLLER=1;;
-                    esac
-                fi
-                [ "$INDEX:$ARG" != 3:worker ] || WORKER=1
-                if [ "$PREVIOUS" = worker ] && [ "$ARG" = "$ID" ]; then
-                    [ "$INDEX" -eq 4 ] && [ "$SHELL$CONTROLLER$WORKER" = 111 ] && return 1
-                    return 2
-                fi
-                PREVIOUS=$ARG
-            done <<EOF
-$ARGS
-EOF
-            ATTEMPT=0
-            while :; do
-                [ -d "$PROCESS/fd" ] && [ -r "$PROCESS/fd" ] && [ -x "$PROCESS/fd" ] &&
-                    FDS=$(ls -A "$PROCESS/fd" 2>/dev/null)
-                CHECK=$?
-                identity; LIVE=$?
-                [ "$LIVE" -ne 3 ] || break
-                [ "$LIVE" -eq 0 ] && [ "$START" = "$EXPECTED" ] && [ "$CHECK" -eq 0 ] || return 2
-                set -- "$PROC/self"
-                for FD in $FDS; do
-                    case "$FD" in *[!0-9]*) return 2;; esac
-                    set -- "$@" "$PROCESS/fd/$FD" "$PROC/self"
-                done
-                [ "$#" -gt 1 ] || break
-                # self is a numeric delimiter after EACH fd, even when that fd
-                # closes. This attributes failures without a subprocess per fd.
-                LINKS=$(readlink "$@" 2>/dev/null); CHECK=$?
-                identity; LIVE=$?
-                [ "$LIVE" -ne 3 ] || break
-                [ "$LIVE" -eq 0 ] && [ "$START" = "$EXPECTED" ] || return 2
-                MARKER=; TARGET_LINK=; CLOSED=0
-                shift
-                while IFS= read -r LINK; do
-                    if [ -z "$MARKER" ]; then
-                        case "$LINK" in ''|*[!0-9]*) return 2;; esac
-                        MARKER=$LINK
-                    elif [ "$LINK" = "$MARKER" ]; then
-                        [ "$#" -ge 2 ] || return 2
-                        if [ -z "$TARGET_LINK" ]; then
-                            # An existing symlink, including a dangling one, is
-                            # NOT evidence of closure. Mixed EACCES/ENOENT fails.
-                            [ ! -L "$1" ] && [ ! -e "$1" ] || return 2
-                            CLOSED=$((CLOSED + 1))
-                        fi
-                        TARGET_LINK=
-                        shift 2
-                    else
-                        [ -z "$TARGET_LINK" ] && [ "$#" -ge 2 ] || return 2
-                        TARGET_LINK=$LINK
-                        case "$LINK" in "$DIR/$ARCHIVE_NAME"|"$DIR/$ARCHIVE_NAME (deleted)"|"$DIR/sample"|"$DIR/sample (deleted)"|"$DIR/header"|"$DIR/header (deleted)") return 1;; esac
-                    fi
-                done <<EOF
-$LINKS
-EOF
-                [ "$#" -eq 0 ] && [ -z "$TARGET_LINK" ] && [ -n "$MARKER" ] || return 2
-                [ "$CHECK" -ne 0 ] || { [ "$CLOSED" -eq 0 ] || return 2; break; }
-                # Only explicitly closed descriptors permit one local retry.
-                [ "$ATTEMPT" -eq 0 ] && [ "$CLOSED" -gt 0 ] || return 2
-                [ -r "$PROCESS/fd" ] && [ -x "$PROCESS/fd" ] || return 2
-                ATTEMPT=1
-            done
-        done
-        [ "$NEW" -ne 0 ] || return 0
-        ROUND=$((ROUND + 1))
-    done
-    return 2
-)
-recover() (
-    # The caller retains control.lock while this subshell takes the lifetime
-    # lock on stdin (inherited by every writer, including append subprocesses).
-    [ ! -L "$DIR/worker.lock" ] || fail 'Unsafe worker lock; retry recovery'
-    if [ -e "$DIR/worker.lock" ]; then
-        # Busy is not confirmed stopped, even if state becomes terminal before
-        # the caller reads it again. Also verify the opened lock inode.
-        lock_worker || fail 'Worker lock is not confirmed inactive; retry recovery'
-    else
-        # A legacy launch may still be delayed before exec of its worker.
-        [ "$STATUS" != starting ] || fail 'Legacy launch is unconfirmed; inspect device and retry recovery'
-        legacy_quiet || fail 'Legacy writer is not confirmed inactive; restore proc visibility and retry recovery'
-    fi
-    load_state
-    confirmed_terminal && exit 0
-    for FILE in "$ARCHIVE_NAME" done state.new stop; do
-        [ ! -L "$DIR/$FILE" ] || fail 'Unsafe recovery file'
-        [ ! -e "$DIR/$FILE" ] || [ -f "$DIR/$FILE" ] || fail 'Unsafe recovery file'
-    done
-    [ -f "$DIR/$ARCHIVE_NAME" ] || fail 'Missing archive; retry recovery'
-    SIZE=$(wc -c < "$DIR/$ARCHIVE_NAME") || fail 'Cannot inspect archive; retry recovery'
-    [ "$SIZE" -ge "$BYTES" ] || fail 'Archive shorter than committed bytes; retry recovery'
-    truncate -s "$BYTES" "$DIR/$ARCHIVE_NAME" || fail 'Cannot recover archive; retry recovery'
-    [ "$(wc -c < "$DIR/$ARCHIVE_NAME")" -eq "$BYTES" ] || fail 'Cannot verify archive; retry recovery'
-    STATUS=error; ERROR=interrupted
-    [ ! -f "$DIR/stop" ] || { STATUS=stopped; ERROR=none; }
-    ENDED_AT=$(date +%s)
-    printf '%s\n' "$ID" > "$DIR/done" || fail 'Cannot publish recovery; retry'
-    state
-)
+# Without a worker receipt or verified boot change, orphaned children may
+# still be writing. Never infer inactivity from PID absence or elapsed time.
 clear_task() (
     DIR=$1; ID=${DIR##*/}; ACTION=$2
     [ -d "$DIR" ] && [ ! -L "$DIR" ] || fail 'Unsafe task directory'
     archive_name "$DIR"
-    for FILE in done state cleaned "$ARCHIVE_NAME" sample header worker.lock; do
+    for FILE in done state cleaned "$ARCHIVE_NAME" sample header; do
         [ ! -L "$DIR/$FILE" ] || fail 'Unsafe task file'
         [ ! -e "$DIR/$FILE" ] || [ -f "$DIR/$FILE" ] || fail 'Unsafe task file'
     done
     [ -f "$DIR/state" ] && [ -r "$DIR/state" ] || fail 'Unreadable task state'
-    if ( validate_state ) >/dev/null 2>&1; then
-        load_state
-        confirmed_terminal || fail 'Capture is not stopped'
-        if [ -e "$DIR/worker.lock" ]; then
-            lock_worker || fail 'Capture lock is not confirmed inactive'
-        else
-            legacy_quiet || fail 'Legacy capture is not confirmed inactive'
-        fi
-    else
-        # No guessed byte count, recovery or done marker for corrupt data.
-        # Hold the verified lifetime lock throughout the entire truncation.
-        lock_worker || fail 'Corrupt capture lock is not confirmed inactive'
-        state_validity >/dev/null 2>&1
-        [ "$?" -eq 1 ] || fail 'Task state cannot be safely inspected'
-    fi
+    load_state
+    confirmed_inactive || fail 'Capture is not confirmed stopped'
     [ "$ACTION" = apply ] || exit 0
     for FILE in "$ARCHIVE_NAME" sample header; do
         [ ! -f "$DIR/$FILE" ] || truncate -s 0 "$DIR/$FILE" || fail 'Cannot clear Top logs'
@@ -398,23 +245,17 @@ shift
 [ ! -L "$ROOT" ] || fail 'Unsafe capture root'
 if [ -e "$ROOT" ]; then
     [ -d "$ROOT" ] && [ -r "$ROOT" ] && [ -x "$ROOT" ] ||
-        fail 'Top capture directory permission denied or invalid; use the original capture user; state unconfirmed'
+        fail 'Top capture directory permission denied or invalid; preserve task data for manual inspection; state unconfirmed'
 fi
 case "$MODE" in
-start)
-    for cmd in nohup setsid timeout flock truncate awk head wc cat mv date sleep top readlink tr ls; do
+start|launch)
+    for cmd in nohup setsid timeout truncate awk head wc cat mv date sleep top readlink tr ls; do
         command -v "$cmd" >/dev/null 2>&1 || fail "Unsupported device: missing $cmd"
     done
     head -c 0 /dev/null >/dev/null 2>&1 ||
         command -v dd >/dev/null 2>&1 || fail 'Unsupported device: head -c or dd required'
     mkdir -p "$ROOT" || fail 'Cannot create capture root'
-    # The lock is held for launch only, not during collection.
-    # Android mksh may close descriptors above 2 on exec. Use stdin for the
-    # launch lock; the detached worker replaces stdin with /dev/null.
     control_lock
-    exec sh "$0" launch "$@"
-    ;;
-launch)
     ID=$1; TARGET=$2; INTERVAL=$3; TITLE=$4
     valid_id "$ID" || fail 'Invalid capture identity'
     case "$TARGET" in -1) ;; ''|*[!0-9]*) fail 'Invalid count';; esac
@@ -422,22 +263,20 @@ launch)
     awk -v n="$INTERVAL" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n >= 1 && n <= 3600) }' || fail 'Invalid interval'
     case "$TITLE" in *[!0-9a-f]*) fail 'Invalid title';; esac
     [ ${#TITLE} -le 960 ] || fail 'Invalid title'
+    [ ! -L "$ROOT/current" ] || fail 'Unsafe current pointer'
     if [ -e "$ROOT/current" ]; then
         NEW_ID=$ID
         current
         archive_name "$DIR"
-        ( load_state; confirmed_terminal && {
-            if [ -e "$DIR/worker.lock" ] || [ -L "$DIR/worker.lock" ]; then
-                worker_inactive
-            else
-                legacy_quiet
-            fi
-        } ) 2>/dev/null || inactive_invalid_state ||
+        ( load_state; confirmed_inactive ) 2>/dev/null ||
             fail 'Previous capture is not confirmed stopped'
         ID=$NEW_ID
     fi
+    LIVE_BOOT=$(boot_identity) || fail 'Cannot verify device boot identity; capture not started'
     DIR=$ROOT/$ID
     mkdir "$DIR" || fail 'Capture already exists'
+    # Publish immutable boot evidence before state/current or any worker exists.
+    printf '%s\n%s\n' "$ID" "$LIVE_BOOT" > "$DIR/boot" || fail 'Cannot save device boot identity'
     # Verify timeout actually enforces a deadline, not just command presence.
     STARTED=$(date +%s)
     timeout -s KILL 1 sleep 3 >/dev/null 2>&1
@@ -453,15 +292,10 @@ launch)
     STARTED_AT=$(date +%s); ENDED_AT=0
     printf 'Top%s.txt\n' "$(date '+%Y%m%d%H%M%S')" > "$DIR/archive_name" || fail 'Cannot save archive name'
     archive_name "$DIR"
-    : > "$DIR/worker.lock" || fail 'Cannot create worker lock'
     : > "$DIR/$ARCHIVE_NAME" || fail 'Cannot create archive'
     state
     printf '%s' "$ID" > "$ROOT/current.new" && mv "$ROOT/current.new" "$ROOT/current" || fail 'Cannot publish task'
-    # Acquire before spawning: even a delayed child is covered when launch
-    # releases control.lock. The child inherits the same locked description.
-    exec 1> "$DIR/worker.lock"
-    flock -n 1 || fail 'Cannot acquire workerlock'
-    nohup setsid sh "$0" worker "$ID" "$TARGET" "$INTERVAL" "$TITLE" locked 0<&1 1>/dev/null 2>/dev/null &
+    nohup setsid sh "$0" worker "$ID" "$TARGET" "$INTERVAL" "$TITLE" </dev/null >/dev/null 2>&1 &
     # A worker must prove a separate session and acknowledge startup.
     N=0
     while [ ! -f "$DIR/ready" ] && [ "$N" -lt 4 ]; do sleep 1; N=$((N + 1)); done
@@ -472,23 +306,19 @@ worker)
     valid_id "$ID" || fail 'Invalid capture identity'
     DIR=$ROOT/$ID
     [ -d "$DIR" ] && [ ! -L "$DIR" ] || fail 'Unsafe worker directory'
-    # Only launch creates locks. Opening for reading cannot recreate a missing
-    # legacy lock or truncate an existing one, even if it disappears meanwhile.
-    [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] || fail 'Missing or unsafe worker lock'
-    if [ "$5" != locked ]; then
-        exec 0< "$DIR/worker.lock" || exit 1
-    fi
-    # The argument is not proof of ownership: verify the inherited open file
-    # description and acquire it non-blockingly before touching any task data.
-    [ "$(readlink /proc/$$/fd/0)" = "$DIR/worker.lock" ] &&
-        [ "$DIR/worker.lock" -ef /proc/$$/fd/0 ] || fail 'Invalid worker lock descriptor'
-    flock -n 0 || fail 'Worker already active or lock unavailable'
-    [ -f "$DIR/worker.lock" ] && [ ! -L "$DIR/worker.lock" ] &&
-        [ "$DIR/worker.lock" -ef /proc/$$/fd/0 ] || fail 'Worker lock changed'
+    EXPECTED=$ID
+    current
+    [ "$ID" = "$EXPECTED" ] || fail 'Capture identity changed'
+    load_state
+    [ "$STATUS" = starting ] && [ "$COUNT" -eq 0 ] && [ "$BYTES" -eq 0 ] || fail 'Worker task is not starting'
+    [ ! -e "$DIR/done" ] && [ ! -L "$DIR/done" ] || fail 'Worker already finished'
+    SAVED_BOOT=$(task_boot) && LIVE_BOOT=$(boot_identity) &&
+        [ "$SAVED_BOOT" = "$LIVE_BOOT" ] || fail 'Worker boot identity missing or changed'
+    mkdir "$DIR/worker.claim" || fail 'Worker already claimed'
     # /proc stat fields after the comm field: state, ppid, pgrp, session.
     SESSION=$(awk '{ sub(/^.*\) /, ""); print $4 }' /proc/$$/stat)
     [ "$SESSION" = "$$" ] || fail 'Worker detach failed'
-    for FD in 1 2; do
+    for FD in 0 1 2; do
         [ "$(readlink /proc/$$/fd/$FD)" = /dev/null ] || fail 'Worker detach failed'
     done
     COUNT=0; BYTES=0; STATUS=running; ERROR=none
@@ -505,7 +335,8 @@ worker)
     PERIOD_MS=$(awk -v n="$INTERVAL" 'BEGIN { printf "%.0f\n", n * 1000 }')
     NEXT_MS=$(monotonic_ms) || finish error clock_failed
     while :; do
-        [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
+        [ "$INTERRUPTED" -eq 0 ] || abort_worker
+        [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || abort_worker
         [ ! -f "$DIR/stop" ] || finish stopped none
         while :; do
             NOW_MS=$(monotonic_ms) || finish error clock_failed
@@ -515,7 +346,8 @@ worker)
                 if (ms > 1000) ms=1000; printf "%.3f", ms / 1000
             }')
             sleep "$WAIT" || { [ "$INTERRUPTED" -ne 0 ] || finish error clock_failed; }
-            [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
+            [ "$INTERRUPTED" -eq 0 ] || abort_worker
+            [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || abort_worker
             [ ! -f "$DIR/stop" ] || finish stopped none
         done
         # A whole missed period cannot be recovered by burst/duplicate samples.
@@ -526,7 +358,8 @@ worker)
         # its direct child (exec top), so no stale PID is ever signalled here.
         timeout -s KILL 10 sh -c 'ulimit -f 8192 || exit 1; exec top -b -n 1 -d 1' > "$DIR/sample" 2>&1
         RC=$?
-        [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
+        [ "$INTERRUPTED" -eq 0 ] || abort_worker
+        [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || abort_worker
         [ "$RC" -eq 0 ] || finish error top_failed_or_timeout
         SIZE=$(wc -c < "$DIR/sample")
         [ "$SIZE" -gt 0 ] && [ "$SIZE" -le "$MAX_SAMPLE" ] || finish error sample_limit
@@ -551,41 +384,78 @@ worker)
         ADDED=$((HEADER + SIZE + 2))
         [ "$((BYTES + ADDED))" -le "$MAX_BYTES" ] || finish stopped size_limit
         if ! { cat "$DIR/header" "$DIR/sample" && printf '\n\n'; } >> "$DIR/$ARCHIVE_NAME"; then
-            [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
-            truncate -s "$BYTES" "$DIR/$ARCHIVE_NAME" || exit 1
-            finish error disk_error
+            abort_worker
         fi
+        [ "$INTERRUPTED" -eq 0 ] || abort_worker
+        [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || abort_worker
         BYTES=$((BYTES + ADDED)); COUNT=$((COUNT + 1))
         state
-        [ "$INTERRUPTED" -eq 0 ] || finish stopped interrupted
+        [ "$INTERRUPTED" -eq 0 ] || abort_worker
+        [ ! -e "$DIR/clear_unconfirmed" ] && [ ! -L "$DIR/clear_unconfirmed" ] || abort_worker
         [ "$TARGET" = -1 ] || [ "$COUNT" -lt "$TARGET" ] || finish completed none
     done
     ;;
 status)
-    [ -e "$ROOT/current" ] || { echo idle; exit 0; }
-    control_lock
+    # Observation must never own the mutation lock: an interrupted poll must
+    # not permanently block stop/pull. Existing locks are observed, never stolen.
+    CONTROL_BUSY=
+    control_busy && CONTROL_BUSY=1
+    [ ! -L "$ROOT/current" ] || fail 'Unsafe current pointer'
+    if [ ! -e "$ROOT/current" ]; then
+        [ -z "$CONTROL_BUSY" ] && ! control_busy ||
+            fail 'Another device operation is active or interrupted; state unconfirmed'
+        echo idle; exit 0
+    fi
     current
-    if ! ( validate_state ) >/dev/null 2>&1; then
-        CONFIRMATION=unconfirmed
-        inactive_invalid_state && ( archive_name "$DIR" ) >/dev/null 2>&1 && CONFIRMATION=inactive
-        printf 'corrupt\n%s\n%s\n' "$ID" "$CONFIRMATION"
+    # A private bounded snapshot keeps validation and output on the same bytes.
+    # On interruption leave only this unique scratch directory, not a global lock;
+    # a surviving foreground reader cannot interfere with any subsequent query.
+    SNAPSHOT_DIR=$(mktemp -d "$ROOT/status.XXXXXXXXXX") || fail 'Cannot create status snapshot'
+    STATE_FILE=$SNAPSHOT_DIR/state
+    trap release_snapshot EXIT
+    trap 'trap - EXIT; exit 1' HUP INT TERM
+    if ! { [ ! -L "$DIR/state" ] && [ -f "$DIR/state" ] && [ -r "$DIR/state" ] &&
+        (set -C; read_bytes 2049 "$DIR/state" > "$STATE_FILE") &&
+        ( validate_state ); } >/dev/null 2>&1; then
+        printf 'corrupt\n%s\nunconfirmed\n' "$ID"
         if [ -f "$DIR/cleaned" ] && [ ! -L "$DIR/cleaned" ]; then echo cleaned; else echo present; fi
+        if [ -e "$DIR/clear_unconfirmed" ] || [ -L "$DIR/clear_unconfirmed" ]; then echo clear_unconfirmed; fi
+        if [ -n "$CONTROL_BUSY" ] || control_busy; then echo control_busy; fi
         exit 0
     fi
     load_state
     UNCONFIRMED=
-    if ! confirmed_terminal; then
-        recover || UNCONFIRMED=1
-    elif [ -e "$DIR/worker.lock" ] || [ -L "$DIR/worker.lock" ]; then
-        worker_inactive || UNCONFIRMED=1
-    else
-        legacy_quiet || UNCONFIRMED=1
-    fi
-    read_bytes 2048 "$DIR/state" || fail 'Cannot read capture state'
+    case "$STATUS" in
+        stopped|completed|error) confirmed_terminal || UNCONFIRMED=1;;
+    esac
+    read_bytes 2048 "$STATE_FILE" || fail 'Cannot read capture state'
     date +%s
     [ "$ARCHIVE_NAME" = raw.txt ] || printf 'archive=%s\n' "$ARCHIVE_NAME"
     [ ! -f "$DIR/cleaned" ] || echo cleaned
     [ -z "$UNCONFIRMED" ] || echo unconfirmed
+    rebooted && echo rebooted
+    if [ -e "$DIR/clear_unconfirmed" ] || [ -L "$DIR/clear_unconfirmed" ]; then echo clear_unconfirmed; fi
+    if [ -n "$CONTROL_BUSY" ] || control_busy; then echo control_busy; fi
+    ;;
+clear-live)
+    # Explicit recovery affects only this task; no stop proof or fake receipt.
+    EXPECTED=$1
+    valid_id "$EXPECTED" || fail 'Invalid capture identity'
+    control_lock
+    current
+    [ "$ID" = "$EXPECTED" ] || fail 'Capture identity changed'
+    load_state
+    for FILE in "$ARCHIVE_NAME" sample header clear_unconfirmed; do
+        [ ! -L "$DIR/$FILE" ] || fail 'Unsafe task file'
+        [ ! -e "$DIR/$FILE" ] || [ -f "$DIR/$FILE" ] || fail 'Unsafe task file'
+    done
+    commit_lock
+    trap 'release_commit; release_control' EXIT
+    # Record the destructive operation before touching logs, even on partial failure.
+    : > "$DIR/clear_unconfirmed" || fail 'Cannot mark recovery clear'
+    for FILE in "$ARCHIVE_NAME" sample header; do
+        [ ! -f "$DIR/$FILE" ] || truncate -s 0 "$DIR/$FILE" || fail 'Cannot clear Top logs'
+    done
     ;;
 clear)
     EXPECTED=$1
@@ -593,8 +463,8 @@ clear)
     control_lock
     current
     [ "$ID" = "$EXPECTED" ] || fail 'Capture identity changed'
-    # Preflight all tasks, then recheck and hold each lifetime lock while clearing.
-    # The parent keeps control.lock; no new task may launch during either pass.
+    # Preflight all tasks, then recheck terminal states and receipts before clearing.
+    # Keep control.busy throughout; permanent worker claims prevent reentry.
     for ACTION in check apply; do
         for TASK in "$ROOT"/*; do
             valid_id "${TASK##*/}" || continue
@@ -602,7 +472,7 @@ clear)
         done
     done
     ;;
-stop|pull)
+stop|pull|pull-live)
     control_lock
     EXPECTED=$1
     valid_id "$EXPECTED" || fail 'Invalid capture identity'
@@ -612,17 +482,20 @@ stop|pull)
         [ ! -L "$DIR/stop" ] || fail 'Unsafe stop marker'
         [ ! -e "$DIR/stop" ] || [ -f "$DIR/stop" ] || fail 'Unsafe stop marker'
         : > "$DIR/stop" || fail 'Cannot request stop; retry'
-        # No polling, proc scan or signals here; status performs recovery.
+        # No polling, proc scan, signals or recovery; status only observes receipts.
     else
         [ ! -e "$DIR/cleaned" ] || fail 'Top logs already cleared'
         load_state
-        confirmed_terminal || fail 'Capture is not confirmed stopped; retry status'
-        [ ! -L "$DIR/done" ] && [ -f "$DIR/done" ] &&
-            [ "$(read_bytes 34 "$DIR/done")" = "$ID" ] || fail 'Capture is not stopped'
-        [ ! -L "$DIR/$ARCHIVE_NAME" ] || fail 'Unsafe archive'
-        SIZE=$(wc -c < "$DIR/$ARCHIVE_NAME")
+        if [ "$MODE" != pull-live ]; then
+            confirmed_inactive || fail 'Capture is not confirmed stopped; retry status'
+        fi
+        [ ! -L "$DIR/$ARCHIVE_NAME" ] && [ -f "$DIR/$ARCHIVE_NAME" ] || fail 'Unsafe archive'
+        SIZE=$(wc -c < "$DIR/$ARCHIVE_NAME") || fail 'Cannot measure archive'
         [ "$SIZE" -le "$MAX_BYTES" ] || fail 'Archive exceeds 1000000000 bytes'
-        read_bytes "$((MAX_BYTES + 1))" "$DIR/$ARCHIVE_NAME" || fail 'Cannot read capture archive'
+        # Recovery copies only the initially measured prefix, never chases growth.
+        LIMIT=$((MAX_BYTES + 1))
+        [ "$MODE" != pull-live ] || LIMIT=$SIZE
+        read_bytes "$LIMIT" "$DIR/$ARCHIVE_NAME" || fail 'Cannot read capture archive'
     fi
     ;;
 *) fail 'Unknown operation';;

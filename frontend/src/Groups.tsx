@@ -9,7 +9,7 @@ import { GroupResults } from './GroupResults'
 const emptyGroup = (segment: number): GroupConfig => ({ name: '', segment, members: [], scene: '未标注', start: null, end: null, description: '' })
 const configOf = (group: GroupConfig): GroupConfig => ({ name: group.name, segment: group.segment, members: group.members, scene: group.scene, start: group.start, end: group.end, description: group.description })
 
-export function Groups({ id, segment, onSegment, disabled, settingsRevision }: { id: string; segment: number; onSegment: (value: number) => void; disabled: boolean; settingsRevision: number }) {
+export function Groups({ id, segment, onSegment, disabled, settingsRevision, sourceFormat }: { sourceFormat?: string; id: string; segment: number; onSegment: (value: number) => void; disabled: boolean; settingsRevision: number }) {
   const [revision, setRevision] = useState(0)
   const groups = useResource<ProcessGroup[]>(groupPath(id), revision)
   const [draft, setDraft] = useState(() => emptyGroup(segment))
@@ -109,7 +109,7 @@ export function Groups({ id, segment, onSegment, disabled, settingsRevision }: {
       {mutation.error && <p className="banner error" role="alert">{mutation.error} {failedLoad ? <button disabled={locked} onClick={() => load(failedLoad)}>重试读取组</button> : '草稿已保留，可再次保存或删除重试。'}</p>}
       {notice && !dirty && <p className="banner success" role="status">{notice}</p>}
     </section>
-    <Processes id={id} segment={segment} onSegment={onSegment} disabled={locked} members={draft.members} memberSegment={draft.segment} onToggle={toggle} />
-    <GroupResults id={id} groups={groups.data ?? []} selected={analysis} onSelect={setAnalysis} revision={revision + settingsRevision} disabled={locked} />
+    <Processes sourceFormat={sourceFormat} id={id} segment={segment} onSegment={onSegment} disabled={locked} members={draft.members} memberSegment={draft.segment} onToggle={toggle} />
+    <GroupResults sourceFormat={sourceFormat} id={id} groups={groups.data ?? []} selected={analysis} onSelect={setAnalysis} revision={revision + settingsRevision} disabled={locked} />
   </>
 }

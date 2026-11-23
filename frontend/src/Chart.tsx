@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { init, use as registerCharts } from 'echarts/core'
 import { LineChart, ScatterChart, BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, AriaComponent, MarkLineComponent } from 'echarts/components'
@@ -30,11 +30,15 @@ interface ChartProps {
   // 按原始字段匹配；数值必须来自同范围的原始统计，单位与趋势一致。
   percentiles?: Record<string, { p95?: number | null; p99?: number | null }>
   defaultShowPercentiles?: boolean
+  sourceFormat?: string
 }
 
 // 数值格式化与请求类型统一来自 API 层。
 
-export function SeriesChart({ title, unit, metrics, references, data, loading, error, mode = 'line', note, percentiles, defaultShowPercentiles = false }: ChartProps) {
+export function SeriesChart({ title, unit, metrics, references, data, loading, error, mode = 'line', note, percentiles, defaultShowPercentiles = false, sourceFormat }: ChartProps) {
+  const isTop = sourceFormat === 'top'
+  const [topAxis, setTopAxis] = useState<'cycle' | 'time'>('cycle')
+  const cycleAxis = isTop && topAxis === 'cycle'
   const [showPercentiles, setShowPercentiles] = useState(defaultShowPercentiles)
   const hasPercentiles = metrics.some(({ field }) => [percentiles?.[field]?.p95, percentiles?.[field]?.p99].some((value) => typeof value === 'number' && Number.isFinite(value)))
   const host = useRef<HTMLDivElement>(null)
@@ -46,17 +50,47 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
     if (!host.current || !hasData || loading || error) return
     const element = host.current
     let chart: ReturnType<typeof init> | undefined
+    const sources = [
+      ...metrics.map((metric) => ({ ...metric, data, scale: 1, reference: false })),
+      ...(references ?? []).map((metric) => ({ ...metric, reference: true })),
+    ]
+    // ECharts 的 axis 提示每条曲线只返回一个最近点；按真实横坐标保留全部样本。
+    const topTooltips = sources.map(({ field, label, data: source, scale = 1 }) => {
+      const entries = new Map<number, string[]>()
+      if (isTop) source?.points.forEach((point) => {
+        const x = cycleAxis ? point.cycle : point.ts
+        const raw = point[field]
+        const value = typeof raw === 'number' && Number.isFinite(raw) ? scaleMetric(raw, scale) : null
+        const text = memoryUnit ? formatMemory(value, memoryUnit) : formatMetricValue(value, unit)
+        const identity = `周期 ${point.cycle} · 段 ${point.segment}${point.pid == null ? '' : ` · PID ${point.pid}`}`
+        const row = `${label}: ${text}${value == null || memoryUnit ? '' : ` ${unit}`}\n  原始时间 ${formatTime(point.ts)} · ${identity}`
+        const rows = entries.get(x) ?? []
+        rows.push(row)
+        entries.set(x, rows)
+      })
+      return entries
+    })
     const option: EChartsOption = {
       animation: false,
       color: ['#4f6cf6', '#11a897', '#ed9b3b', '#b178e8', '#e16c87'],
       textStyle: { fontFamily: 'system-ui, sans-serif', color: '#62718a' },
-      aria: { enabled: true, description: `${title}${displayUnit ? `，${displayUnit}` : ''}，横轴为本地时间。` },
+      aria: { enabled: true, description: `${title}${displayUnit ? `，${displayUnit}` : ''}，横轴为${cycleAxis ? '实际采样周期' : '本地时间'}。` },
       tooltip: {
         trigger: mode === 'scatter' ? 'item' : 'axis', renderMode: 'richText', confine: true,
         formatter: (params) => {
           const items = Array.isArray(params) ? params : [params]
           const first = items[0]?.value
           const timestamp = Array.isArray(first) && typeof first[0] === 'number' ? first[0] : null
+          if (isTop) {
+            const seen = new Set<string>()
+            return items.flatMap((item) => {
+              const x = Array.isArray(item.value) ? item.value[0] : null
+              const key = `${item.seriesIndex}:${x}`
+              if (typeof x !== 'number' || seen.has(key)) return []
+              seen.add(key)
+              return topTooltips[item.seriesIndex ?? -1]?.get(x) ?? []
+            }).join('\n')
+          }
           return [formatTime(timestamp), ...items.map((item) => {
             const raw = Array.isArray(item.value) ? item.value[1] : null
             const value = typeof raw === 'number' ? raw : null
@@ -69,9 +103,10 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
       legend: { top: 0, type: 'scroll', textStyle: { color: '#62718a', fontSize: 11 } },
       grid: { top: 50, left: 88, right: 28, bottom: 94 },
       xAxis: {
-        type: 'time', min: 'dataMin', max: 'dataMax', name: '本地时间', nameLocation: 'middle', nameGap: 47,
-        axisLabel: { hideOverlap: true, formatter: (value: number) => formatTime(value, 'axis') },
-        axisPointer: { label: { formatter: (params) => formatTime(Number(params.value)) } },
+        type: cycleAxis ? 'value' : 'time', min: 'dataMin', max: 'dataMax', name: cycleAxis ? '采样周期' : '本地时间', nameLocation: 'middle', nameGap: 47,
+        minInterval: cycleAxis ? 1 : undefined,
+        axisLabel: { hideOverlap: true, formatter: (value: number) => cycleAxis ? formatNumber(value, 0) : formatTime(value, 'axis') },
+        axisPointer: { snap: cycleAxis ? true : undefined, label: { formatter: (params) => cycleAxis ? `周期 ${formatNumber(Number(params.value), 0)}` : formatTime(Number(params.value)) } },
         splitLine: { show: false }, axisLine: { lineStyle: { color: '#d9e1ec' } },
       },
       yAxis: {
@@ -79,21 +114,19 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
         axisLabel: { formatter: (value: number) => memoryUnit ? formatMemory(value, memoryUnit) : formatMetricValue(value, unit) },
         splitLine: { lineStyle: { color: '#edf1f6', type: 'dashed' } },
       },
-      dataZoom: [{ type: 'inside' }, { type: 'slider', height: 16, bottom: 2, borderColor: 'transparent', labelFormatter: (value: number) => formatTime(value) }],
-      series: [
-        ...metrics.map((metric) => ({ ...metric, data, scale: 1, reference: false })),
-        ...(references ?? []).map((metric) => ({ ...metric, reference: true })),
-      ].map(({ field, label, data: source, scale = 1, reference }) => {
+      dataZoom: [{ type: 'inside' }, { type: 'slider', height: 16, bottom: 2, borderColor: 'transparent', labelFormatter: (value: number) => cycleAxis ? `周期 ${formatNumber(value, 0)}` : formatTime(value) }],
+      series: sources.map(({ field, label, data: source, scale = 1, reference }) => {
         const seriesMode = reference ? 'line' : mode
         const values: (number | null)[][] = []
         source?.points.forEach((point, index) => {
           const previous = source.points[index - 1]
-          // 各曲线保留自身时间与周期，不对独立降采样的数据按数组下标拼接。
-          if (seriesMode === 'line' && previous && (point.segment !== previous.segment || point.pid !== previous.pid || point.cycle > previous.cycle + 1 || point.ts <= previous.ts)) {
-            values.push([point.ts, null])
-          }
+          // 周期轴不受秒精度时间重复影响；不重编号、不拼接独立降采样的数据。
+          const x = cycleAxis ? point.cycle : point.ts
+          const discontinuous = previous && (point.segment !== previous.segment || point.pid !== previous.pid
+            || (cycleAxis ? point.cycle !== previous.cycle + 1 : point.cycle > previous.cycle + 1 || point.ts <= previous.ts || (isTop && point.cycle <= previous.cycle)))
+          if (seriesMode === 'line' && discontinuous) values.push([x, null])
           const value = point[field]
-          values.push([point.ts, typeof value === 'number' ? scaleMetric(value, scale) : null])
+          values.push([x, typeof value === 'number' && Number.isFinite(value) ? scaleMetric(value, scale) : null])
         })
         return {
           name: label, type: seriesMode, data: values, connectNulls: false,
@@ -126,11 +159,12 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
     observer.observe(element)
     resize()
     return () => { observer.disconnect(); chart?.dispose() }
-  }, [data, metrics, references, title, unit, mode, hasData, loading, error, memoryUnit, displayUnit, percentiles, showPercentiles])
+  }, [data, metrics, references, title, unit, mode, hasData, loading, error, memoryUnit, displayUnit, percentiles, showPercentiles, isTop, cycleAxis])
 
   return (
     <section className="panel chart-panel" aria-label={title}>
       <div className="panel-heading"><h3>{title}</h3>{displayUnit && <span className="unit">{displayUnit}</span>}</div>
+      {isTop && <label className="metric-select">横轴 <select aria-label={`${title}横轴`} value={topAxis} onChange={(event) => setTopAxis(event.target.value as 'cycle' | 'time')}><option value="cycle">采样周期</option><option value="time">原始时间</option></select></label>}
       {percentiles && <label><input type="checkbox" checked={showPercentiles} disabled={!hasPercentiles} onChange={(event) => setShowPercentiles(event.target.checked)} />显示 P95 / P99 参考线（原始样本分位数，非准入阈值）{!hasPercentiles && ' · 暂无有效分位数'}</label>}
       {loading ? <div className="chart-placeholder" role="status">正在读取趋势…</div>
         : error ? <div className="chart-placeholder error" role="alert">{error}</div>
@@ -138,6 +172,7 @@ export function SeriesChart({ title, unit, metrics, references, data, loading, e
         : <div ref={host} className="chart" role="img" aria-label={`${title}趋势${displayUnit ? `，单位 ${displayUnit}` : ''}`} />}
       <p className="chart-caption">
         {data && !error && !loading && `${data.sampled ? '已降采样 · 限额内优先保留极值' : '原始记录'} · 展示 ${formatNumber(data.points.length, 0)} / ${formatNumber(data.total, 0)} 条。`}
+        {isTop && (cycleAxis ? '按实际采样周期绘制，不代表等间隔时间；原始时间见悬浮提示。重复周期、跨段、PID 变化及缺失仍断线。' : '按原始时间绘制；同秒样本可能重叠，悬浮提示保留同坐标样本，可切换采样周期轴。')}
         {note || '拖动底部滑块缩放；缺失记录不补零。'}
       </p>
     </section>
@@ -253,8 +288,8 @@ export function Trend({ path, statisticsPath, active = true, ...props }: Omit<Ch
 }
 
 // 按需加载精确统计，避免打开会话时同时排序所有指标。
-export function StatisticsPanel({ title, path, trendPath, disabled }: {
-  title: string; path: string | null; trendPath: string | null; disabled: boolean
+export function StatisticsPanel({ title, path, trendPath, disabled, sourceFormat }: {
+  title: string; path: string | null; trendPath: string | null; disabled: boolean; sourceFormat?: string
 }) {
   const [open, setOpen] = useState(false)
   const [field, setField] = useState('')
@@ -278,7 +313,7 @@ export function StatisticsPanel({ title, path, trendPath, disabled }: {
         <label className="metric-select">查看任意数值指标趋势 <select value={field} disabled={disabled} onChange={(event) => setField(event.target.value)}>
           <option value="">选择指标</option>{Object.entries(data.metrics).map(([key, item]) => <option key={key} value={key}>{item.label} · {key}</option>)}
         </select></label>
-        {metric && <Trend path={trendPath} percentiles={data.metrics} title={metric.label} unit={metric.unit} metrics={[{ field, label: metric.label }]} mode="scatter" note={metric.note || '全部数值字段均可查看；缺失不补零。'} />}
+        {metric && <Trend sourceFormat={sourceFormat} path={trendPath} percentiles={data.metrics} title={metric.label} unit={metric.unit} metrics={[{ field, label: metric.label }]} mode="scatter" note={metric.note || '全部数值字段均可查看；缺失不补零。'} />}
         {Object.entries(data.categories).map(([key, category]) => <details key={key}>
           <summary>{category.label}（{key}）· {formatNumber(category.count, 0)} 个有效样本</summary>
           <p>{category.note || '分类频数按原始样本计算，不代表时间占比。'}</p>
@@ -292,7 +327,6 @@ export function StatisticsPanel({ title, path, trendPath, disabled }: {
 }
 
 // 重试只影响当前图，避免重新请求所有明细。
-import { useState } from 'react'
 function useRetry(): [number, () => void] {
   const [revision, setRevision] = useState(0)
   return [revision, () => setRevision((value) => value + 1)]

@@ -34,11 +34,15 @@ class AdbController:
         # Local service lifetime only; PID observations are not process birth times.
         self.capture_times = {}
 
-    def run(self, *args, timeout=30, output=None):
+    def run(self, *args, timeout=30, output=None, input_data=None):
         if not self.executable:
             raise AdbError("未找到 adb，请安装 Android platform-tools 并加入 PATH", 503)
         try:
-            result = subprocess.run([self.executable, *args], stdin=subprocess.DEVNULL,
+            # subprocess.run owns PIPE/communicate when input is supplied, also
+            # with streamed stdout. Existing callers retain closed stdin.
+            stdin_options = ({"stdin": subprocess.DEVNULL} if input_data is None
+                             else {"input": input_data})
+            result = subprocess.run([self.executable, *args], **stdin_options,
                                     stdout=output if output is not None else subprocess.PIPE,
                                     stderr=subprocess.PIPE, timeout=timeout, shell=False)
         except subprocess.TimeoutExpired as exc:
@@ -75,10 +79,20 @@ class AdbController:
         finally:
             self.lock.release()
 
-    def shell(self, serial, script, root=False, output=None):
+    def shell(self, serial, script, root=False, output=None, *, via_stdin=False):
+        if via_stdin:
+            return self.run("-s", serial, "shell", "-T", "su 0 sh -s" if root else "sh -s",
+                            input_data=self.shell_input(script),
+                            timeout=40 if output is not None else 30, output=output)
         command = "su 0 sh -c " + shlex.quote(script) if root else "sh -c " + shlex.quote(script)
         return self.run("-s", serial, "shell", "-T", command,
                         timeout=40 if output is not None else 30, output=output)
+
+    @staticmethod
+    def shell_input(script):
+        # Parse the entire compound before running it; a truncated transfer must
+        # not execute a partial guard or action. No script text enters argv.
+        return ("(\n" + script + "\n)\n").encode("utf-8")
 
     def _shell_step(self, serial, script, root=False, *, step):
         try:
@@ -293,6 +307,8 @@ class AdbController:
                 raise AdbError("设备没有可拉取的性能日志")
             with ExitStack() as stack:
                 sources = [(path.name, stack.enter_context(path.open("rb"))) for path in paths]
+                for _, stream in sources:
+                    stream._capture_log_directory = folder
                 started = self._capture_timing(serial, [], False)["started_at"]
                 result = store.import_files(sources, capture_method="SysMonitor",
                                             device_name=device.get("model") or serial,

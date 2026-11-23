@@ -29,7 +29,9 @@ from perf_adb import AdbController, AdbError
 from perf_report import REPORT_CSP, render_report
 from perf_report_compact import REPORT_CSP as COMPACT_REPORT_CSP
 from perf_store import Store, safe_filename
-from urllib.parse import quote
+from perf_storage import StorageBusy, StorageInsufficientSpace
+from urllib.parse import quote, urlencode
+from perf_report_dates import normalize_dates, report_dates, validate_dates
 from perf_top_capture import TopCapture
 from perf_qnx_capture import QnxCapture, validate_target
 from perf_version import VERSION
@@ -37,6 +39,35 @@ from perf_version import VERSION
 MAX_FILE_BYTES = 1024 * 1024 * 1024
 # 最多 5 个文件，额外预留 1 MiB multipart 表单开销。
 MAX_BODY_BYTES = 5 * MAX_FILE_BYTES + 1024 * 1024
+
+
+class StorageConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm: bool = Field(strict=True)
+
+
+class StorageDeleteRequest(StorageConfirmation):
+    session_ids: list[str] = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_ids(self):
+        if any(not sid.strip() or len(sid) > 128 for sid in self.session_ids):
+            raise ValueError("会话 ID 必须是非空字符串，且最多 128 个字符")
+        return self
+
+
+class SessionMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_ids: list[str] = Field(min_length=2, max_length=1000)
+    name: str = Field(default="", max_length=120)
+
+    @model_validator(mode="after")
+    def validate_ids(self):
+        if any(not sid.strip() or len(sid) > 128 for sid in self.session_ids):
+            raise ValueError("会话 ID 必须是非空字符串，且最多 128 个字符")
+        if len(set(self.session_ids)) != len(self.session_ids):
+            raise ValueError("不能重复选择同一会话")
+        return self
 
 
 class LocalBoundary:
@@ -149,6 +180,10 @@ class TopTaskRequest(TopConfirmRequest):
     capture_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
+class TopRecoveryRequest(TopTaskRequest):
+    allow_unconfirmed: bool = Field(default=False, strict=True)
+
+
 class TopStartRequest(TopConfirmRequest):
     serial: str = Field(min_length=1, max_length=200)
     count: int = Field(default=-1, ge=-1, le=100000, strict=True)
@@ -241,6 +276,7 @@ class AdmissionCreateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     scenes: Optional[dict[int, Literal["background", "foreground", "unknown"]]] = None
     factor: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    dates: Optional[list[str]] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -248,6 +284,10 @@ class AdmissionCreateRequest(BaseModel):
         if not isinstance(values, dict):
             raise ValueError("请求必须是对象")
         values = dict(values)
+        if "dates" in values:
+            if not isinstance(values["dates"], list):
+                raise ValueError("dates必须是非空日期数组")
+            values["dates"] = normalize_dates(values["dates"])
         title = values.get("title")
         if isinstance(title, str) and (not title.strip() or "\x00" in title):
             raise ValueError("标题无效")
@@ -392,9 +432,17 @@ def create_app(database, port=8765, development=False, frontend=None):
         try:
             def invoke():
                 reject_qnx_if_present(store, session_id)
-                jobs = admission_jobs()
                 if operation == "create":
-                    return jobs.create(session_id, **body.model_dump())
+                    params = body.model_dump()
+                    if params["dates"] is None:
+                        params.pop("dates")
+                    else:
+                        try:
+                            params["dates"] = validate_dates(store, session_id, params["dates"])
+                        except ValueError as exc:
+                            raise AdmissionJobError(str(exc)) from None
+                    return admission_jobs().create(session_id, **params)
+                jobs = admission_jobs()
                 if operation == "publish":
                     return jobs.publish(session_id, draft_id, **body.model_dump())
                 if operation == "list":
@@ -495,17 +543,17 @@ def create_app(database, port=8765, development=False, frontend=None):
             raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/top/pull")
-    def top_pull(body: TopTaskRequest):
+    def top_pull(body: TopRecoveryRequest):
         try:
-            return top.pull(body.serial, body.capture_id)
+            return top.pull(body.serial, body.capture_id, allow_unconfirmed=body.allow_unconfirmed)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except OSError as exc:
             raise HTTPException(503, "本地归档写入失败，未覆盖已有归档") from exc
 
     @app.post("/api/top/clear")
-    def top_clear(body: TopTaskRequest):
-        return top.clear(body.serial, body.capture_id)
+    def top_clear(body: TopRecoveryRequest):
+        return top.clear(body.serial, body.capture_id, allow_unconfirmed=body.allow_unconfirmed)
 
     @app.post("/api/top/import")
     def top_import(body: TopImportRequest):
@@ -566,6 +614,15 @@ def create_app(database, port=8765, development=False, frontend=None):
     @app.exception_handler(KeyError)
     async def missing(_request, _exc):
         return JSONResponse({"detail": "会话或进程组不存在或已删除"}, status_code=404)
+
+    @app.exception_handler(StorageBusy)
+    async def storage_busy(_request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(StorageInsufficientSpace)
+    async def storage_space(_request, exc):
+        return JSONResponse({"detail": str(exc), "required_bytes": exc.required_bytes,
+                             "free_bytes": exc.free_bytes}, status_code=507)
 
     @app.exception_handler(sqlite3.OperationalError)
     async def database_error(_request, _exc):
@@ -665,16 +722,67 @@ def create_app(database, port=8765, development=False, frontend=None):
             lambda **callbacks: compare_sessions(store, baseline, target, baseline_segment, target_segment, **callbacks),
             compare_slots, "对比")
 
+    def checked_report_dates(session_id, dates):
+        try:
+            return validate_dates(store, session_id, dates)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/report-dates")
+    def available_report_dates(session_id: str):
+        with store.connect() as db:
+            return report_dates(db, session_id)
+
     @app.get("/api/sessions/{session_id}/report/stream")
-    async def report_stream(session_id: str, style: Literal["default", "compact"] = "default"):
+    async def report_stream(session_id: str, style: Literal["default", "compact"] = "default",
+                            dates: Optional[list[str]] = Query(default=None)):
+        dates = await run_in_threadpool(checked_report_dates, session_id, dates)
         def prepare_report(**callbacks):
-            # Keep HTML out of NDJSON; the download endpoint reuses this style's cache.
+            # Keep HTML out of NDJSON; the download endpoint reuses this selection's cache.
+            params = []
             if style == "compact":
                 callbacks["style"] = style
+                params.append(("style", style))
+            if dates is not None:
+                callbacks["dates"] = dates
+                params.extend(("dates", day) for day in dates)
             render_report(store, session_id, **callbacks)
-            return f"/api/sessions/{session_id}/report" + ("?style=compact" if style == "compact" else "")
+            return f"/api/sessions/{session_id}/report" + ("?" + urlencode(params) if params else "")
 
         return analysis_stream(prepare_report, report_slots, "性能分析")
+
+    def storage_operation(action, *args):
+        # Sync routes run in FastAPI's worker pool. Hold the import lock through
+        # database commit AND filesystem cleanup, including capture state saves.
+        if not import_lock.acquire(blocking=False):
+            raise StorageBusy("已有导入或存储维护正在进行，请稍后重试")
+        try:
+            return action(*args)
+        finally:
+            import_lock.release()
+
+    def require_storage_confirmation(body):
+        if body.confirm is not True:
+            raise HTTPException(400, "请明确确认存储维护操作")
+
+    @app.get("/api/storage")
+    def storage_usage():
+        return storage_operation(store.storage_usage)
+
+    @app.post("/api/storage/delete")
+    def storage_delete(body: StorageDeleteRequest):
+        require_storage_confirmation(body)
+        return storage_operation(store.delete_many, body.session_ids)
+
+    @app.post("/api/storage/retry-cleanup")
+    def storage_retry(body: StorageConfirmation):
+        require_storage_confirmation(body)
+        return storage_operation(store.retry_pending_cleanup)
+
+    @app.post("/api/storage/reclaim")
+    def storage_reclaim(body: StorageConfirmation):
+        require_storage_confirmation(body)
+        return storage_operation(store.reclaim_space)
 
     @app.get("/api/sessions")
     def sessions():
@@ -708,15 +816,23 @@ def create_app(database, port=8765, development=False, frontend=None):
         finally:
             import_lock.release()
 
+    @app.post("/api/sessions/merge")
+    def merge_sessions(body: SessionMergeRequest):
+        try:
+            return storage_operation(store.merge_sessions, body.session_ids, body.name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.get("/api/sessions/{session_id}")
     def overview(session_id: str):
         return store.overview(session_id)
 
     @app.delete("/api/sessions/{session_id}")
     def delete(session_id: str):
-        if not store.delete(session_id):
+        result = storage_operation(store.delete_many, [session_id])
+        if not result["deleted_ids"]:
             raise HTTPException(404, "会话不存在或已删除")
-        return {"deleted": True}
+        return dict(result, deleted=True)
 
     @app.get("/api/sessions/{session_id}/series")
     def series(session_id: str, kind: Literal["S", "P", "D", "DE", "DP"],
@@ -796,8 +912,16 @@ def create_app(database, port=8765, development=False, frontend=None):
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/sessions/{session_id}/report")
-    def report(session_id: str, style: Literal["default", "compact"] = "default"):
-        document = render_report(store, session_id, style=style) if style == "compact" else render_report(store, session_id)
+    def report(session_id: str, style: Literal["default", "compact"] = "default",
+               dates: Optional[list[str]] = Query(default=None)):
+        dates = checked_report_dates(session_id, dates)
+        options = {} if dates is None else {"dates": dates}
+        if style == "compact":
+            options["style"] = style
+        try:
+            document = render_report(store, session_id, **options)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         session = store.session(session_id)
         filename = safe_filename(session["name"], fallback="report") + ".html"
         csp = COMPACT_REPORT_CSP if style == "compact" else REPORT_CSP

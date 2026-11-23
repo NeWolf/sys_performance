@@ -2,6 +2,8 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import sqlite3
+from concurrent.futures import CancelledError
 import threading
 import zlib
 
@@ -10,7 +12,7 @@ from perf_report_data import _progress_reporter, build_report_data
 from perf_report_ui import CSS, JS, REPORT_CSP, render_document
 
 # Bump when Python report/statistics semantics change; assets/CSP invalidate automatically.
-REPORT_CACHE_VERSION = "28:" + hashlib.sha256(
+REPORT_CACHE_VERSION = "34:" + hashlib.sha256(
     (CSS + "\0" + JS + "\0" + REPORT_CSP).encode("utf-8")).hexdigest()
 # Bounded process-wide locks also coalesce requests through separate Store instances.
 _REPORT_LOCKS = tuple(threading.Lock() for _ in range(64))
@@ -28,7 +30,7 @@ def timestamp(value, *, local=False):
         return str(value) + " ms"
 
 
-def render_report(store, session_id, progress=None, cancelled=None, *, style="default"):
+def render_report(store, session_id, progress=None, cancelled=None, *, style="default", dates=None):
     """Reuse a durable complete report; only successful generation is published."""
     if style not in ("default", "compact"):
         raise ValueError("未知报告样式")
@@ -47,6 +49,17 @@ def render_report(store, session_id, progress=None, cancelled=None, *, style="de
             session = db.execute("SELECT summary FROM sessions WHERE id=?", (session_id,)).fetchone()
             if session is None:
                 raise KeyError(session_id)
+            from perf_report_dates import date_filter, normalize_dates
+            dates = normalize_dates(dates)
+            if dates is not None:
+                import os
+                import time
+                if cancelled is not None:
+                    db.set_progress_handler(lambda: int(cancelled()), 10000)
+                date_filter(db, session_id, dates)
+                identity = [dates, os.environ.get("TZ"), time.tzname, time.timezone, time.altzone]
+                version += ":dates:" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+            options = {} if dates is None else {"dates": dates}
             is_qnx = json.loads(session["summary"]).get("source_format") == "qnx"
             if is_qnx:
                 import perf_qnx_report
@@ -64,12 +77,12 @@ def render_report(store, session_id, progress=None, cancelled=None, *, style="de
                 report("complete")
                 return document
         if is_qnx:
-            data = perf_qnx_report.build_report_data(store, session_id, progress=progress, cancelled=cancelled)
+            data = perf_qnx_report.build_report_data(store, session_id, progress=progress, cancelled=cancelled, **options)
             document = perf_qnx_report.render_document(data, style=style, progress=progress, cancelled=cancelled)
         else:
             # Both Android styles need the complete system stream for per-cycle overlays.
             data = build_report_data(store, session_id, progress=progress,
-                                     cancelled=cancelled, include_full_system=True)
+                                     cancelled=cancelled, include_full_system=True, **options)
             report("render")
             document = renderer(data)
         report("compress")
@@ -87,5 +100,9 @@ def render_report(store, session_id, progress=None, cancelled=None, *, style="de
             report("save")  # Cancellation before commit leaves the previous cache intact.
         report("complete")
         return document
+    except sqlite3.OperationalError:
+        if dates is not None and cancelled is not None and cancelled():
+            raise CancelledError() from None
+        raise
     finally:
         lock.release()

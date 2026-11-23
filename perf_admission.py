@@ -199,7 +199,8 @@ def _write(path, content):
 
 
 def build_admission(store, session_id, template: list, output_dir: Path,
-                    scenes: dict[int, str] | None = None, factor: float | None = None) -> dict:
+                    scenes: dict[int, str] | None = None, factor: float | None = None,
+                    *, dates=None) -> dict:
     """Fill the template block tree and write report.json.
 
     Returns the filled blocks, a sandbox-safe preview and the warnings.
@@ -217,6 +218,8 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     Group scene配置在独立快照中读取，样本仍来自同一份一致性报告数据。
     """
     reject_qnx_if_present(store, session_id)
+    from perf_report_dates import validate_dates
+    dates = validate_dates(store, session_id, dates)
     if factor is not None and (not _valid(factor) or factor <= 0):
         raise ValueError("factor必须是显式正有限数值或None")
     # K列不留空：未显式给出系数时沿用离线报告同一个常量，使5.2与“当前实测”逐行可比。
@@ -229,7 +232,8 @@ def build_admission(store, session_id, template: list, output_dir: Path,
         raise ValueError("scenes可省略；给出时每段必须是background/foreground/unknown")
     names = [entry["name"] for entry in REQUIRED_PROCESSES]
     layout = perf_slate.validate_template(deepcopy(template), required_names=names)
-    data = build_report_data(store, session_id, include_full_system=True)
+    options = {} if dates is None else {"dates": dates}
+    data = build_report_data(store, session_id, include_full_system=True, **options)
     segments = {s["segment"] for s in data["systems"]}
     if scenes is not None and set(scenes) - segments:
         raise ValueError("scenes包含未观测的segment，不允许额外段")
@@ -283,7 +287,7 @@ def build_admission(store, session_id, template: list, output_dir: Path,
     by_id = {p["id"]: p for p in data["processes"]}
     matched = []
     for required in data["required"]:
-        processes = [] if required["truncated"] else [by_id[pid] for pid in required["matches"]]
+        processes = [by_id[pid] for pid in required["matches"]]
         matched.append(processes)
         row = layout.process_row(required["name"])
         source = EXCEL_BUDGETS[required["excel_row"]]
@@ -318,13 +322,15 @@ def build_admission(store, session_id, template: list, output_dir: Path,
                 colors.append(color)
             perf_slate.write_row(row, texts, offset, colors=colors)
     covered = sum(any(p["p_records"] for p in group) for group in matched)
-    warnings.append(f"可靠匹配采集覆盖：{covered}/{len(data['required'])}；歧义候选不参与，截断WebView始终留空。")
+    warnings.append(f"可靠匹配采集覆盖：{covered}/{len(data['required'])}；歧义候选不参与；WebView仅精确匹配或唯一完整服务名补全匹配参与统计。")
     missing = [r["name"] for r, group in zip(data["required"], matched) if not any(p["p_records"] for p in group)]
     if missing:
         warnings.append("未可靠采集：" + "、".join(missing))
 
     warnings.append("5.1趋势图依次为总CPU（单核%，可超过100%）和整机已用内存（MB÷1024，GB）；"
                     "横轴为跨段全量系统样本顺序，非等间隔时间轴；缺值、缺周期、时间不递增及段间断线，不补零。")
+    if dates is not None:
+        warnings.insert(0, data["session"]["date_selection_note"])
     blocks = _with_charts(layout, full) + perf_slate.note_blocks(warnings)
     perf_slate.validate_tree(blocks, allow_images=True)
     output_dir = Path(output_dir).resolve()

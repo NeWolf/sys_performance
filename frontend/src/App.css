@@ -1,8 +1,30 @@
 [hidden] { display: none !important; }
+.operation-progress { position: fixed; right: 24px; bottom: 24px; z-index: 150; width: min(520px, calc(100vw - 32px)); padding: 18px 20px; border: 1px solid #bdcaff; border-radius: 12px; background: #f5f7ff; color: #354983; box-shadow: 0 8px 32px #223b6b26; overflow-wrap: anywhere; }
+.operation-progress-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; font-size: 13px; }
+.operation-progress-heading span { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; }
+.operation-progress p { margin: 8px 0 0; font-size: 12px; line-height: 1.6; }
+.operation-progress-track { height: 6px; margin-top: 14px; overflow: hidden; border-radius: 4px; background: #dfe6ff; }
+.operation-progress-track span { display: block; width: 35%; height: 100%; border-radius: inherit; background: #526bf0; animation: operation-progress-slide 1.5s ease-in-out infinite; }
+@keyframes operation-progress-slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+@media (prefers-reduced-motion: reduce) { .operation-progress-track span { animation: none; width: 100%; opacity: .6; } }
+@media (max-width: 760px) { .operation-progress { right: 16px; bottom: 16px; } }
 .local-import { margin-top: 20px; }
 .local-import > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
 .local-import > summary span { font-weight: 400; color: #7b879b; margin-left: 12px; font-size: 12px; }
 .local-import .import-form.capture-import { border: 0; margin: 16px 0 0; padding: 0; }
+.session-merge { padding: 20px; }
+.merge-note { margin: 12px 0; color: #6f7d92; font-size: 12px; line-height: 1.7; }
+.merge-filters, .merge-actions { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.merge-filters label { display: grid; gap: 6px; font-size: 12px; min-width: 0; max-width: 100%; }
+.merge-filters input { min-width: 0; max-width: 100%; }
+.merge-actions { align-items: center; font-size: 12px; }
+.merge-list { max-height: 360px; overflow-y: auto; border: 1px solid #e4eaf3; border-radius: 8px; padding: 0 12px; }
+.merge-row { display: flex; align-items: flex-start; gap: 10px; padding: 12px 0; cursor: pointer; }
+.merge-row + .merge-row { border-top: 1px solid #edf1f7; }
+.merge-row input { margin-top: 3px; flex: 0 0 auto; }
+.merge-row > span { min-width: 0; display: grid; gap: 4px; overflow-wrap: anywhere; }
+.merge-row strong { font-size: 13px; }
+.merge-row small { font-size: 11px; color: #6f7d92; }
 .analysis-report { overflow: hidden; border: 1px solid #26334c; border-radius: 14px; background: #0b1120; margin-bottom: 22px; }
 .analysis-report-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; color: #e2e8f0; border-bottom: 1px solid #26334c; }
 .analysis-report-toolbar p, .analysis-report-note { color: #94a3b8; font-size: 12px; }
@@ -192,6 +214,13 @@ details ul { padding-left: 20px; max-height: 270px; overflow: auto; color: #7e8c
 .config-toolbar label { min-width: 0; }
 .config-toolbar select { max-width: 100%; }
 .config-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+.report-dates { margin-bottom: 20px; }
+.report-dates legend { margin-bottom: 10px; font-weight: 600; }
+.report-dates p { margin: 8px 0; font-size: 13px; }
+.report-date-options { display: flex; flex-wrap: wrap; gap: 10px 18px; }
+.report-date-options label { display: inline-flex; align-items: center; gap: 6px; }
+.report-date-options input { margin: 0; flex: 0 0 auto; }
+.report-dates .banner button { margin-left: 10px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 18px 0; }
 .form-grid label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .form-grid input, .form-grid textarea, .form-grid select { width: 100%; }

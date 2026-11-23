@@ -304,9 +304,14 @@ class AdmissionJobs:
             self._open()
             return self._meta(self._find(session_id, draft_id))
 
-    def create(self, session_id, draft_id, title, scenes=None, factor=None):
+    def create(self, session_id, draft_id, title, scenes=None, factor=None, *, dates=None):
         session_id, draft_id = _id(session_id), _id(draft_id)
         reject_qnx_if_present(self._store, session_id)
+        from perf_report_dates import validate_dates
+        try:
+            dates = validate_dates(self._store, session_id, dates)
+        except ValueError as exc:
+            raise AdmissionJobError(str(exc)) from None
         if not isinstance(title, str) or not title.strip() or len(title) > 200 or "\x00" in title:
             raise AdmissionJobError("标题不能为空、含NUL或超过200字符。")
         if scenes is not None and (not isinstance(scenes, dict) or any(type(k) is not int for k in scenes)
@@ -322,6 +327,8 @@ class AdmissionJobs:
             raise AdmissionJobError("factor必须是正有限数值或None。")
         config = {"title": title, "factor": factor,
                   "scenes": None if scenes is None else [[k, v] for k, v in sorted(scenes.items())]}
+        if dates is not None:
+            config["dates"] = dates
         with self._mutex:
             self._open(write=True)
             existing = self._records.get(draft_id)
@@ -433,12 +440,15 @@ class AdmissionJobs:
             directory = self._directory(record)
             directory.mkdir(exist_ok=True)
             scenes = record["config"]["scenes"]
+            from perf_report_dates import validate_dates
+            dates = validate_dates(self._store, record["session_id"], record["config"].get("dates"))
+            options = {} if dates is None else {"dates": dates}
             stage = "template"
             template = read_template()
             stage = "build"
             result = build_admission(self._store, record["session_id"], template, directory,
                                      None if scenes is None else dict(scenes),
-                                     record["config"]["factor"])
+                                     record["config"]["factor"], **options)
             stage = "snapshot"
             blocks, record["source_sha256"] = report_snapshot(directory / "report.json")
             stage = "preview"

@@ -1,0 +1,39 @@
+.storage-view { display: grid; gap: 18px; }
+.storage-view > .banner { margin: 0; }
+.storage-view h2 { font-size: 16px; }
+.storage-view p { line-height: 1.7; }
+.storage-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.storage-toolbar label { font-size: 12px; }
+.storage-toolbar select { margin-left: 8px; }
+.storage-view .actions { flex-wrap: wrap; }
+.storage-stats .stat strong { font-size: clamp(20px, 2vw, 29px); overflow-wrap: anywhere; }
+.storage-stats .stat small { display: block; line-height: 1.7; color: #6f7d92; }
+.storage-sessions { overflow: hidden; }
+.storage-sessions > .storage-toolbar { padding: 18px 20px; }
+.storage-sessions > .storage-selection { padding-top: 0; }
+.storage-table { table-layout: fixed; min-width: 620px; }
+.storage-table th:first-child { width: 58px; }
+.storage-table th:nth-child(2) { width: 40%; text-align: left; }
+.storage-table th:nth-child(n+3) { width: 18%; }
+.storage-table input[type=checkbox] { width: 16px; height: 16px; accent-color: #526bf0; cursor: pointer; }
+.storage-table .storage-name { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.storage-table .storage-name strong { color: #405474; }
+.storage-table small { display: block; color: #7b879b; margin-top: 5px; white-space: normal; }
+.storage-table .storage-unmanaged { color: #946722; }
+.storage-note { padding: 16px 20px; border-top: 1px solid #e4eaf3; color: #6f7d92; font-size: 12px; }
+.storage-note details { margin-top: 10px; padding-bottom: 0; }
+.storage-note details p { margin-top: 8px; }
+.storage-maintenance { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 20px; flex-wrap: wrap; }
+.storage-maintenance > div:first-child { flex: 1 1 280px; }
+.storage-maintenance p { margin-top: 8px; }
+.storage-view .banner ul { padding-left: 20px; margin: 6px 0 0; }
+@media (max-width: 1100px) {
+  .storage-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .storage-stats { gap: 10px; }
+  .storage-stats .stat { padding: 14px; }
+  .storage-sessions > .storage-toolbar, .storage-note, .storage-maintenance { padding: 14px; }
+  .storage-maintenance .actions { flex: 1 1 100%; }
+  .storage-maintenance button { flex: 1 1 auto; }
+}

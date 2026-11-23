@@ -76,11 +76,48 @@ class FakeAdb(AdbController):
         return ""
 
 
+class AdbInputTests(unittest.TestCase):
+    def test_stdin_script_keeps_argv_short_and_preserves_binary_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            adb = AdbController(folder, executable="fake-adb")
+            script = "printf '中文'; printf '\\000\\377'"
+            with patch("perf_adb.subprocess.run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, b"ok\n", b"")
+                self.assertEqual(adb.shell("unit", script, via_stdin=True), "ok")
+                self.assertEqual(run.call_args.args[0], ["fake-adb", "-s", "unit", "shell", "-T", "sh -s"])
+                self.assertEqual(run.call_args.kwargs["input"], adb.shell_input(script))
+                self.assertNotIn("stdin", run.call_args.kwargs)
+                self.assertEqual(run.call_args.kwargs["timeout"], 30)
+            with tempfile.TemporaryFile() as output:
+                # Use local sh as the executable, never a device or real Store.
+                local = AdbController(folder, executable="sh")
+                local.run("-s", input_data=local.shell_input(script), output=output)
+                output.seek(0)
+                self.assertEqual(output.read(), "中文".encode() + b"\x00\xff")
+                with self.assertRaises(AdbError) as error:
+                    local.run("-s", input_data=local.shell_input("sleep 1"), timeout=0.01)
+                self.assertEqual(error.exception.status, 504)
+
+    def test_truncated_script_does_not_execute_partial_action(self):
+        payload = AdbController.shell_input("printf unsafe")
+        for end in (payload.index(b"unsafe"), len(payload) - 2):
+            result = subprocess.run(["sh", "-s"], input=payload[:end], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+
+    def test_existing_calls_keep_closed_stdin(self):
+        with tempfile.TemporaryDirectory() as folder, patch("perf_adb.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+            AdbController(folder, executable="fake-adb").run("devices", "-l")
+            self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertNotIn("input", run.call_args.kwargs)
+
+
 class AdbTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.adb = FakeAdb(Path(self.temp.name) / "logs")
+        self.adb = FakeAdb(Path(self.temp.name) / "adb_logs")
         self.store = Store(Path(self.temp.name) / "test.sqlite3")
 
     def test_devices_and_root(self):
@@ -131,8 +168,9 @@ class AdbTests(unittest.TestCase):
     def test_pull_naming_falls_back_to_first_record_without_valid_start(self, _sleep):
         for scenario in ("never_started", "observed", "expired_running", "expired_stopped"):
             with self.subTest(scenario=scenario):
-                adb = FakeAdb(Path(self.temp.name) / scenario)
-                store = Store(Path(self.temp.name) / f"{scenario}.sqlite3")
+                base = Path(self.temp.name) / scenario
+                adb = FakeAdb(base / "adb_logs")
+                store = Store(base / "test.sqlite3")
                 tick = 145
                 with patch("perf_adb.time.time", return_value=1700000000), \
                         patch("perf_adb.time.monotonic", return_value=100):
@@ -189,6 +227,12 @@ class AdbTests(unittest.TestCase):
         self.assertEqual(len(self.store.sessions()), 1)
         reopened = Store(Path(self.temp.name) / "test.sqlite3")
         self.assertEqual(reopened.overview(imported["id"]), before)
+        with reopened.connect() as db:
+            assets = db.execute('SELECT path,kind FROM storage_assets').fetchall()
+            self.assertEqual({row['path'] for row in assets},
+                             {str(Path(item['archive']).resolve()) for item in (imported, duplicate)})
+            self.assertEqual({row['kind'] for row in assets}, {'directory'})
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM session_logs').fetchone()[0], 2)
 
     def test_capture_observation_pid_change_and_disabled_switch(self):
         self.adb.processes = ["2", "1"]

@@ -688,8 +688,10 @@ class StoreTests(ReportAssertions, unittest.TestCase):
                 html = render_report(self.store, sid, style=style)
                 markup = ReportMarkup(html)
                 monitors = [attrs for tag, attrs in markup.tags
-                            if tag == 'section' and attrs.get('class') == 'panel pid-monitor']
+                            if tag == 'details' and attrs.get('class') == 'panel pid-monitor']
                 self.assertEqual(len(monitors), 2)
+                self.assertTrue(all('open' not in attrs for attrs in monitors))
+                self.assertEqual(html.count('<summary>PID 变化监测</summary>'), 2)
                 for process in processes:
                     self.assertIn(pid_monitor([process]), html)
                 self.assertEqual(html.count('>首次观察</td>'), 1)
@@ -776,6 +778,10 @@ assert.match(empty.count.textContent, /0 \/ 0.*0 次/);
         self.assertIn('本采集段未观察到 PID 集合变化。', pid_monitor(processes[1:]))
         self.assertIn('本采集段未观察到 PID 集合变化。', pid_monitor([]))
         self.assertNotIn(' hidden', pid_monitor([]))
+        for content in (html, pid_monitor(processes[1:]), pid_monitor([])):
+            self.assertTrue(content.startswith(
+                '<details class="panel pid-monitor"><summary>PID 变化监测</summary>'))
+            self.assertTrue(content.endswith('</table></div></details>'))
         search = [a['data-pid-search'] for t, a in markup.tags if t == 'tbody']
         self.assertEqual(search, [name + ' 11, 未知'])
 
@@ -1215,8 +1221,12 @@ assert.match(empty.count.textContent, /0 \/ 0.*0 次/);
             def handle_data(parser, text):
                 if parser.stack and parser.stack[-1][0] in ("h4", "th", "summary"):
                     if "单核" in text:
-                        self.assertTrue(any(t == "section" and a.get("class") == "panel overview"
-                                           for t, a in parser.stack))
+                        self.assertTrue(any(
+                            (t == "section" and a.get("class") == "panel overview") or
+                            (t == "div" and a.get("data-table") == "cpu-exceedances"
+                             and parser.stack[-1][0] == "th"
+                             and text == "当时全进程 CPU 前5名 · 单核 %")
+                            for t, a in parser.stack))
                     self.assertNotIn("RSS", text)
                 if parser.stack and parser.stack[-1][0] == "summary":
                     if parser.stack[-2][1].get("class") == "panel":
@@ -1232,7 +1242,7 @@ assert.match(empty.count.textContent, /0 \/ 0.*0 次/);
         self.assertEqual(markup.modules, [
             *expanded_titles,
             "CPU 超标分布明细 · 整机 100% 口径",
-            "活跃 CPU Top30 · 活跃均值", "CPU 峰值 Top30 · 趋势", "内存均值 Top30",
+            "CPU Top30 · 全量有效均值", "CPU 峰值 Top30 · 趋势", "内存均值 Top30",
             "物理 / 逻辑 IO · 有效增量及累计", "统计口径与数据来源",
         ])
 
@@ -1275,6 +1285,306 @@ assert.equal(fold.open,false);
 assert.equal(instances.get(hiddenNode).chart,null);
 """
         self.run_report_script(harness + lifecycle + checks)
+
+    def test_report_chart_fullscreen_lifecycle(self):
+        source = (Path(__file__).parent / "report_assets/report.js").read_text(encoding="utf-8")
+        fullscreen = source[source.index("  function setupChartFullscreen() {"):
+                            source.index("  data.processes.forEach(prepareMetrics);")]
+        activate = source[source.index("  function activate(node, state) {"):
+                          source.index("  function draw(node, option) {")]
+        harness = """
+const assert = require('node:assert/strict');
+class Target {
+  constructor() { this.events = new Map(); }
+  addEventListener(type, fn) {
+    if (!this.events.has(type)) this.events.set(type, []);
+    this.events.get(type).push(fn);
+  }
+  emit(type, props = {}) {
+    const event = {defaultPrevented:false, ...props,
+      preventDefault() { this.defaultPrevented = true; }};
+    for (const fn of this.events.get(type) || []) fn(event);
+    return event;
+  }
+}
+class Element extends Target {
+  constructor(tag) {
+    super(); this.tagName = tag; this.parentNode = null; this.children = [];
+    this.attributes = new Map(); this.style = {}; this.dataset = {}; this.textContent = '';
+    this.classes = new Set();
+    this.classList = {add:name=>this.classes.add(name), remove:name=>this.classes.delete(name),
+      contains:name=>this.classes.has(name)};
+  }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); }
+  remove() {
+    if (this.parentNode) {
+      const siblings = this.parentNode.children;
+      siblings.splice(siblings.indexOf(this), 1); this.parentNode = null;
+    }
+  }
+  append(...nodes) {
+    for (const node of nodes) { node.remove(); node.parentNode = this; this.children.push(node); }
+  }
+  before(node) {
+    assert.ok(this.parentNode, 'before needs an attached node');
+    node.remove(); node.parentNode = this.parentNode;
+    this.parentNode.children.splice(this.parentNode.children.indexOf(this), 0, node);
+  }
+  replaceWith(node) { this.before(node); this.remove(); }
+  get isConnected() { return this === document.body || !!this.parentNode?.isConnected; }
+  focus(options) {
+    assert.ok(this.isConnected, 'must not focus a detached element');
+    this.focusOptions = options; document.activeElement = this;
+  }
+  getClientRects() { return this.isConnected ? [{}] : []; }
+  get clientWidth() { return this.isConnected ? 800 : 0; }
+  get clientHeight() { return this.isConnected ? 400 : 0; }
+  getBoundingClientRect() { return {height:this.clientHeight}; }
+}
+const document = new Target(), window = new Target();
+window.scrollX = 12; window.scrollY = 321;
+window.scrollTo = ({left, top, behavior}) => {
+  assert.equal(behavior, 'instant');
+  window.scrollX = left; window.scrollY = top;
+};
+document.body = new Element('body');
+document.createElement = tag => new Element(tag);
+document.createComment = text => { const node = new Element('#comment'); node.textContent = text; return node; };
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = text;
+  if (cls) cls.split(' ').forEach(name => node.classList.add(name));
+  return node;
+}
+function descendants(root) { return root.children.flatMap(node => [node, ...descendants(node)]); }
+document.querySelectorAll = selector => {
+  const matchers = selector.split(',').map(part => {
+    switch (part.trim()) {
+      case '[data-chart^="overlay-"]': return node => node.getAttribute('data-chart')?.startsWith('overlay-');
+      case '.overview > .chart': return node => node.classList.contains('chart') &&
+        node.parentNode?.classList.contains('overview');
+      case '.combination > .chart': return node => node.classList.contains('chart') &&
+        node.parentNode?.classList.contains('combination');
+      default: throw new Error('Unsupported selector: ' + part);
+    }
+  });
+  return descendants(document.body).filter(node => matchers.some(match => match(node)));
+};
+const frames = [];
+const requestAnimationFrame = fn => { frames.push(fn); return frames.length; };
+function flushFrames() { while (frames.length) frames.shift()(); }
+const instances = new Map(), initialized = [];
+function makeChart() {
+  return {actions:[], resizes:0, options:[],
+    interaction:{legend:{CPU:false, memory:true}, dataZoom:{start:25, end:75}},
+    dispatchAction(action) { assert.deepEqual(action, {type:'hideTip'}); this.actions.push(action); },
+    resize() { this.resizes++; },
+    setOption(...args) { this.options.push(args); },
+    dispose() { assert.fail('fullscreen must not dispose charts'); }};
+}
+const echarts = {init(node) { const chart = makeChart(); initialized.push({node, chart}); return chart; }};
+"""
+        checks = """
+const previousFocus = el('button', 'outside'), standard = el('section'), compact = el('div', null, 'combination');
+document.body.append(previousFocus, standard, compact);
+const standardBefore = el('p'), standardNode = el('div', null, 'chart'), standardAfter = el('p');
+standardNode.id = 'segment-overlay-cpu';
+standardNode.setAttribute('data-chart', 'overlay-cpu');
+standardNode.setAttribute('aria-label', 'CPU 全进程');
+standard.append(standardBefore, standardNode, standardAfter);
+const compactBefore = el('p'), compactNode = el('div', null, 'chart'), compactAfter = el('p');
+compactNode.id = 'compact-memory';
+compact.append(compactBefore, compactNode, compactAfter);
+// Negative controls: unrelated charts and nested (not direct) compact children.
+const ordinaryChart = el('div', null, 'chart'), nested = el('div'), nestedChart = el('div', null, 'chart');
+ordinaryChart.setAttribute('data-chart', 'cpu');
+standard.append(ordinaryChart); compact.append(nested); nested.append(nestedChart);
+const initialChart = makeChart(), standardState = {chart:initialChart, option:{series:['CPU']}};
+const lazyOption = {series:['memory']}, compactState = {chart:null, option:lazyOption};
+instances.set(standardNode, standardState); instances.set(compactNode, compactState);
+const overview = el('section', null, 'overview');
+document.body.append(overview);
+const overviewFixtures = ['CPU', '内存'].map((title, index) => {
+  const node = el('div', null, 'chart');
+  node.id = 'overview-' + index;
+  node.setAttribute('data-chart', index ? 'memory' : 'system-cpu');
+  node.setAttribute('aria-label', title);
+  overview.append(el('h3'), node, el('table'));
+  instances.set(node, {chart:makeChart(), option:{series:[title]}});
+  return {node, parent:overview, title};
+});
+const originalInteraction = JSON.parse(JSON.stringify(initialChart.interaction));
+document.body.style.overflow = 'scroll'; document.body.scrollTop = 321;
+previousFocus.focus();
+setupChartFullscreen();
+assert.equal(initialized.length, 0, 'setup must keep hidden charts lazy');
+assert.equal(frames.length, 0);
+assert.equal(compactState.chart, null);
+assert.equal(ordinaryChart.parentNode, standard);
+assert.equal(nestedChart.parentNode, nested);
+const fixtures = [
+  {node:standardNode, parent:standard, title:'CPU 全进程'},
+  {node:compactNode, parent:compact, title:'全进程图表'},
+  ...overviewFixtures
+];
+for (const fixture of fixtures) {
+  fixture.shell = fixture.node.parentNode;
+  const toolbar = fixture.shell.children[0];
+  fixture.button = toolbar.children[1];
+  assert.ok(fixture.shell.classList.contains('chart-shell'));
+  assert.ok(toolbar.classList.contains('chart-toolbar'));
+  assert.equal(toolbar.children[0].textContent, fixture.title);
+  assert.equal(fixture.shell.getAttribute('aria-label'), fixture.title);
+  assert.equal(fixture.button.type, 'button');
+  assert.equal(fixture.button.getAttribute('aria-controls'), fixture.node.id);
+  assert.equal(fixture.button.getAttribute('aria-expanded'), 'false');
+  assert.equal(fixture.button.textContent, '全屏查看');
+  assert.equal(fixture.shell.children[1], fixture.node);
+  fixture.originalChildren = [...fixture.parent.children];
+}
+const originalBody = [...document.body.children];
+const [a, b] = fixtures;
+function assertEntered(fixture) {
+  const {shell, button, node, parent, originalChildren} = fixture;
+  assert.equal(shell.parentNode, document.body);
+  assert.ok(shell.classList.contains('is-fullscreen'));
+  assert.equal(shell.getAttribute('role'), 'dialog');
+  assert.equal(shell.getAttribute('aria-modal'), 'true');
+  assert.equal(button.getAttribute('aria-expanded'), 'true');
+  assert.equal(button.textContent, '退出全屏（Esc）');
+  assert.equal(node.parentNode, shell, 'move the original node, never clone it');
+  assert.equal(document.body.style.overflow, 'hidden');
+  assert.equal(document.activeElement, button);
+  assert.deepEqual(button.focusOptions, {preventScroll:true});
+  const anchorIndex = originalChildren.indexOf(shell);
+  assert.ok(parent.children[anchorIndex].classList.contains('chart-placeholder'));
+  assert.equal(parent.children[anchorIndex].style.height, '400px');
+  assert.equal(parent.children[anchorIndex].getAttribute('aria-hidden'), 'true');
+  assert.deepEqual(parent.children.filter((_, i) => i !== anchorIndex),
+    originalChildren.filter((_, i) => i !== anchorIndex));
+}
+function assertRestored(fixture) {
+  assert.deepEqual(fixture.parent.children, fixture.originalChildren);
+  assert.equal(fixture.node.parentNode, fixture.shell);
+  assert.equal(fixture.shell.classList.contains('is-fullscreen'), false);
+  assert.equal(fixture.shell.getAttribute('role'), null);
+  assert.equal(fixture.shell.getAttribute('aria-modal'), null);
+  assert.equal(fixture.button.getAttribute('aria-expanded'), 'false');
+  assert.equal(fixture.button.textContent, '全屏查看');
+}
+function assertPageRestored() {
+  fixtures.forEach(assertRestored);
+  assert.deepEqual(document.body.children, originalBody);
+  assert.equal(document.body.style.overflow, 'scroll');
+  assert.equal(document.body.scrollTop, 321);
+  assert.equal(window.scrollX, 12);
+  assert.equal(window.scrollY, 321);
+  assert.equal(document.activeElement, previousFocus);
+  assert.deepEqual(previousFocus.focusOptions, {preventScroll:true});
+}
+// Enter/exit by the same button: resize on the next frame without resetting user state.
+assert.equal(document.emit('keydown', {key:'Escape'}).defaultPrevented, false);
+a.button.emit('click'); assertEntered(a);
+assert.equal(initialChart.resizes, 0);
+assert.equal(frames.length, 1);
+flushFrames();
+assert.equal(initialChart.resizes, 1);
+assert.equal(initialChart.actions.length, 1);
+window.scrollX = 0; window.scrollY = 0; // Simulate a viewport shift while fullscreen.
+a.button.emit('click'); assertPageRestored();
+assert.equal(initialChart.resizes, 1);
+flushFrames();
+assert.equal(initialChart.resizes, 2);
+assert.equal(initialChart.actions.length, 2);
+assert.equal(instances.get(standardNode), standardState);
+assert.equal(standardState.chart, initialChart);
+assert.deepEqual(initialChart.interaction, originalInteraction);
+assert.deepEqual(initialChart.options, [], 'existing charts must never call setOption');
+assert.equal(initialized.length, 0, 'existing charts must not be reinitialized');
+// Compact selector and lazy initialization use the shipped activate(), only once.
+b.button.emit('click'); assertEntered(b);
+assert.equal(compactState.chart, null);
+flushFrames();
+assert.equal(initialized.length, 1);
+assert.equal(initialized[0].node, compactNode);
+const lazyChart = compactState.chart;
+assert.equal(initialized[0].chart, lazyChart);
+assert.equal(compactNode.dataset.ready, 'true');
+assert.deepEqual(lazyChart.options, [[lazyOption, true]]);
+assert.equal(lazyChart.options[0][0], lazyOption);
+assert.equal(document.emit('keydown', {key:'Enter'}).defaultPrevented, false);
+assertEntered(b);
+previousFocus.focus();
+assert.equal(document.emit('keydown', {key:'Tab'}).defaultPrevented, true);
+assert.equal(document.activeElement, b.button);
+assert.equal(document.emit('keydown', {key:'Tab', shiftKey:true}).defaultPrevented, true);
+assert.equal(document.activeElement, b.button);
+assert.equal(document.emit('keydown', {key:'Escape'}).defaultPrevented, true);
+assertPageRestored(); flushFrames();
+assert.equal(lazyChart.resizes, 1);
+assert.equal(lazyChart.actions.length, 1);
+b.button.emit('click'); assertEntered(b); flushFrames();
+b.button.emit('click'); assertPageRestored(); flushFrames();
+assert.equal(compactState.chart, lazyChart);
+assert.equal(initialized.length, 1);
+assert.equal(lazyChart.options.length, 1);
+assert.equal(lazyChart.resizes, 3);
+// Switching before RAF runs must restore the first location and leave only one dialog.
+a.button.emit('click'); assertEntered(a);
+b.button.emit('click'); assertEntered(b); assertRestored(a);
+assert.equal(descendants(document.body).filter(node => node.classList.contains('is-fullscreen')).length, 1);
+flushFrames();
+assert.equal(document.body.style.overflow, 'hidden');
+assert.equal(document.emit('keydown', {key:'Escape'}).defaultPrevented, true);
+assertPageRestored(); flushFrames();
+// Overview CPU and memory preserve interaction state across both exit routes.
+for (const fixture of overviewFixtures) {
+  const state = instances.get(fixture.node), chart = state.chart;
+  for (const escape of [false, true]) {
+    const resizes = chart.resizes;
+    fixture.button.emit('click'); assertEntered(fixture); flushFrames();
+    assert.equal(chart.resizes, resizes + 1);
+    if (escape) assert.equal(document.emit('keydown', {key:'Escape'}).defaultPrevented, true);
+    else fixture.button.emit('click');
+    assertPageRestored(); flushFrames();
+    assert.equal(chart.resizes, resizes + 2);
+    assert.equal(instances.get(fixture.node), state);
+    assert.equal(state.chart, chart);
+    assert.deepEqual(chart.interaction, originalInteraction);
+    assert.deepEqual(chart.options, []);
+  }
+}
+// Printing exits every chart variant synchronously, restoring DOM before print layout.
+for (const fixture of fixtures) {
+  fixture.button.emit('click'); assertEntered(fixture); flushFrames();
+  const chart = instances.get(fixture.node).chart, resizes = chart.resizes;
+  window.emit('beforeprint'); assertPageRestored();
+  assert.equal(chart.resizes, resizes);
+  flushFrames(); assert.equal(chart.resizes, resizes + 1);
+  window.emit('beforeprint');
+  assert.equal(document.emit('keydown', {key:'Escape'}).defaultPrevented, false);
+  assert.equal(frames.length, 0, 'inactive exits must be no-ops');
+}
+// A removed prior focus target must not throw on exit; an absent chart state is harmless.
+const detachedFocus = el('button'); document.body.append(detachedFocus); detachedFocus.focus();
+instances.delete(compactNode);
+b.button.emit('click'); assertEntered(b); flushFrames();
+detachedFocus.remove();
+window.emit('beforeprint'); flushFrames(); assertRestored(b);
+assert.equal(document.body.style.overflow, 'scroll');
+assert.equal(document.body.scrollTop, 321);
+assert.deepEqual(document.body.children, originalBody);
+assert.equal(document.activeElement, b.button);
+assert.equal(initialized.length, 1);
+assert.equal(standardState.chart, initialChart);
+assert.deepEqual(initialChart.interaction, originalInteraction);
+assert.deepEqual(initialChart.options, []);
+assert.equal(lazyChart.options.length, 1);
+assert.deepEqual(lazyChart.interaction, originalInteraction);
+"""
+        self.run_report_script(harness + activate + fullscreen + checks)
 
     def test_report_overview_chart_percentiles_and_time(self):
         source = Path("report_assets/report.js").read_text(encoding="utf-8")
@@ -1421,9 +1731,9 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
             table = report.split('data-table="all"', 1)[1].split('</table>', 1)[0]
             headers = re.findall(r'<th scope="col">(.*?)</th>', table)
             expected_headers = PROCESS_HEADERS if has_io else [
-                '序号', '原始进程名', 'PID', '活跃周期', '活跃均值 %',
-                '活跃P95 %', '活跃峰值 %', '活跃P95K KDMIPS',
-                '活跃峰值K KDMIPS', '内存均值 MB', '内存 P95 MB', '内存峰值 MB', 'PID变化']
+                '序号', '原始进程名', 'PID', 'CPU有效周期', 'CPU均值 %',
+                'CPU P95 %', 'CPU峰值 %', 'CPU P95K KDMIPS',
+                'CPU峰值K KDMIPS', '内存均值 MB', '内存 P95 MB', '内存峰值 MB', 'PID变化']
             self.assertEqual(headers, [h.replace('KB/周期', '').replace('KB', '').strip() if 'KB' in h else h for h in expected_headers])
             body_rows = re.findall(r'<tr\b[^>]*>(.*?)</tr>', table.split('<tbody>', 1)[1])
             self.assertEqual(len(body_rows), len(processes))
@@ -1493,12 +1803,13 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
         self.assertEqual(PROCESS_HEADERS[rss_column + 1:rss_column + 3], ["累计读 KB", "累计写 KB"])
         for p in payload["processes"]:
             cells = dict(zip(PROCESS_HEADERS, process_row(p, 1)))
-            self.assertNotIn("活跃P99 %", cells)
-            self.assertIn("p99", p["active"]["metrics"]["cpu1c"])
-            self.assertEqual(cells["活跃P95 %"], p["active"]["metrics"]["cpu1c"]["p95"])
-            self.assertEqual(cells["活跃峰值 %"], p["active"]["metrics"]["cpu1c"]["max"])
-            for header, key in (("活跃P95K KDMIPS", "p95k"), ("活跃峰值K KDMIPS", "peakk")):
-                expected = p["active"]["metrics"]["cpu1c"][key]
+            self.assertNotIn("CPU P99 %", cells)
+            self.assertFalse(any("活跃" in header for header in cells))
+            self.assertIn("p99", p["metrics"]["cpu1c"])
+            self.assertEqual(cells["CPU P95 %"], p["metrics"]["cpu1c"]["p95"])
+            self.assertEqual(cells["CPU峰值 %"], p["metrics"]["cpu1c"]["max"])
+            for header, key in (("CPU P95K KDMIPS", "p95k"), ("CPU峰值K KDMIPS", "peakk")):
+                expected = p["metrics"]["cpu1c"][key]
                 if expected is None:
                     self.assertIsNone(cells[header])
                 else:
@@ -1515,6 +1826,11 @@ assert.deepEqual(topMemory.series[1].markLine.data.map(x=>x.yAxis),[7209,7209]);
                          if tag == 'input' and attrs.get('class') == 'merge-show-system-processes']
         self.assertEqual(len(merge_toggles), 1)
         self.assertNotIn('checked', merge_toggles[0])
+        merge_add = [attrs for tag, attrs in ReportMarkup(html).tags
+                     if tag == 'button' and attrs.get('class') == 'merge-add-overlay']
+        self.assertEqual(len(merge_add), len(payload['systems']))
+        self.assertTrue(all(attrs.get('type') == 'button' and 'disabled' in attrs for attrs in merge_add))
+        self.assertIn('添加到全进程曲线', html)
         from perf_report_ui import CSS
         self.assertIn('.merge-grid :is(.candidate-list,.selected-list){height:164px}', CSS)
         self.assertIn('.candidate-list>label,.selected-list>div{height:41px;', CSS)
@@ -1594,6 +1910,40 @@ for (const mode of ['overlay','merge']) {
   assert.equal(option(mode+'-io').yAxis.axisLabel.formatter(1536),'1.50 MB');
   assert.equal(option(mode+'-io').tooltip.valueFormatter(1048576),'1.00 GB');
 }
+// Reference lines and sorted tooltip dots share the same per-metric colors.
+assert.deepEqual(option('overlay-io').series.map(s=>s.lineStyle.color),ioColors);
+assert.equal(new Set(ioColors).size,4);
+const ioTip=option('overlay-io').tooltip.formatter([{axisValue:points[0].ts}]);
+for (const tipRow of ioTip.children[1].children) {
+  const curve=option('overlay-io').series.find(s=>tipRow.children[1].textContent===s.name+'：');
+  assert.ok(curve);assert.equal(tipRow.children[0].style.backgroundColor,curve.lineStyle.color);
+}
+const irqName='系统中断 · irq+softirq · 单核口径';
+assert.equal(option('overlay-cpu').series[1].name,irqName);
+assert.equal(option('overlay-cpu').series[1].data[0][1],system.full_points[0].cpu_irq_single_core);
+// Converted single-core values take precedence; measured zero stays, missing stays absent.
+const savedSystemPoints=system.full_points;
+const irqCases=[3.25,null,0,1.5];
+system.full_points=irqCases.map((value,i)=>({...savedSystemPoints[0],cycle:i+1,
+  ts:1000*(i+1),cpu_irq:99,cpu_irq_single_core:value}));
+setupSegment(system);
+const irqCurves=option('overlay-cpu').series.filter(s=>s.name===irqName);
+assert.deepEqual(irqCurves.flatMap(s=>s.data).map(p=>p[1]),[3.25,0,1.5]);
+assert.equal(irqCurves.length,2);
+assert.ok(irqCurves.every(s=>s.lineStyle.color==='#fbbf24' && s.lineStyle.type==='dashed'));
+for (const [i,value] of irqCases.entries()) {
+  const box=option('overlay-cpu').tooltip.formatter([{axisValue:1000*(i+1)}]);
+  const tipRow=box.children[1].children.find(r=>r.children[1].textContent===irqName+'：');
+  if (value===null) assert.equal(tipRow,undefined);
+  else {assert.equal(tipRow.children[0].style.backgroundColor,'#fbbf24');
+    assert.equal(tipRow.children[2].textContent,value.toFixed(2)+' %');}
+}
+system.full_points=system.full_points.map(p=>({...p,cpu_irq_single_core:null}));
+nodes.delete(system.id); setupSegment(system);
+assert.ok(!option('overlay-cpu').series.some(s=>s.name===irqName));
+system.full_points=savedSystemPoints;
+nodes.delete(system.id); setupSegment(system);
+assert.equal(JSON.stringify(data),snapshot);
 const root=document.getElementById(system.id);
 const searchWrap = new Node(), searchInput = searchWrap.querySelector('.table-search');
 const searchTable = searchWrap.querySelector('table');
@@ -1611,7 +1961,7 @@ delete searchRow.dataset.search;
 searchInput.value='pid-worker'; searchInput.events.input();
 assert.equal(searchRow.hidden,false);
 const precisionWrap=new Node(), precisionTable=precisionWrap.querySelector('table');
-const precisionHeaders=['PID','PID变化','活跃周期','活跃均值 CPU','内存峰值'];
+const precisionHeaders=['PID','PID变化','CPU有效周期','CPU均值 %','内存峰值'];
 precisionTable.tHead={rows:[{cells:precisionHeaders.map(text=>{const cell=new Node();cell.textContent=text;return cell;})}]};
 const precisionRow=new Node(); precisionRow.dataset.process=data.processes.find(p=>!p.dp_only).id;
 precisionRow.cells=precisionHeaders.map((_,cellIndex)=>{const cell=new Node();cell.cellIndex=cellIndex;cell.dataset.sort='stale';return cell;});
@@ -1722,10 +2072,75 @@ root.querySelector('.merge-apply').events.click();
 assert.equal(option('merge-cpu').series.length,2);
 assert.equal(option('merge-cpu').series[1].data[0][1],116.30);
 assert.equal(option('merge-io').series.length,8);
+assert.equal(root.querySelector('.merge-add-overlay').disabled,true);
+root.querySelector('.merge-add-overlay').events.click();
+assert.equal(root.querySelector('.selection-tags').children.length,0);
 root.querySelector('.merge-clear').events.click();
 assert.equal(option('merge-cpu').series.length,1);
 assert.equal(option('merge-io').series.length,4);
 assert.equal(JSON.stringify(data),snapshot);
+// Saved groups coexist with original processes without entering the source data or IO reference.
+{
+const base=data.processes.find(p=>!p.dp_only);
+const clones=[1,2].map(n=>({...base,id:'merge-test-'+n,name:'app.merge.'+n,
+  full_cycles:base.full_cycles.map(row=>{const copy=[...row];copy[index.rss_kb]=6;return copy;})}));
+data.processes.push(...clones);
+const groupSnapshot=JSON.stringify(data);
+nodes.delete(system.id); setupSegment(system);
+const groupRoot=document.getElementById(system.id), tags=groupRoot.querySelector('.selection-tags');
+const add=groupRoot.querySelector('.merge-add-overlay'), calculate=groupRoot.querySelector('.merge-apply');
+const selectMember=(id,checked=true)=>{
+  const check=groupRoot.querySelector('.candidate-list').children.find(label=>label.children[0].value===id).children[0];
+  check.checked=checked;check.events.change();
+};
+const clearGroup=()=>groupRoot.querySelector('.merge-clear').events.click();
+const selectGroup=ids=>{clearGroup();ids.forEach(id=>selectMember(id));calculate.events.click();};
+const all=groupRoot.querySelector('[data-table="all"]');
+all.querySelector('table').tBodies=[{rows:[makeRow(base.id,base.name,false)]}];
+all.querySelector('.select-top15').events.click();
+assert.equal(tags.children.length,1);
+const referenceBefore=JSON.stringify(option('overlay-io').series.slice(0,4));
+selectGroup(clones.map(p=>p.id));
+assert.equal(add.disabled,false);add.events.click();
+assert.equal(tags.children.length,2);
+assert.ok(tags.children[1].textContent.includes('app.merge.1 + app.merge.2'));
+assert.ok(!tags.children[1].textContent.includes('PID'));
+assert.equal(option('overlay-cpu').series.length,4);
+assert.equal(option('overlay-cpu').series[3].data[0][1],232.6);
+assert.equal(option('overlay-rss').series[2].data[0][1],0.02);
+assert.equal(option('overlay-io').series.length,12);
+assert.equal(JSON.stringify(option('overlay-io').series.slice(0,4)),referenceBefore);
+assert.equal(option('io-physical-total').series[3].data[0][1],312);
+const savedCurves=JSON.stringify(option('overlay-io').series);
+add.events.click();assert.equal(tags.children.length,2);
+selectGroup(clones.map(p=>p.id).reverse());add.events.click();
+assert.equal(tags.children.length,2);
+assert.equal(JSON.stringify(option('overlay-io').series),savedCurves);
+clearGroup();assert.equal(add.disabled,true);add.events.click();
+assert.equal(tags.children.length,2);
+assert.equal(JSON.stringify(option('overlay-io').series),savedCurves);
+selectGroup([base.id,clones[0].id,clones[1].id]);add.events.click();
+assert.equal(tags.children.length,3);
+assert.equal(option('overlay-cpu').series[4].data[0][1],348.9);
+tags.children[1].events.click();assert.equal(tags.children.length,2);
+assert.equal(option('overlay-cpu').series.length,4);
+selectGroup(clones.map(p=>p.id));add.events.click();assert.equal(tags.children.length,3);
+// Invalidating a pending asynchronous result must not make it addable.
+let delayed;
+const immediate=setTimeout;global.setTimeout=callback=>{delayed=callback;};
+calculate.events.click();assert.equal(add.disabled,true);
+selectMember(base.id);delayed();assert.equal(add.disabled,true);
+add.events.click();assert.equal(tags.children.length,3);
+global.setTimeout=immediate;
+all.querySelector('.clear-selection').events.click();
+assert.equal(tags.children.length,0);assert.equal(option('overlay-cpu').series.length,2);
+// A DP-only member yields missing, never a fabricated zero or a partial sum.
+selectGroup([base.id,systemProcess.id]);add.events.click();
+assert.equal(tags.children.length,1);assert.equal(option('overlay-cpu').series.length,2);
+assert.equal(JSON.stringify(data),groupSnapshot);
+data.processes.splice(-clones.length);
+assert.equal(JSON.stringify(data),snapshot);
+}
 const originalName=systemProcess.name;
 for (const [name,hidden] of [['worker',true],['[worker]',true],['app.worker',false],
   ['  jkc-service ',false],['jkc',false],['jkc.example',false],['worker_jkc',true],
@@ -1756,7 +2171,7 @@ for (const [name,hidden] of [['worker',true],['[worker]',true],['app.worker',fal
 systemProcess.name=originalName;
 // An omitted IO chart must not break initial rendering or merge calculation.
 const getNode=document.getElementById;
-document.getElementById=id=>id===system.id+'-merge-io' ? null : getNode(id);
+document.getElementById=id=>[system.id+'-merge-io',system.id+'-overlay-io'].includes(id) ? null : getNode(id);
 nodes.delete(system.id);
 setupSegment(system);
 const noIO=document.getElementById(system.id);
@@ -1764,6 +2179,11 @@ const noIOCheck=noIO.querySelector('.candidate-list').children[0].children[0];
 noIOCheck.checked=true; noIOCheck.events.change();
 noIO.querySelector('.merge-apply').events.click();
 assert.ok(noIO.querySelector('.merge-status').textContent.startsWith('已对齐'));
+const secondNoIOCheck=noIO.querySelector('.candidate-list').children[1].children[0];
+secondNoIOCheck.checked=true;secondNoIOCheck.events.change();
+noIO.querySelector('.merge-apply').events.click();
+noIO.querySelector('.merge-add-overlay').events.click();
+assert.equal(noIO.querySelector('.selection-tags').children.length,1);
 document.getElementById=getNode;
 assert.equal(JSON.stringify(data),snapshot);
 const row = (cycle, ts, values, records=1) => {
@@ -1806,23 +2226,44 @@ document.createElement=()=>{const n=new Node();n.style={};return n;};
 const entries=[{stream,field:'cpu1c',name:'系统',divisor:1},
   {stream:missing,field:'cpu1c',name:'缺失进程',divisor:1}];
 const tooltipRows=box=>box.children[1].children.map(row=>row.children.slice(1).map(n=>n.textContent).join(''));
-const show=()=>['',...tooltipRows(overlayTooltip(entries,'%').formatter([{axisValue:601000}]))];
+const showBox=()=>overlayTooltip(entries,'%').formatter([{axisValue:601000}]);
+const show=()=>tooltipRows(showBox());
 const tip=overlayTooltip(entries,'%',{getBoundingClientRect:()=>({left:100,top:300})});
 assert.equal(tip.confine,false); assert.equal(tip.appendToBody,true);
 assert.equal(tip.backgroundColor,'#ffffff');
 document.documentElement.clientWidth=1000; document.documentElement.clientHeight=800;
 assert.deepEqual(tip.position([500,200],[],null,null,{contentSize:[560,600]}),[-72,-112]);
 assert.deepEqual(tip.position([20,10],[],null,null,{contentSize:[200,100]}),[32,-14]);
-assert.equal(show()[1],'系统：600.00 %');
-assert.equal(show()[2],'缺失进程：缺失或冲突');
-entries[0].stream=overlayStream([...full,{...full[600]}],['cpu1c']);
-assert.equal(show()[1],'系统：缺失或冲突');
+assert.deepEqual(show(),['系统：600.00 %']);
+for (const duplicates of [2,3]) {
+  entries[0].stream=overlayStream([...full,...Array.from({length:duplicates-1},()=>({...full[600]}))],['cpu1c']);
+  assert.deepEqual(show(),[]); // Even a third duplicate must remain ambiguous.
+}
 entries[0].stream=overlayStream(full.filter(p=>p.cycle!==601),['cpu1c']);
 entries[1].stream=stream;
-assert.equal(show()[1],'系统：缺失或冲突');
-assert.equal(show()[2],'缺失进程：600.00 %');
+assert.deepEqual(show(),['缺失进程：600.00 %']);
 entries[0].stream=overlayStream([...full,{...full[600],cycle:9999}],['cpu1c']);
-assert.ok(show().slice(1).every(text=>text.endsWith('缺失或冲突')));
+assert.deepEqual(show(),['缺失进程：600.00 %']);
+assert.ok(!showBox().children[0].textContent.includes('周期'));
+entries[0].stream=overlayStream([{...full[600],cycle:9999,cpu1c:700}],['cpu1c']);
+assert.deepEqual(show(),['系统：700.00 %','缺失进程：600.00 %']);
+assert.ok(!showBox().children[0].textContent.includes('周期'));
+for (const invalid of [null,undefined,NaN,Infinity,'600']) {
+  entries[0].stream=overlayStream([{...full[600],cpu1c:invalid}],['cpu1c']);
+  assert.deepEqual(show(),['缺失进程：600.00 %']);
+}
+assert.deepEqual(tooltipRows(overlayTooltip(entries,'%').formatter([{axisValue:601001}])),[]);
+const rankedEntries=[
+  {stream:overlayStream([{cycle:1,ts:1000,rss_kb:2}],['rss_kb']),field:'rss_kb',name:'整机',divisor:1,reference:true},
+  {stream:overlayStream([{cycle:1,ts:1000,rss_kb:1024}],['rss_kb']),field:'rss_kb',name:'小进程',divisor:1024},
+  {stream:overlayStream([{cycle:1,ts:1000,rss_kb:4096}],['rss_kb']),field:'rss_kb',name:'大进程',divisor:1024},
+  {stream:overlayStream([{cycle:1,ts:1000,rss_kb:null}],['rss_kb']),field:'rss_kb',name:'无效',divisor:1024},
+  {stream:overlayStream([{cycle:1,ts:1000,rss_kb:0}],['rss_kb']),field:'rss_kb',name:'零进程',divisor:1024}
+];
+const ranked=overlayTooltip(rankedEntries,'MB').formatter([{axisValue:1000}]);
+assert.deepEqual(tooltipRows(ranked),['大进程：4.00 MB','整机：2.00 MB','小进程：1.00 MB','零进程：0.00 MB']);
+assert.deepEqual(ranked.children[1].children.map(row=>row.children[0].style.backgroundColor),
+  [palette[2],'#ff6b6b',palette[1],palette[4]]);
 const memory=overlayTooltip([{stream,field:'rss_kb',name:'内存',divisor:1024}],'MB');
 assert.equal(tooltipRows(memory.formatter([{axisValue:601000}]))[0],'内存：1.00 MB');
 assert.equal(tooltipRows(overlayTooltip([{stream,field:'cpu1c',name:'零',divisor:1}],'%')
@@ -1831,25 +2272,26 @@ const overviewRows = (role, ts, names) => option(role).tooltip.formatter(
   names.map(seriesName=>({axisValue:ts,seriesName})));
 const originalPoints = system.full_points;
 const processRows = data.processes[0].full_cycles;
-const samplePoint = {...originalPoints[0],cycle:7,ts:1234,cpu_single_core:0,mem_used_mb:123};
+const samplePoint = {...originalPoints[0],cycle:7,ts:1234,cpu_single_core:0,mem_used_mb:123,mem_avail_mb:456};
 system.full_points = [samplePoint,{...samplePoint,cycle:8,ts:2234,cpu_single_core:null,mem_used_mb:null}];
 data.processes[0].full_cycles = [...processRows,row(9999,1234,{cpu1c:999}),row(9999,1234,{cpu1c:999})];
 setupSegment(system);
 for (const [role,name,value] of [['system-cpu','CPU 总占用','0.00 %'],['memory','已使用内存','123.00 MB']]) {
   const box = overviewRows(role,1234,[name,'伪造进程']);
   assert.deepEqual(tooltipRows(box),[name+'：'+value]);
-  assert.equal(box.children[0].textContent,'1970-01-01 08:00:01.234 · 周期 7');
-  assert.deepEqual(tooltipRows(overviewRows(role,2234,[name])),[name+'：缺失或冲突']);
+  assert.equal(box.children[0].textContent,'1970-01-01 08:00:01 · 周期 7');
+  assert.deepEqual(tooltipRows(overviewRows(role,2234,[name])),[]);
 }
 assert.deepEqual(tooltipRows(overviewRows('memory',1234,['已使用内存','空闲内存'])),
-  ['已使用内存：123.00 MB','空闲内存：'+fmt(samplePoint.mem_avail_mb)+' MB']);
+  ['空闲内存：456.00 MB','已使用内存：123.00 MB']);
 for (const conflictingCycle of [7,99]) {
   system.full_points = [samplePoint,{...samplePoint,cycle:conflictingCycle}];
   setupSegment(system);
   for (const [role,name] of [['system-cpu','CPU 总占用'],['memory','已使用内存']]) {
     const box = overviewRows(role,1234,[name]);
-    assert.deepEqual(tooltipRows(box),[name+'：缺失或冲突']);
-    assert.ok(box.children[0].textContent.endsWith(' · 周期 '+(conflictingCycle === 7 ? '7' : '冲突')));
+    assert.deepEqual(tooltipRows(box),[]);
+    if (conflictingCycle === 7) assert.ok(box.children[0].textContent.endsWith(' · 周期 7'));
+    else assert.equal(box.children[0].textContent,'1970-01-01 08:00:01');
   }
 }
 system.full_points = originalPoints;
@@ -1869,7 +2311,7 @@ root.querySelectorAll=selector=>selector==='tr[data-process]' ? selectionRows : 
 visibleWrap.querySelectorAll=()=>selectionRows;
 visibleWrap.querySelector('.select-top15').events.click();
 const tags=root.querySelector('.selection-tags');
-const selectedCount=data.processes.filter(p=>!p.dp_only && valid(p.active.metrics.cpu1c.avg)).length;
+const selectedCount=data.processes.filter(p=>!p.dp_only && valid(p.metrics.cpu1c.avg)).length;
 assert.equal(tags.children.length,selectedCount);
 visibleWrap.querySelector('.select-top15').events.click();
 assert.equal(tags.children.length,selectedCount);
@@ -1885,7 +2327,7 @@ const clearSelection=visibleWrap.querySelector('.clear-selection');
 const assertCleared=()=>{
   assert.equal(tags.children.length,0);
   assert.ok(selectionRows.every(row=>!row.selected && row.ariaSelected==='false'));
-  assert.equal(option('overlay-cpu').series.length,1);
+  assert.equal(option('overlay-cpu').series.length,2);
   assert.equal(option('overlay-rss').series.length,1);
   assert.equal(option('overlay-io').series.length,4);
   assert.equal(JSON.stringify(option('merge-cpu')),mergeBefore);
@@ -2626,6 +3068,235 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         return dict(dict(name="组合", segment=0, members=[dict(pid=1, name="a"),
                         dict(pid=2, name="b")]), **changes)
 
+    def test_exceedance_processes_exact_sample_and_validity(self):
+        import sqlite3
+        from perf_report_data import _exceedance_processes
+
+        with sqlite3.connect(':memory:') as db:
+            db.row_factory = sqlite3.Row
+            db.execute('CREATE TEMP TABLE report_source (id INTEGER PRIMARY KEY, '
+                       'segment, cycle, ts, kind, pid, name, source, line, data)')
+            def add(pid, name, cpu, *, segment=0, cycle=1, ts=1001, kind='P'):
+                db.execute('INSERT INTO report_source VALUES (NULL,?,?,?,?,?,?,?,?,?)',
+                           (segment, cycle, ts, kind, pid, name, 'fixture', 1,
+                            json.dumps(dict(cpu1c=cpu, cpu=999))))
+            add(1, 'same', 200)
+            add(2, 'same', 190)  # Same name, distinct PID: not summed.
+            add(3, '/system/bin/test', 180)
+            add(4, 'tie-a', 100)
+            add(5, 'tie-b', 100)
+            add(6, 'zero', 0)
+            add(7, 'missing', None)
+            add(8, 'invalid', 'bad')
+            add(9, 'nonfinite', float('inf'))
+            add(10, 'duplicate', 999)
+            add(10, 'duplicate', 888)
+            add(11, 'wrong-time', 999, ts=1002)
+            add(12, 'dp-only', 999, kind='DP')
+            add(None, 'missing-pid', 999)
+            add(13, 'missing-time', 999, ts=None)
+            add(14, 'other-cycle', 777, cycle=2, ts=1002)
+            add(15, 'other-segment', 666, segment=1)
+            result = _exceedance_processes(db, 0, 1, 1001)
+            self.assertEqual(result['valid_processes'], 6)
+            self.assertEqual([p['pid'] for p in result['top_processes']], [1, 2, 3, 4, 5])
+            self.assertTrue(all(p['record_id'] and p['source'] == 'fixture'
+                                for p in result['top_processes']))
+            self.assertEqual(_exceedance_processes(db, 0, 2, 1002)['top_processes'][0]['pid'], 14)
+            self.assertEqual(_exceedance_processes(db, 1, 1, 1001)['top_processes'][0]['pid'], 15)
+            self.assertEqual(_exceedance_processes(db, 0, 1, None)['top_processes'], [])
+            add(6, 'zero', 0, cycle=3)
+            lone = _exceedance_processes(db, 0, 3, 1001)
+            self.assertEqual(lone['valid_processes'], 1)
+            self.assertEqual(lone['top_processes'][0]['cpu1c'], 0)
+            self.assertEqual(_exceedance_processes(db, 0, 4, 1001)['top_processes'], [])
+
+    def test_exceedance_top_processes_report_and_thresholds(self):
+        from perf_report_data import build_report_data
+        from perf_report_ui import render_document, stamp
+        from perf_report import timestamp
+
+        start = 946684800123
+        hostile = '<img src=x onerror=alert(1)>'
+        rows = []
+        for i, cpu in enumerate([90, 95, 99, 100] + [91] * 201):
+            ts = start + i  # Different cycles within the same second.
+            rows.append(f'S,{ts},7,{cpu},0,0,0,0,100,200,100\n')
+            if i == 1:
+                rows.append(self.p(ts, pid=20, name=hostile, cpu1c=321))
+                rows.append(self.p(ts, pid=21, name='zero', cpu1c=0))
+            elif i == 2:
+                rows.append(self.p(ts, pid=22, name='next-cycle', cpu1c=222))
+        sid = self.load(''.join(rows))
+        source = build_report_data(self.store, sid, include_full_system=True)
+        exceed = source['systems'][0]['cpu_exceedances']
+        self.assertEqual(exceed['valid_samples'], 205)
+        self.assertEqual([t['count'] for t in exceed['thresholds']], [204, 2, 1])
+        self.assertEqual(exceed['total'], 204)
+        self.assertTrue(exceed['truncated'])
+        self.assertEqual(len(exceed['details']), 200)
+        first, second, empty = exceed['details'][:3]
+        self.assertEqual([p['pid'] for p in first['top_processes']], [20, 21])
+        self.assertEqual([p['pid'] for p in second['top_processes']], [22])
+        self.assertEqual(empty['top_processes'], [])
+        html = render_document(source)
+        table = html.split('<div class="data-table" data-table="cpu-exceedances">', 1)[1].split('</table>', 1)[0]
+        self.assertIn('当时全进程 CPU 前5名 · 单核 %', table)
+        self.assertIn('&lt;img src=x onerror=alert(1)&gt;', table)
+        self.assertNotIn(hostile, table)
+        self.assertIn('321.00%\n2. zero（PID 21）：0.00%', table)
+        self.assertIn('无有效进程样本', table)
+        self.assertNotIn('.124', table)
+        self.assertEqual(stamp(start, seconds=True),
+                         datetime.fromisoformat(timestamp(start, local=True)).isoformat(timespec='seconds'))
+        self.assertIn('.123', stamp(start))  # Public precision remains intact.
+
+    def test_top_offline_cycle_axes_and_boundaries(self):
+        from copy import deepcopy
+        from perf_report_data import build_report_data
+        from perf_report_ui import render_document as standard_document
+        from perf_report_compact import render_document as compact_document
+
+        sid = self.load(self.s(1) + self.p(1, cpu1c=0, rss_kb=1024))
+        source = build_report_data(self.store, sid, include_full_system=True)
+        source['session']['summary']['source_format'] = 'top'
+        standard_html = standard_document(deepcopy(source))
+        compact_html = compact_document(deepcopy(source))
+        standard = ReportMarkup(standard_html).payload()
+        compact = ReportMarkup(compact_html).payload()
+        for html in (standard_html, compact_html):
+            self.assertIn('横轴显示小时:分钟:秒（本机时间，按原始周期等距）', html)
+            self.assertNotIn('横轴为原始采样周期 cycle', html)
+        schema = {field: i for i, field in enumerate(source['full_cycle_schema'])}
+        self.assertEqual(compact['processes'][0]['chart_samples'], [
+            [row[schema[f]] for f in ('cycle', 'ts', 'cpu1c', 'rss_kb', 'pids')]
+            for row in source['processes'][0]['full_cycles']])
+        self.assertTrue(all(len(row) == 4 for row in compact['systems'][0]['chart_samples']))
+        shared = Path('report_assets/report.js').read_text(encoding='utf-8')
+        shared = shared[:shared.index('  function setupFocusTable')]
+        compact_js = Path('report_assets/report_compact.js').read_text(encoding='utf-8')
+        compact_js = compact_js[:compact_js.index("  plot('system-cpu'")]
+        harness = """
+const assert = require('node:assert/strict');
+global.window = {};
+class Node {
+  constructor() { this.children=[]; this.style={}; this.dataset={}; this.textContent=''; }
+  append(...nodes) { this.children.push(...nodes); }
+  querySelector() { return this.children[0]; }
+  querySelectorAll() { return []; }
+  getClientRects() { return []; }
+}
+global.document = {
+  getElementById: () => ({textContent:JSON.stringify(input)}),
+  createElement: () => new Node(), documentElement:{classList:{add(){}}}
+};
+"""
+        script = 'const input = ' + json.dumps(standard) + ';\n' + harness + shared
+        script += """
+window.shared = {data,valid,fmt,scaleMetric,metric,exactStats,processLabel,el,draw};
+window.api = {lineSeries,systemPoints,fullPoints,draw,instances,overlayStream,overlayTooltip,mergeFull};
+})();
+"""
+        script += compact_js + '\nreturn {curves,sampleTooltip}; };\n'
+        script += """
+const api = window.api, shared = window.shared;
+const point = (cycle, changes={}) => ({segment:0,cycle,ts:1234,cpu1c:cycle%3,
+  rss_kb:1024,pids:[1],_run_cpu1c:cycle,...changes});
+const continuous = Array.from({length:721},(_,i)=>point(i+41));
+const run = points => api.lineSeries(points,'cpu1c','CPU','red');
+const flat = series => series.flatMap(s=>s.data);
+const snapshot = JSON.stringify(continuous);
+assert.equal(run(continuous).length,1);
+assert.equal(flat(run(continuous)).length,721);
+assert.deepEqual(flat(run(continuous))[0],[41,2,1234]);
+assert.equal(JSON.stringify(continuous),snapshot); // Python run markers are not mutated.
+const compactRun = points => {
+  const process = {id:'proc',name:'a',segment:0,pids:[1],chart_samples:
+    points.map(p=>[p.cycle,p.ts,p.cpu1c,p.rss_kb,p.pids])};
+  const system = {id:'sys',segment:0,metrics:{},chart_samples:[[41,1234,9,1]]};
+  shared.data.processes = [process];
+  return {process, system, compact:window.setupCompactReport(system,shared)};
+};
+const full = compactRun(continuous);
+assert.equal(full.compact.curves(full.process,'cpu1c','CPU','red').length,1);
+assert.deepEqual(flat(full.compact.curves(full.process,'cpu1c','CPU','red')),flat(run(continuous)));
+// Both implementations preserve valid observations, but never bridge bad boundaries.
+const cases = [
+  [[point(41),point(43)],2,2],
+  [[point(41),point(42,{ts:1233})],2,2],
+  [[point(41),point(42,{pids:[2]})],2,2],
+  [[point(41),point(42,{pids:null}),point(43)],3,3],
+  [[point(41),point(42,{cpu1c:null}),point(43)],2,2],
+  [[point(41),point(42,{ts:null}),point(43)],2,2],
+  [[point(41),point(41.5),point(42)],2,2],
+  [[point(41),point(42),point(42,{cpu1c:null}),point(43)],3,3],
+  [[point(41),point(42),point(42),point(43)],4,4],
+];
+for (const [points,count,groups] of cases) {
+  const c = compactRun(points);
+  for (const series of [run(points),c.compact.curves(c.process,'cpu1c','CPU','red')]) {
+    assert.equal(flat(series).length,count);
+    assert.equal(series.length,groups);
+  }
+}
+assert.equal(run([point(41),point(42,{segment:1})]).length,2);
+const systemSource = {segment:0,full_points:continuous.map(p=>({...p,cpu_single_core:p.cpu1c})),
+  series:{points:[]}};
+const systemSnapshot = JSON.stringify(systemSource);
+assert.equal(flat(api.lineSeries(api.systemPoints(systemSource),'cpu_total','CPU','red',1,0,true)).length,721);
+assert.equal(api.lineSeries(api.systemPoints(systemSource),'cpu_total','CPU','red',1,0,true).length,1);
+assert.equal(JSON.stringify(systemSource),systemSnapshot);
+const member = (pids) => ({segment:0,full_cycles:pids.map((pid,i)=>shared.data.full_cycle_schema.map(
+  f=>({...point(41+i),pids:[pid]})[f] ?? null))});
+const mergeSystem = {segment:0,cycle_axis:[41,42].map(cycle=>shared.data.cycle_axis_schema.map(
+  f=>({cycle,ts:1234})[f] ?? null))};
+assert.equal(run(api.fullPoints(member([1,1]))).length,1);
+assert.equal(run(api.mergeFull(mergeSystem,[member([1,1]),member([2,2])]).points).length,1);
+assert.equal(run(api.mergeFull(mergeSystem,[member([1,2]),member([2,1])]).points).length,2);
+const chart = new Node();
+api.draw(chart,{series:run(continuous)});
+const option = api.instances.get(chart).option;
+assert.equal(option.xAxis.type,'value');
+assert.equal(option.xAxis.name,'真实时间（本机，按周期等距）');
+assert.equal(option.xAxis.minInterval,1);
+const date = new Date(1234), pad = n=>String(n).padStart(2,'0');
+const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+assert.equal(option.xAxis.axisLabel.formatter(41),time);
+assert.equal(option.dataZoom.find(z=>z.type==='slider').labelFormatter(41),time);
+const show = cycle => option.tooltip.formatter([{axisValue:cycle,seriesName:'CPU',data:[42,999,0]}]);
+assert.ok(show(42).includes('CPU：0.00'));
+assert.ok(show(42).includes(time));
+assert.ok(!show(42).includes('.234'));
+assert.equal(show(40),'周期 40');
+assert.equal(show(41.5),'');
+api.draw(chart,{series:[],xAxis:{type:'category',data:['a']},dataZoom:[]});
+assert.equal(api.instances.get(chart).option.xAxis.type,'category');
+assert.equal(api.instances.get(chart).option.tooltip.formatter,undefined);
+const duplicate = [point(41),point(42),point(42,{cpu1c:null}),point(43)];
+api.draw(chart,{series:run(duplicate)});
+assert.equal(api.instances.get(chart).option.tooltip.formatter([{axisValue:42,seriesName:'CPU'}]),'周期 42');
+const entry = points => ({name:'CPU',field:'cpu1c',divisor:1,stream:api.overlayStream(points,['cpu1c'])});
+const tip = api.overlayTooltip([entry(continuous)],'%',chart);
+assert.equal(tip.formatter([{axisValue:42}]).children[1].children[0].children[2].textContent,'0.00 %');
+assert.equal(tip.formatter([{axisValue:40}]).children[1].children.length,0);
+assert.equal(api.overlayTooltip([entry(duplicate)],'%',chart).formatter([{axisValue:42}]).children[1].children.length,0);
+const c = compactRun(continuous);
+const tooltip = c.compact.sampleTooltip([{item:c.process,name:'CPU',color:'red'}],2,'%',chart);
+assert.equal(tooltip.formatter([{axisValue:42}]).children[1].children[0].children[2].textContent,'0.00 %');
+assert.ok(tooltip.formatter([{axisValue:42}]).children[0].textContent.endsWith(time+' · 周期 42'));
+assert.ok(!tooltip.formatter([{axisValue:42}]).children[0].textContent.includes('.234'));
+assert.equal(tooltip.formatter([{axisValue:40}]).children[1].children.length,0);
+const d = compactRun(duplicate);
+assert.equal(d.compact.sampleTooltip([{item:d.process,name:'CPU'}],2,'%',chart)
+  .formatter([{axisValue:42}]).children[1].children.length,0);
+const mixed = api.overlayTooltip([entry([point(41)]),entry([point(41,{ts:2345})])],'%',chart)
+  .formatter([{axisValue:41}]);
+assert.ok(mixed.children[0].textContent.includes('原始时间不唯一'));
+assert.equal(mixed.children[1].children.length,2);
+assert.ok(mixed.children[1].children.every(row=>row.children[3].textContent.includes('原始时间')));
+"""
+        self.run_report_script(script)
+
     def test_compact_full_resolution_samples_and_tooltip(self):
         from perf_report import render_report
         from perf_report_data import build_report_data
@@ -2649,13 +3320,28 @@ class GroupStoreTests(ReportAssertions, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '完整整机采样'):
             render_document(build_report_data(self.store, sid))
         js = (Path(__file__).parent / 'report_assets/report_compact.js').read_text()
-        prefix = js[:js.index("  function combination(")]
+        prefix = js[:js.index("  const byId =")]
         harness = """
 const assert = require('node:assert/strict');
 global.window = {};
+class Node {
+  constructor() { this.textContent=''; this.style={}; this.children=[]; this.events={}; this.nodes=new Map(); }
+  append(...nodes) { this.children.push(...nodes); }
+  prepend(...nodes) { this.children.unshift(...nodes); }
+  setAttribute() {}
+  addEventListener(type,callback) { this.events[type]=callback; }
+  querySelector(selector) {
+    if (!this.nodes.has(selector)) this.nodes.set(selector,new Node());
+    return this.nodes.get(selector);
+  }
+}
+const nodes=new Map();
 global.document = {
-  getElementById: id => ({id,textContent:JSON.stringify(data)}),
-  createElement: () => ({textContent:'',style:{},children:[],append(...nodes){this.children.push(...nodes);}}),
+  getElementById(id) {
+    if (!nodes.has(id)) { const node=new Node(); node.id=id; node.textContent=JSON.stringify(data); nodes.set(id,node); }
+    return nodes.get(id);
+  },
+  createElement: () => new Node(),
   documentElement:{clientWidth:900,clientHeight:420,classList:{add(){}}}
 };
 const rows = box => box.children[1].children.map(row => row.children.slice(1).map(n => n.textContent).join('：'));
@@ -2688,9 +3374,9 @@ assert.deepEqual(tooltip.position([-200,-200],[],null,null,{contentSize:[560,390
 const show = ts => tooltip.formatter([{axisValue:ts}]);
 assert.equal(tooltip.formatter([]),'');
 const missing = system.chart_samples[600];
-assert.equal(rows(show(missing[1]))[1],window.shared.processLabel(process)+'：缺失或冲突');
+assert.deepEqual(rows(show(missing[1])),['整机总 CPU：'+window.shared.fmt(missing[2])+' %']);
 const present = process.chart_samples[600];
-assert.equal(rows(show(present[1]))[1],window.shared.processLabel(process)+'：'+window.shared.fmt(present[2])+' %');
+assert.ok(rows(show(present[1])).includes(window.shared.processLabel(process)+'：'+window.shared.fmt(present[2])+' %'));
 assert.equal(show(present[1]).className,'compact-tooltip');
 assert.equal(show(present[1]).children[1].className,'compact-tooltip-list');
 const memory = api.sampleTooltip([
@@ -2698,7 +3384,7 @@ const memory = api.sampleTooltip([
   {item:process,name:process.name,color:'#2e956b',divisor:1024}
 ],3,'MB',chart);
 assert.equal(rows(memory.formatter([{axisValue:present[1]}]))[1],process.name+'：1.00 MB');
-assert.equal(rows(memory.formatter([{axisValue:missing[1]}]))[1],process.name+'：缺失或冲突');
+assert.deepEqual(rows(memory.formatter([{axisValue:missing[1]}])),['整机内存：'+window.shared.fmt(missing[3])+' MB']);
 assert.equal(memory.formatter([{axisValue:present[1]}]).children[1].children[1].children[0].style.backgroundColor,'#2e956b');
 const zero = process.chart_samples.find(row=>row[2]===0);
 assert.equal(rows(show(zero[1]))[1],window.shared.processLabel(process)+'：0.00 %');
@@ -2707,7 +3393,9 @@ const assertOverview = sample => {
   assert.deepEqual(rows(overview('memory',sample[1])),['整机已用内存：'+window.shared.fmt(sample[3])+' MB']);
   for (const role of ['system-cpu','memory']) {
     assert.equal(overview(role,sample[1]).children[0].textContent,
-      new Date(sample[1]).toLocaleString()+'.'+String(new Date(sample[1]).getMilliseconds()).padStart(3,'0')+' · 周期 '+sample[0]);
+      (() => { const d=new Date(sample[1]), pad=n=>String(n).padStart(2,'0');
+        return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      })()+' · 周期 '+sample[0]);
   }
 };
 assertOverview(missing); // Missing process sample does not affect the overview.
@@ -2715,27 +3403,98 @@ assertOverview(system.chart_samples[601]);
 process.chart_samples.push([9999,present[1],999,999]);
 window.setupCompactReport(system,window.shared);
 assertOverview(system.chart_samples[601]); // A process's different cycle is irrelevant here.
-assert.ok(rows(window.setupCompactReport(system,window.shared).cpuTooltip([process])
-  .formatter([{axisValue:present[1]}])).every(text=>text.endsWith('缺失或冲突')));
+const systemOnly=['整机总 CPU：'+window.shared.fmt(system.chart_samples[601][2])+' %'];
+const cpuBox=()=>window.setupCompactReport(system,window.shared).cpuTooltip([process])
+  .formatter([{axisValue:present[1]}]);
+assert.deepEqual(rows(cpuBox()),systemOnly);
+assert.ok(!cpuBox().children[0].textContent.includes('周期'));
 process.chart_samples.pop();
-process.chart_samples.push([...present]);
-const duplicate = window.setupCompactReport(system,window.shared).cpuTooltip([process]);
-assert.equal(rows(duplicate.formatter([{axisValue:present[1]}]))[1],window.shared.processLabel(process)+'：缺失或冲突');
+for (const duplicates of [2,3]) {
+  process.chart_samples.push([...present]);
+  assert.deepEqual(rows(cpuBox()),systemOnly);
+}
+process.chart_samples.pop(); process.chart_samples.pop();
+const oldCycle=present[0];
+present[0]=9999;
+assert.equal(rows(cpuBox()).length,2); // Independently valid samples need not share a cycle.
+assert.ok(!cpuBox().children[0].textContent.includes('周期'));
+present[0]=oldCycle;
+const oldCpu=present[2];
+for (const invalid of [null,undefined,NaN,Infinity,'2']) {
+  present[2]=invalid;
+  assert.deepEqual(rows(cpuBox()),systemOnly);
+}
+present[2]=oldCpu;
+assert.deepEqual(rows(api.cpuTooltip([process]).formatter([{axisValue:present[1]+0.5}])),[]);
 assertOverview(system.chart_samples[601]);
 system.chart_samples.push([...system.chart_samples[601]]);
 window.setupCompactReport(system,window.shared);
 for (const role of ['system-cpu','memory']) {
-  assert.ok(rows(overview(role,present[1]))[0].endsWith('缺失或冲突'));
+  assert.deepEqual(rows(overview(role,present[1])),[]);
   assert.ok(overview(role,present[1]).children[0].textContent.endsWith(' · 周期 '+present[0]));
 }
+assert.deepEqual(rows(cpuBox()),[window.shared.processLabel(process)+'：'+window.shared.fmt(present[2])+' %']);
 system.chart_samples.pop();
 system.chart_samples.push([9999,present[1],20,100]);
-const conflict = window.setupCompactReport(system,window.shared).cpuTooltip([process]);
-assert.equal(rows(conflict.formatter([{axisValue:present[1]}]))[0],'整机总 CPU：缺失或冲突');
+assert.deepEqual(rows(cpuBox()),[window.shared.processLabel(process)+'：'+window.shared.fmt(present[2])+' %']);
 for (const role of ['system-cpu','memory']) {
-  assert.ok(rows(overview(role,present[1]))[0].endsWith('缺失或冲突'));
-  assert.ok(overview(role,present[1]).children[0].textContent.endsWith(' · 周期 不明确'));
+  assert.deepEqual(rows(overview(role,present[1])),[]);
+  assert.ok(!overview(role,present[1]).children[0].textContent.includes('周期'));
 }
+system.chart_samples.pop();
+// Sort converted units, including the reference, without changing entry colors.
+const originalSystemSamples=system.chart_samples, originalProcessSamples=process.chart_samples;
+system.chart_samples=[[1,1000,2,2]];
+process.chart_samples=[[1,1000,4,4096]];
+const small={...process,id:process.id+'-small',name:'small',chart_samples:[[1,1000,1,1024]]};
+const empty={...process,id:process.id+'-empty',name:'empty',chart_samples:[[1,1000,null,null]]};
+const zeroItem={...process,id:process.id+'-zero',name:'zero',chart_samples:[[1,1000,0,0]]};
+window.shared.data.processes.push(small,empty,zeroItem);
+nodes.delete(system.id);
+const rankedApi=window.setupCompactReport(system,window.shared);
+const rankedEntries=[
+  {item:system,name:'整机',color:'#202c40',divisor:1},
+  {item:small,name:'小进程',color:'#111111',divisor:1024},
+  {item:process,name:'大进程',color:'#222222',divisor:1024},
+  {item:empty,name:'无效',color:'#333333',divisor:1024},
+  {item:zeroItem,name:'零进程',color:'#444444',divisor:1024}
+];
+const ranked=rankedApi.sampleTooltip(rankedEntries,3,'MB',chart).formatter([{axisValue:1000}]);
+assert.deepEqual(rows(ranked),['大进程：4.00 MB','整机：2.00 MB','小进程：1.00 MB','零进程：0.00 MB']);
+assert.deepEqual(ranked.children[1].children.map(row=>row.children[0].style.backgroundColor),
+  ['#222222','#202c40','#111111','#444444']);
+// The legend selection drives both the curves and tooltip; the reference stays selected.
+for (const role of ['combined-cpu','combined-memory']) {
+  const controls=document.getElementById(system.id).querySelector('[data-role="'+role+'"] .legend-controls');
+  const [actions,list]=controls.children;
+  const button=label=>actions.children.find(node=>node.textContent===label);
+  const chartOption=()=>options.get(system.id+'-'+role);
+  const box=()=>chartOption().tooltip.formatter([{axisValue:1000}]);
+  const labels=()=>box().children[1].children.map(row=>row.children[1].textContent);
+  const systemCheck=list.children[0].children[0];
+  assert.equal(systemCheck.checked,true);
+  assert.equal(systemCheck.disabled,true);
+  assert.equal(button('全隐'),undefined);
+  assert.ok(button('仅整机'));
+  assert.deepEqual(labels(),[window.shared.processLabel(process),'整机',window.shared.processLabel(small),window.shared.processLabel(zeroItem)]);
+  button('仅整机').events.click();
+  assert.deepEqual(labels(),['整机']);
+  assert.equal(chartOption().series.length,1);
+  assert.equal(systemCheck.checked,true);
+  assert.ok(list.children.slice(1).every(label=>!label.children[0].checked));
+  button('全显').events.click();
+  const processLabel=list.children.find(label=>label.children[1].textContent===window.shared.processLabel(process));
+  processLabel.children[0].checked=false; processLabel.children[0].events.change();
+  assert.ok(!labels().includes(window.shared.processLabel(process)));
+  assert.ok(chartOption().series.every(series=>series.name!==window.shared.processLabel(process)));
+  assert.ok(labels().includes('整机'));
+  button('仅前 15 + 整机').events.click();
+  assert.ok(labels().includes(window.shared.processLabel(process)));
+  const tooltipRow=box().children[1].children.find(row=>row.children[1].textContent===window.shared.processLabel(process));
+  assert.equal(tooltipRow.children[0].style.backgroundColor,processLabel.children[1].style.color);
+}
+window.shared.data.processes.splice(-3);
+system.chart_samples=originalSystemSamples; process.chart_samples=originalProcessSamples;
 """
         self.run_report_script(script)
 
@@ -3167,6 +3926,99 @@ for (const role of ['system-cpu','memory']) {
                 self.assert_metric(second["metrics"][field], 1, [9] * 5)
         self.assertEqual(second["pid_changes"], 0)
 
+    def test_report_views_use_only_measured_values_without_zero_filling(self):
+        from perf_report import render_report
+        from perf_report_data import REQUIRED_PROCESSES
+        from perf_report_ui import PROCESS_HEADERS, process_row, required_table
+
+        target = REQUIRED_PROCESSES[-1]["name"]
+        text = ""
+        for ts in range(1, 25):
+            text += self.s(ts)
+            text += self.p(ts, 2, "steady", cpu1c=10, rss_kb=2048)
+            text += self.p(ts, 3, "zero", cpu1c=0, rss_kb=0)
+            if ts <= 22:
+                text += self.p(ts, 1, target, cpu1c=105 if ts == 21 else 0, rss_kb=1024)
+            if ts == 24:
+                text += f"DP,{ts},1,100,1,{target}\n"
+        sid = self.load(text)
+        with self.store.connect() as db:
+            db.execute("UPDATE records SET data=json_set(data,'$.cpu1c',NULL) "
+                       "WHERE session=? AND kind='P' AND pid=1 "
+                       "AND json_extract(data,'$.ts')=22", (sid,))
+        html = render_report(self.store, sid)
+        data = self.assert_report(html)
+        compact = ReportMarkup(render_report(self.store, sid, style="compact")).payload()
+        lookup = {p["name"]: p for p in data["processes"]}
+        process = lookup[target]
+        self.assert_metric(process["metrics"]["cpu1c"], 21, [0, 5, 0, 105, 105])
+        self.assert_metric(process["display_metrics"]["rss_mb"], 22, [1] * 5)
+        self.assert_metric(lookup["zero"]["metrics"]["cpu1c"], 24, [0] * 5)
+        self.assertEqual(process["active"]["metrics"]["cpu1c"]["avg"], 105)
+        for p in compact["processes"]:
+            self.assertEqual(p["metrics"], lookup[p["name"]]["metrics"])
+            self.assertEqual(p["display_metrics"], lookup[p["name"]]["display_metrics"])
+        cells = dict(zip(PROCESS_HEADERS, process_row(process, 1)))
+        self.assertEqual([cells[h] for h in ("CPU有效周期", "CPU均值 %", "CPU P95 %", "CPU峰值 %")],
+                         [21, 5, 0, 105])
+        focus = required_table(dict(data, required=[data["required"][-1]]), 0)
+        measured = focus.split('class="measured"', 1)[1]
+        sorts = [a["data-sort"] for tag, a in ReportMarkup(measured).tags
+                 if tag == "td" and "data-sort" in a]
+        self.assertEqual([float(v) for v in sorts[:5]], [0, 0, 105, 30.19, 1])
+        cycles = [dict(zip(data["full_cycle_schema"], row)) for row in process["full_cycles"]]
+        self.assertNotIn(23, [c["ts"] for c in cycles])
+        self.assertEqual([c["cpu1c"] for c in cycles[-2:]], [None, None])
+        self.assertIn('data-chart="cpu-top"', html)
+        self.assertNotIn('data-chart="active-top"', html)
+        self._check_measured_report_javascript(data, compact, target)
+
+    def _check_measured_report_javascript(self, data, compact, target):
+        source = Path("report_assets/report.js").read_text(encoding="utf-8")
+        helpers = source[:source.index("  const observer =")]
+        functions = source[source.index("  function rank("):source.index("  function mergeTable(")]
+        script = "const input = " + json.dumps(dict(data=data, compact=compact, target=target)) + ";\n"
+        script += """
+const assert = require('node:assert/strict');
+global.document = {
+  getElementById: () => ({textContent:JSON.stringify(input.data)}),
+  documentElement: {classList:{add(){}}}
+};
+""" + helpers + functions + """
+const keys = ['count','min','avg','p95','p99','max','total'];
+const compare = (actual, expected) => {
+  for (const key of keys) assert.equal(actual[key], expected[key], key);
+};
+for (const p of data.processes) {
+  const expected= structuredClone(p);
+  prepareMetrics(p);
+  for (const f of fields) compare(p.metrics[f], expected.metrics[f]);
+  const merged = mergeFull(data.systems[0], [p]);
+  for (const f of fields) compare(merged.metrics[f], p.metrics[f]);
+  compare(merged.metrics.rss_mb, p.display_metrics.rss_mb);
+}
+for (const p of input.compact.processes) {
+  const expected = structuredClone(p.metrics.cpu1c);
+  prepareMetrics(p);
+  compare(p.metrics.cpu1c, expected);
+}
+const p = data.processes.find(p => p.name === input.target);
+const steady = data.processes.find(p => p.name === 'steady');
+assert.deepEqual(rank(data.processes,'cpu1c','avg').map(p => p.name), ['steady',input.target,'zero']);
+const merged = mergeFull(data.systems[0], [p,steady]);
+assert.equal(merged.metrics.cpu1c.count,21);
+assert.equal(merged.metrics.cpu1c.avg,15);
+assert.equal(merged.metrics.cpu1c.p95,10);
+assert.equal(merged.metrics.rss_mb.count,22);
+assert.equal(merged.metrics.rss_mb.avg,3);
+assert.deepEqual(merged.points.slice(-3).map(p => p.cpu1c), [null,null,null]);
+assert.deepEqual(merged.points.slice(-3).map(p => p.rss_mb), [3,null,null]);
+compare(exactStats([{cpu1c:null},{}], 'cpu1c'),
+  {count:0,min:null,avg:null,p95:null,p99:null,max:null,total:null});
+})();
+"""
+        self.run_report_script(script)
+
     def test_report_merged_fields_are_independently_nullable(self):
         from perf_report import render_report
 
@@ -3511,7 +4363,7 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
             48: ("dp_only", "exact", [pid(0, "/system/bin/surfaceflinger")], []),
             52: ("pending_confirmation", "ambiguous", [],
                  [pid(0, "/vendor/bin/logd"), pid(0, "/other/bin/logd")]),
-            57: ("pending_confirmation", "candidate", [], [pid(0, webview), pid(0, webview + ".SandboxedProcessService:0")]),
+            57: ("collected", "exact", [pid(0, webview)], []),
         }
         for row, item in required.items():
             with self.subTest(row=row):
@@ -3530,9 +4382,64 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
                 self.assertEqual(item["missing"], not bool(matches + later))
                 self.assertEqual(item["status"], "collected" if later else status)
         assigned = {(0, names[0]): [45], (0, "audioserver"): [46],
-                    (0, "/system/bin/surfaceflinger"): [48], (1, "/system/bin/logd"): [52]}
+                    (0, "/system/bin/surfaceflinger"): [48], (1, "/system/bin/logd"): [52],
+                    (0, webview): [57]}
         for key, process in processes.items():
             self.assertEqual(process["required_rows"], assigned.get(key, []), key)
+
+    def test_report_webview_matching_and_measured_values(self):
+        from perf_report import render_report
+        from perf_report_data import REQUIRED_PROCESSES
+        from perf_report_ui import required_table
+
+        target = REQUIRED_PROCESSES[-1]["name"]
+        full = target + ".SandboxedProcessService:0"
+        cases = [
+            ([target], "collected", "exact", target),
+            ([full], "collected", "prefix", full),
+            ([full + "1", full], "pending_confirmation", "candidate", None),
+            ([target[:-4]], "pending_confirmation", "candidate", None),
+            ([target + ".SandboxedProcessServic"], "pending_confirmation", "candidate", None),
+            ([target, full], "collected", "exact", target),
+            ([full.replace("process0:", "process1:")], "missing", None, None),
+            ([target + ".SandboxedProcessService0:2"], "collected", "prefix",
+             target + ".SandboxedProcessService0:2"),
+            ([target + ".SandboxedProcessServiceEvil"], "pending_confirmation", "candidate", None),
+            ([], "missing", None, None),
+        ]
+        text = ""
+        for segment, (names, _, _, _) in enumerate(cases):
+            ts = 2000 - segment * 100
+            text += self.s(ts)
+            text += "".join(self.p(ts, pid, name, cpu1c=12 * pid, rss_kb=1024 * pid)
+                            for pid, name in enumerate(names, 1))
+        text += self.s(100) + f"DP,100,1,100,1,{full}\n"
+        cases.append(([full], "dp_only", "prefix", full))
+        data = self.assert_report(render_report(self.store, self.load(text)))
+        item = data["required"][-1]
+        lookup = {p["id"]: p for p in data["processes"]}
+        self.assertEqual(len(item["segments"]), len(cases))
+        for segment, (names, status, mode, matched_name) in enumerate(cases):
+            with self.subTest(segment=segment):
+                result = item["segments"][segment]
+                self.assertEqual((result["status"], result["match"]), (status, mode))
+                matched = [lookup[pid] for pid in result["process_ids"]]
+                self.assertEqual([p["name"] for p in matched], [matched_name] if matched_name else [])
+                self.assertEqual(len(result["candidate_ids"]), len(names) if status == "pending_confirmation" else 0)
+                html = required_table(dict(data, required=[item]), segment)
+                if matched:
+                    process = matched[0]
+                    self.assertEqual(process["required_rows"], [57])
+                    self.assertIn('<strong>' + matched_name + '</strong>', html)
+                    self.assertIn('data-process="' + process["id"] + '"', html)
+                    self.assertEqual(process["metrics"]["cpu1c"]["p95"],
+                                     12 if status == "collected" else None)
+                    self.assertEqual(process["metrics"]["rss_kb"]["max"],
+                                     1024 if status == "collected" else None)
+                    if status == "collected":
+                        self.assertIn('data-sort="12.0"', html)
+                else:
+                    self.assertNotIn('data-process=', html)
 
     def test_report_voice_algorithm_fallback_is_segment_local(self):
         from perf_report import render_report
@@ -3615,20 +4522,19 @@ assert.equal(a.querySelector('.focus-identity').querySelector('.process-pid').te
         for column in range(7):
             self.assertEqual(budget_comparison(100, EXCEL_BUDGETS[8], column), ("", ""))
         # Current exact names collect; retired names do not become aliases.
-        # The short WebView name and its old longer form remain candidates only.
+        # Exact WebView names collect; incomplete extensions remain candidates.
         text = self.s(100) + "".join(self.p(100, i, name) for i, name in enumerate(expected.values(), 1))
         text += self.s(1) + "".join(self.p(1, i, name) for i, name in enumerate(old_names, 1))
         data = self.assert_report(render_report(self.store, self.load(text)))
         required = {r["excel_row"]: r for r in data["required"]}
         for excel_row in expected:
             first, retired = required[excel_row]["segments"]
+            self.assertEqual((first["status"], first["match"]), ("collected", "exact"))
             if excel_row == 57:
-                for segment in (first, retired):
-                    self.assertEqual(segment["status"], "pending_confirmation")
-                    self.assertEqual(segment["process_ids"], [])
-                    self.assertEqual(len(segment["candidate_ids"]), 1)
+                self.assertEqual(retired["status"], "pending_confirmation")
+                self.assertEqual(retired["process_ids"], [])
+                self.assertEqual(len(retired["candidate_ids"]), 1)
             else:
-                self.assertEqual((first["status"], first["match"]), ("collected", "exact"))
                 self.assertEqual(retired["status"], "missing")
                 self.assertEqual(retired["candidate_ids"], [])
         html = required_table(dict(data, required=[required[8]]), 0)
@@ -4293,8 +5199,11 @@ const compile = source => ts.transpileModule(source, {compilerOptions: {
     revokeObjectURL(value) { released.push(value); }};
   let response = {headers: new Headers({'Content-Type': 'text/html; charset=utf-8'}),
     blob: async () => blob, text() { throw Error('must not decode HTML'); }};
-  const {loadReport, releaseReport} = new Function('apiResponse', 'URL', compile(functions) +
-    '\nreturn {loadReport, releaseReport};')(async () => { calls++; return response; }, urls);
+  const datesSource = fs.readFileSync(root + '/frontend/src/ReportDates.tsx', 'utf8');
+  const dateExports= {};
+  new Function('require', 'exports', compile(datesSource))(() => ({}), dateExports);
+  const {loadReport, releaseReport} = new Function('apiResponse', 'URL', 'assertReportPath', compile(functions) +
+    '\nreturn {loadReport, releaseReport};')(async () => { calls++; return response; }, urls, dateExports.assertReportPath);
   const path = '/api/sessions/' + 'a'.repeat(32) + '/report';
   const controller = new AbortController();
   assert.equal(await loadReport(path, controller.signal), 'blob:report');
@@ -4564,7 +5473,10 @@ const compile = source => ts.transpileModule(source, {compilerOptions: {
         self.assertEqual(report.status_code, 200)
         self.assertIn('data-chart="system-cpu"', report.text)
         self.assertIn("attachment", report.headers["content-disposition"])
-        self.assertEqual(self.client.delete(base, headers=self.headers).json(), {"deleted": True})
+        deleted = self.client.delete(base, headers=self.headers)
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json(), {"deleted": True, "deleted_ids": [sid],
+                                         "missing_ids": [], "logs_freed_bytes": 0, "warnings": []})
         self.assertEqual(self.client.get(base, headers=self.headers).status_code, 404)
 
     def test_reopened_analysis_uses_persistent_report_and_overview(self):

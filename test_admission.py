@@ -230,11 +230,29 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(rows[0][5:12], ["10.00", "2.88", "10.00", "2.88", "2.00", "200.00", "400.00"])
         names = [r["name"] for r in REQUIRED_PROCESSES]
         self.assertEqual(rows[names.index("/system/bin/audioserver")][5:], [""] * 14)
-        self.assertEqual(rows[-1][5:], [""] * 14)
+        self.assertEqual(rows[-1][5:12], ["10.00", "2.88", "10.00", "2.88", "1.00", "100.00", "200.00"])
+        self.assertEqual(rows[-1][12:], ["-"] * 7)
         self.assertEqual(rows[names.index("/system/bin/mediaserver")][5], "40.00")
         self.assertEqual([row[1:] for row in totals], [["", ""], ["", ""]])
         self.assertEqual(len(list(self.output.glob("*.png"))), 0)
         self.assertTrue(any("IO" in warning for warning in result["warnings"]))
+
+    def test_webview_ambiguous_and_dp_only_remain_empty(self):
+        target = REQUIRED_PROCESSES[-1]["name"]
+        full = target + ".SandboxedProcessService:0"
+        cases = [
+            p(1, full) + p(1, full[:-1] + "1", pid=2),
+            p(1, target[:-4]),
+            p(1, target + ".SandboxedProcessServic"),
+            f"DP,1,1,100,1,{full}\n",
+            f"DP,1,1,100,1,{target}\n" + p(1, full, pid=2),
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                result = self.build(s(1) + text)
+                rows, _ = self.rows(result["blocks"])
+                self.assertEqual(rows[-1][5:], [""] * 14)
+                self.assertTrue(any("可靠匹配采集覆盖：0/50；" in w for w in result["warnings"]))
 
     def test_factor_and_scene_validation(self):
         sid = self.load(s(1) + p(1))
@@ -451,8 +469,10 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(by_name[healing][3:5], ["Y", "N"])
         self.assertEqual(by_name[healing][5:12], ["-"] * 7)
         self.assertEqual(by_name[healing][12:16], ["80.00", "23.00", "80.00", "23.00"])
-        self.assertEqual(by_name[webview][5:], [""] * 14)
-        self.assertTrue(any("可靠匹配采集覆盖：2/50；" in w for w in result["warnings"]))
+        self.assertEqual(by_name[webview][5:12],
+                         ["10.00", "2.88", "10.00", "2.88", "1.00", "100.00", "200.00"])
+        self.assertEqual(by_name[webview][12:], ["-"] * 7)
+        self.assertTrue(any("可靠匹配采集覆盖：3/50；" in w for w in result["warnings"]))
         self.assertEqual(json.loads((self.output / "report.json").read_text()), result["blocks"])
 
     def assert_rejected_before_read(self, source):

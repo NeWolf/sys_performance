@@ -6,6 +6,7 @@ Only connection-local SQLite temporary tables are written. Public payload versio
 import itertools
 import json
 import posixpath
+import re
 import time
 from concurrent.futures import CancelledError
 from collections import Counter, defaultdict
@@ -217,13 +218,19 @@ def _required(processes, segments):
         for segment in segments:
             names = by_segment[segment]
             matches, candidates, mode = [], [], None
-            if entry["truncated"]:
+            if target in names:
+                matches, mode = [names[target]], "exact"
+            elif entry["truncated"]:
                 candidates = [p for name, p in names.items() if isinstance(name, str)
                               and "webview" in name and len(name) >= 15
                               and (name.startswith(target) or target.startswith(name))]
                 mode = "candidate" if candidates else None
-            elif target in names:
-                matches, mode = [names[target]], "exact"
+                # A spreadsheet prefix is not proof of identity. Only promote a
+                # unique, complete service name; shorter/ambiguous names stay pending.
+                if len(candidates) == 1 and re.fullmatch(
+                        re.escape(target) + r"\.SandboxedProcessService[0-9]*(?::[0-9]+)?",
+                        candidates[0]["name"]):
+                    matches, candidates, mode = candidates, [], "prefix"
             else:
                 base = posixpath.basename(target) if target.startswith("/") else target
                 candidates = [p for name, p in names.items() if isinstance(name, str)
@@ -259,10 +266,12 @@ def _required(processes, segments):
     return required
 
 
-def _prepare(db, session_id):
+def _prepare(db, session_id, dates=None):
+    from perf_report_dates import date_filter
+    predicate = date_filter(db, session_id, dates)
     register_metric_sql(db)
     # One session scan; indices/sorts live only in this connection's temp database.
-    db.execute("CREATE TEMP TABLE report_source AS SELECT id,segment,cycle,ts,kind,pid,name,source,line,data FROM records WHERE session=?", (session_id,))
+    db.execute("CREATE TEMP TABLE report_source AS SELECT id,segment,cycle,ts,kind,pid,name,source,line,data FROM records WHERE session=?" + predicate, (session_id,))
     db.execute("CREATE INDEX temp.report_identity ON report_source(kind,segment,name,cycle,id)")
     db.execute("CREATE INDEX temp.report_segment_cycle ON report_source(segment,cycle,id)")
     db.execute("CREATE TEMP TABLE report_values(scope TEXT,field TEXT,value REAL,active INTEGER)")
@@ -285,7 +294,7 @@ def _progress_reporter(progress=None, cancelled=None):
     return report
 
 
-def build_report_data(store, session_id, progress=None, cancelled=None, include_full_system=False):
+def build_report_data(store, session_id, progress=None, cancelled=None, include_full_system=False, *, dates=None):
     """Return JSON-safe session/systems/processes/required/method, schema_version=1.
 
     Statistics use all valid samples, charts are bounded, and full_cycles are not.
@@ -305,7 +314,9 @@ def build_report_data(store, session_id, progress=None, cancelled=None, include_
             raise KeyError(session_id)
         session = dict(raw, summary=json.loads(raw["summary"]))
         reject_qnx_session(session)
-        _prepare(db, session_id)
+        _prepare(db, session_id, dates)
+        from perf_report_dates import selected_session
+        session = selected_session(db, session, "report_source", dates)
         totals = dict(db.execute("SELECT kind,COUNT(*) FROM report_source GROUP BY kind"))
         completed = {"process": 0, "system": 0}
         totals = {"process": totals.get("P", 0) + totals.get("DP", 0), "system": totals.get("S", 0)}
@@ -395,6 +406,26 @@ def _build_process(db, store, index, segment, name, rows, cycles, advance=None):
     )
 
 
+def _exceedance_processes(db, segment, cycle, ts):
+    """Rank observed PID identities at this exact sample, independent of UI filters."""
+    rows = db.execute(
+        "SELECT * FROM report_source WHERE segment IS ? AND cycle=? "
+        "AND kind='P' ORDER BY name,pid,id", (segment, cycle))
+    ranked = []
+    for (name, pid), group in itertools.groupby(rows, key=lambda r: (r["name"], r["pid"])):
+        records = list(group)
+        # Never choose an arbitrary duplicate or borrow a neighbouring timestamp.
+        if len(records) != 1 or pid is None or ts is None or records[0]["ts"] != ts:
+            continue
+        row = records[0]
+        cpu = _number(json.loads(row["data"]).get("cpu1c"))
+        if cpu is not None:
+            ranked.append(dict(name=name, pid=pid, cpu1c=cpu,
+                               record_id=row["id"], source=row["source"], line=row["line"]))
+    ranked.sort(key=lambda p: (-p["cpu1c"], p["name"], p["pid"]))
+    return dict(top_processes=ranked[:5], valid_processes=len(ranked))
+
+
 def _build_system(db, store, segment, cycles, advance=None, include_full_system=False):
     scope = "s" + str(segment)
     counts = Counter()
@@ -430,7 +461,8 @@ def _build_system(db, store, segment, cycles, advance=None, include_full_system=
                 counts[threshold] += cpu > threshold
             if cpu > 90 and len(details) < 200:
                 details.append(dict(record_id=row["id"], cycle=row["cycle"], ts=row["ts"],
-                                    source=row["source"], line=row["line"], cpu_total=cpu))
+                                    source=row["source"], line=row["line"], cpu_total=cpu,
+                                    **_exceedance_processes(db, segment, row["cycle"], row["ts"])))
         profiles.add((reference["cpu_platform"], reference["cpu_capacity"]))
         point = dict(ts=row["ts"], record_id=row["id"], **(values | reference))
         db.execute("INSERT INTO report_points VALUES (?,?,?,?,?)",
@@ -465,13 +497,13 @@ def _payload(session, systems, processes, required):
             missing="仅观察到的成员参与；当周期任一 P/DP 成员缺 P 或字段缺失，该字段为 null。缺周期不补零；不能证明未观察成员不存在。",
             duplicates="同 cycle 同 PID/name 多条 P：整个名称该周期全部指标为 null，duplicate_pids 保留；DP 不作为 P 数值来源。",
             coverage="cycles 是该段全部记录类型的去重周期数；complete_cycles 要求七字段全有效。P 覆盖率不等于字段有效覆盖率。",
-            active="对同名同周期合计后有效单核 cpu1c > 0 的周期另算全部指标；不是单 PID 活跃度，不代表实际运行时长。",
+            report_scope="关注进程、全进程、排行榜与关联进程均按全部有效观察周期统计，包含有效零值，各字段独立排除缺失、不补零；不使用仅 CPU 大于零的周期统计。",
             pid="pid_path 按已观察周期列出 PID 集合变化（含 DP）；pid_changes 不跨段，不推断缺周期的退出/重启及同 PID 复用。",
             system="每条原始 S 有效字段独立统计，重复 S 不去重；超标严格大于 90/95/99，分母是有效 cpu_total 样本数，非时间占比。没有系统任务总量。",
             charts="每系列最多600点；全部原始点先写 _run_字段。仅同段同run且字段非null可连接；run已覆盖缺值、缺周期、非递增ts。不得用采样点计算精确统计或合并。",
             merge="使用 full_cycles（schema见 full_cycle_schema），仅选择同 segment 的不同原始 name；按该段全部 cycle 对齐。缺任一选中名称的行或字段则对应合计为null，否则求和；对全量合计有效周期重算最近秩统计。不要相加各进程p95/p99，严禁跨段求和。",
             provenance="每条 full_cycles 附 first_record_id/last_record_id，结合 session+segment+name+cycle 查询 records 可追溯所有 P/DP source/line；范围可能穿插其他记录。系统明细直接附 source/line。",
-            matching="Excel原名逐字优先；仅绝对路径可退化basename，歧义仅列候选。WebView截断行始终待确认。required按每段标记，无采集为missing；dp_only不是P采集成功。",
+            matching="Excel原名逐字优先；仅绝对路径可退化basename，歧义仅列候选。WebView优先精确匹配，否则仅唯一完整SandboxedProcessService名称可补全匹配；短名称及多候选仍待确认。required按每段标记，无采集为missing；dp_only不是P采集成功。",
             precision="指标输入先按十进制HALF_UP舍入至两位，合计、均值及派生计算使用共享十进制函数，结果保留两位；整数计数、时间戳、标识符及原始records不改。统计临时表使用SQLite REAL，大整数可能有IEEE754舍入。完整周期数组不降采样，输出体积随名称周期数增长。",
         ),
     )

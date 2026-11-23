@@ -673,7 +673,7 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
                 self.assertEqual([p[field] for p in system["series"]["points"]], [0, None])
                 self.assert_metric(system["metrics"][field], 1, [0] * 5)
 
-    def test_report_active_cpu_percentiles_and_kdmips_share_samples(self):
+    def test_report_measured_and_active_cpu_percentiles_and_kdmips(self):
         from perf_report import render_report
         from perf_report_ui import PROCESS_HEADERS, process_row
 
@@ -694,8 +694,16 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
                 text.append(f"{pid} 1M {values[i]} {name}\n")
         html = render_report(self.store, self.load(''.join(text)))
         payload = self.assert_report(html)
-        self.assertIn("活跃样本为1至19个时二者必然相等", html)
-        self.assertIn("内存与 IO 仍按全部有效观察周期统计", html)
+        self.assertIn("全部有效观察周期（含有效零值）", html)
+        self.assertIn("各字段独立排除缺失，不补零", html)
+        measured_expected = {
+            "sparse.app": (0, 3.5, 0, 1.01),
+            "repeated.app": (3.7, 7.4, 1.06, 2.13),
+            "nineteen.app": (14, 19, 4.03, 5.46),
+            "twenty.app": (15, 20, 4.31, 5.75),
+            "distinct.app": (95, 100, 27.31, 28.75),
+            "idle.app": (0, 0, 0, 0),
+        }
         for process in payload["processes"]:
             with self.subTest(name=process["name"]):
                 _, count, p95, peak = cases[process["name"]]
@@ -705,21 +713,27 @@ class TopStoreTests(ReportAssertions, unittest.TestCase):
                 self.assertEqual((active["p95"], active["max"]), (p95, peak))
                 self.assertEqual(process["metrics"]["cpu1c"]["count"], 100)
                 cells = dict(zip(PROCESS_HEADERS, process_row(process, 1)))
-                for header_name, key, expected in (
-                        ("活跃P95 %", "p95", p95), ("活跃峰值 %", "max", peak),
-                        ("活跃P95K KDMIPS", "p95k", {None: None, 3.5: 1.01, 7.4: 2.13, 19: 5.46, 95: 27.31}[p95]),
-                        ("活跃峰值K KDMIPS", "peakk", {None: None, 3.5: 1.01, 7.4: 2.13, 19: 5.46, 20:5.75, 100: 28.75}[peak])):
+                for key, expected in (
+                        ("p95k", {None: None, 3.5: 1.01, 7.4: 2.13, 19: 5.46, 95: 27.31}[p95]),
+                        ("peakk", {None: None, 3.5: 1.01, 7.4: 2.13, 19: 5.46, 20: 5.75, 100: 28.75}[peak])):
                     if expected is None:
-                        self.assertIsNone(cells[header_name])
                         self.assertIsNone(active[key])
                     else:
-                        self.assertAlmostEqual(cells[header_name], expected)
                         self.assertAlmostEqual(active[key], expected)
+                measured = process["metrics"]["cpu1c"]
+                self.assertEqual(cells["CPU有效周期"], 100)
+                for (header_name, key), expected in zip(
+                        (("CPU P95 %", "p95"), ("CPU峰值 %", "max"),
+                         ("CPU P95K KDMIPS", "p95k"), ("CPU峰值K KDMIPS", "peakk")),
+                        measured_expected[process["name"]]):
+                    self.assertAlmostEqual(cells[header_name], expected)
+                    self.assertAlmostEqual(measured[key], expected)
                 self.assertEqual(cells["内存均值 MB"], 1)
                 if process["name"] == "sparse.app":
                     self.assertEqual(process["metrics"]["cpu1c"]["p95"], 0)
                     self.assertEqual(process["metrics"]["cpu1c"]["p95k"], 0)
-                    self.assertGreater(cells["活跃P95K KDMIPS"], 0)
+                    self.assertEqual(cells["CPU P95K KDMIPS"], 0)
+                    self.assertGreater(active["p95k"], 0)
 
     def test_real_report_nearest_rank_uses_all_observed_values(self):
         from perf_report import render_report

@@ -14,6 +14,9 @@ export interface Session {
   created: string | number
   summary: {
     source_format?: string
+    device_name?: string
+    merge_sources?: { id: string; name: string; first_ts: number | null; last_ts: number | null; segment_start: number; segment_end: number }[]
+    merge_policy?: string
     counts: Partial<Record<Kind, number>> & Record<string, number | undefined>
     errors: number
     unknown: number
@@ -27,6 +30,59 @@ export interface Session {
     files: string[]
   }
 }
+export interface SessionStorage {
+  id: string
+  database_bytes: number
+  logs_bytes: number
+  total_bytes: number
+  cache_bytes: number
+  unmanaged_logs: boolean
+  estimated: boolean
+}
+export interface StorageUsage {
+  database_bytes: number
+  wal_bytes: number
+  shm_bytes: number
+  free_bytes: number
+  reclaimable_bytes: number
+  logs_bytes: number
+  total_bytes: number
+  pending_cleanup_count: number
+  unmanaged_logs: boolean
+  warnings: string[]
+  estimate_method: string
+  sessions: SessionStorage[]
+}
+export interface StorageCleanupResult {
+  logs_freed_bytes: number
+  warnings: string[]
+}
+export interface StorageDeleteResult extends StorageCleanupResult {
+  deleted_ids: string[]
+  missing_ids: string[]
+}
+export interface StorageReclaimResult {
+  before_bytes: number
+  after_bytes: number
+  reclaimed_bytes: number
+  skipped: boolean
+}
+export type SessionDeleteResult = StorageDeleteResult & { deleted: boolean }
+
+export function formatBytes(value: number): string {
+  return value < 1024 ? `${value} B` : formatMemory(value / 1024)
+}
+
+// 本地维护可能超过普通请求的五分钟时限；由工作区统一串行及保护离页。
+export async function storageMutation<T>(path: string, signal: AbortSignal, sessionIds?: string[]): Promise<T> {
+  const response = await apiResponse(path, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirm: true, ...(sessionIds ? { session_ids: sessionIds } : {}) }),
+  }, null)
+  return response.json() as Promise<T>
+}
+
 export interface Overview extends Session {
   stats: {
     samples: number
@@ -355,7 +411,11 @@ type StreamState<T> = { key: string; data?: T; error?: string; progress?: Progre
 
 export function useAnalysisStream<T>(path: string | null, run: number,
   resolve?: (data: T, signal: AbortSignal) => T | Promise<T>, dispose?: (data: T) => void) {
-  const key = JSON.stringify([path, run])
+  const requestKey = JSON.stringify([path, run])
+  // A → B → A must not reuse a disposed preview or accept an earlier A request.
+  const [request, setRequest] = useState({ key: requestKey, generation: 0 })
+  if (request.key !== requestKey) setRequest({ key: requestKey, generation: request.generation + 1 })
+  const key = JSON.stringify([requestKey, request.generation])
   const controllerRef = useRef<AbortController | null>(null)
   const [state, setState] = useState<StreamState<T>>({ key: '', elapsed: 0 })
   const current: StreamState<T> = state.key === key ? state : { key, elapsed: 0 }

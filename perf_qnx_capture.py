@@ -103,9 +103,14 @@ class QnxCapture:
 
     def _save(self, state, deadline=None):
         folder = self._folder(state['capture_id'])
+        if not folder.is_dir():
+            raise AdbError("QNX 本地任务不存在或已删除", 404)
         self._safe(folder / 'local.tmp')
         self._safe(folder / 'local.json')
-        device.atomic_json(folder / 'local.json', state, deadline)
+        try:
+            device.atomic_json(folder / 'local.json', state, deadline)
+        except FileNotFoundError as exc:
+            raise AdbError("QNX 本地任务文件不存在或已删除", 404) from exc
 
     def _load(self, capture_id):
         folder = self._folder(capture_id)
@@ -342,28 +347,34 @@ class QnxCapture:
 
     def import_capture(self, capture_id):
         with self._guard():
-            state = self._load(capture_id)
-            if not self._view(state)['can_import']:
-                raise AdbError('无可导入的 UTC 数据；raw-only 任务仅支持原始归档下载', 409)
             if not self.import_lock.acquire(blocking=False):
                 raise AdbError('已有导入正在执行', 409)
             try:
-                folder, raw = self._upstream(state)
-                perf = self._bound_perf(folder, raw)
-                if perf is None:
-                    raise ValueError('Current generation is not importable')
-                with perf.open('rb') as stream:
-                    imported = self.store.import_files([('perf_qnx.log', stream)], state['title'],
-                                                       capture_method='QNX', device_name=state['serial'])
-                state['session_id'] = imported['id']
-                state['error'] = None
-                self._save(state)
-                return {'capture': self._view(state), 'session_id': imported['id'],
-                        'duplicate': bool(imported.get('duplicate'))}
-            except Exception as exc:
-                state['error'] = 'import_failed'
-                self._save(state)
-                raise AdbError('QNX 数据导入失败，原始文件已保留', 422) from exc
+                # Deletion and import must not race between local validation,
+                # transactional ownership registration and saving local state.
+                state = self._load(capture_id)
+                if not self._view(state)['can_import']:
+                    raise AdbError('无可导入的 UTC 数据；raw-only 任务仅支持原始归档下载', 409)
+                try:
+                    folder, raw = self._upstream(state)
+                    perf = self._bound_perf(folder, raw)
+                    if perf is None:
+                        raise ValueError('Current generation is not importable')
+                    with perf.open('rb') as stream:
+                        stream._capture_log_directory = self._folder(capture_id)
+                        imported = self.store.import_files([('perf_qnx.log', stream)], state['title'],
+                                                           capture_method='QNX', device_name=state['serial'])
+                    state['session_id'] = imported['id']
+                    state['error'] = None
+                    self._save(state)
+                    return {'capture': self._view(state), 'session_id': imported['id'],
+                            'duplicate': bool(imported.get('duplicate'))}
+                except AdbError:
+                    raise
+                except Exception as exc:
+                    state['error'] = 'import_failed'
+                    self._save(state)
+                    raise AdbError('QNX 数据导入失败；请检查本地任务文件后重试', 422) from exc
             finally:
                 self.import_lock.release()
 

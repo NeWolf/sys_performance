@@ -5,8 +5,8 @@ import { SeriesChart } from './Chart'
 
 function percent(value: number, cycles: number) { return cycles ? `${formatNumber(scaleMetric(value, 100, cycles))} %` : '—' }
 
-export function GroupResults({ id, groups, selected, onSelect, revision, disabled }: {
-  id: string; groups: ProcessGroup[]; selected: string; onSelect: (gid: string) => void; revision: number; disabled: boolean
+export function GroupResults({ id, groups, selected, onSelect, revision, disabled, sourceFormat }: {
+  sourceFormat?: string; id: string; groups: ProcessGroup[]; selected: string; onSelect: (gid: string) => void; revision: number; disabled: boolean
 }) {
   return <>
     <div className="section-heading"><h2>进程组分析</h2><span>仅分析已保存配置 · 不随排行时间段改变</span></div>
@@ -20,8 +20,8 @@ export function GroupResults({ id, groups, selected, onSelect, revision, disable
     </section>
     {selected && <div key={`${id}:${selected}`}>
       <ResourceResults id={id} gid={selected} revision={revision} disabled={disabled} />
-      <KindResults id={id} gid={selected} kind="P" revision={revision} disabled={disabled} />
-      <KindResults id={id} gid={selected} kind="DP" revision={revision} disabled={disabled} />
+      <KindResults sourceFormat={sourceFormat} id={id} gid={selected} kind="P" revision={revision} disabled={disabled} />
+      <KindResults sourceFormat={sourceFormat} id={id} gid={selected} kind="DP" revision={revision} disabled={disabled} />
     </div>}
   </>
 }
@@ -55,7 +55,7 @@ function ResourceCells({ available, s, factor }: { available: boolean; s: GroupR
   return <>{values.map((value, index) => <td key={index}>{available ? value : '—'}</td>)}</>
 }
 
-function KindResults({ id, gid, kind, revision, disabled }: { id: string; gid: string; kind: 'P' | 'DP'; revision: number; disabled: boolean }) {
+function KindResults({ id, gid, kind, revision, disabled, sourceFormat }: { sourceFormat?: string; id: string; gid: string; kind: 'P' | 'DP'; revision: number; disabled: boolean }) {
   const [retry, setRetry] = useState(0)
   const [field, setField] = useState('')
   const { data, loading, error } = useResource<GroupAnalysis>(`${groupPath(id, gid)}/analysis?kind=${kind}&limit=600`, revision + retry)
@@ -82,7 +82,7 @@ function KindResults({ id, gid, kind, revision, disabled }: { id: string; gid: s
       <label className="metric-select">全部数值指标趋势 <select disabled={disabled || !entries.length} value={selected?.[0] ?? ''} onChange={(event) => setField(event.target.value)}>
         {!entries.length && <option value="">无数值指标</option>}{entries.map(([key, item]) => <option key={key} value={key}>{item.label} · {key}</option>)}
       </select></label>
-      {selected && <SeriesChart title={`${kind} · ${selected[1].label}`} unit={selected[1].unit} metrics={[{ field: selected[0], label: selected[1].label }]} data={data.series} mode="scatter" note="趋势与统计复用同一组合响应；切换指标不重新请求。统计使用全部有效原始周期，不从采样点推算。I/O 是周期增量，不再次差分、不换算速率；缺失不补零。" />}
+      {selected && <SeriesChart sourceFormat={sourceFormat} title={`${kind} · ${selected[1].label}`} unit={selected[1].unit} metrics={[{ field: selected[0], label: selected[1].label }]} data={data.series} mode="scatter" note="趋势与统计复用同一组合响应；切换指标不重新请求。统计使用全部有效原始周期，不从采样点推算。I/O 是周期增量，不再次差分、不换算速率；缺失不补零。" />}
       <p className="muted">{data.note}</p>
     </>}
   </section>

@@ -56,7 +56,8 @@ NOTES = [
 ]
 
 
-def build_report_data(store, session_id, progress=None, cancelled=None):
+def build_report_data(store, session_id, progress=None, cancelled=None, *, dates=None):
+    from perf_report_dates import date_filter, selected_session
     report = _progress_reporter(progress, cancelled)
     report("prepare")
     try:
@@ -72,11 +73,13 @@ def build_report_data(store, session_id, progress=None, cancelled=None):
             if session["summary"].get("source_format") != "qnx":
                 raise ValueError("QNX 报告仅支持 QNX 会话")
             report("timeline")
-            db.execute("""CREATE TEMP TABLE qnx_source AS SELECT id,segment,ts,source,line,
+            predicate = date_filter(db, session_id, dates)
+            db.execute("""CREATE TEMP TABLE qnx_source AS SELECT id,segment,cycle,kind,ts,source,line,
                 json_extract(data,'$.module') module, json_extract(data,'$.metric') metric,
                 json_extract(data,'$.unit') unit, json_extract(data,'$.value') value,
                 json_extract(data,'$.qnx_relative_s') qnx_relative_s
-                FROM records WHERE session=? AND kind IN ('QC','QG','QDSP','QDDR')""", (session_id,))
+                FROM records WHERE session=? AND kind IN ('QC','QG','QDSP','QDDR')""" + predicate, (session_id,))
+            session = selected_session(db, session, "qnx_source", dates)
             db.execute("CREATE INDEX temp.qnx_time ON qnx_source(segment,module,metric,unit,id)")
             db.execute("CREATE INDEX temp.qnx_value ON qnx_source(segment,module,metric,unit,value)")
             segments = [dict(row) for row in db.execute("""SELECT segment,MIN(ts) start,MAX(ts) end,
@@ -342,7 +345,7 @@ def render_document(data, *, style="default", progress=None, cancelled=None):
     report = _progress_reporter(progress, cancelled)
     report("render")
     session = data["session"]
-    summary = session["summary"]
+    summary = session.get("import_summary", session["summary"])
     parts = ['<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
              '<meta name="viewport" content="width=device-width,initial-scale=1">',
              f'<meta http-equiv="Content-Security-Policy" content="{_esc(REPORT_CSP)}">',
@@ -351,6 +354,8 @@ def render_document(data, *, style="default", progress=None, cancelled=None):
              f'<p>{_esc(session["name"])}</p>',
              f'<p>独立序列：{len(data["series"])} · 时间分段：{len(data["segments"])} · '
              f'解析错误：{_esc(summary.get("errors", 0))}</p>', '<ul>']
+    if session.get("date_selection_note"):
+        parts.append(f'<li>{_esc(session["date_selection_note"])}</li>')
     parts.extend(f'<li>{_esc(note)}</li>' for note in data["notes"])
     parts.append('</ul>')
     if data["missing_modules"]:

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from perf_storage import StorageMixin, StorageBusy, StorageInsufficientSpace
 from perf_diagnostics import span
 from perf_parser import iter_records, rotation_key
 from perf_top_parser import detect_source_format, iter_top_records
@@ -126,9 +127,10 @@ def normalize_process_record(data):
     return data
 
 
-class Store(GroupStore):
+class Store(StorageMixin, GroupStore):
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = Path(path).absolute()
+        self._init_storage_gate()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
@@ -200,6 +202,7 @@ class Store(GroupStore):
                     total INTEGER NOT NULL
                 );
             """)
+            self._create_storage_schema(db)
             self._migrate_capture_processes(db)
             db.commit()
             self._migrate_capture_processes(
@@ -286,23 +289,27 @@ class Store(GroupStore):
 
     @contextmanager
     def connect(self, *, import_commit=False):
-        db = sqlite3.connect(str(self.path), timeout=30)
-        db.row_factory = sqlite3.Row
-        register_metric_sql(db)
-        db.execute("PRAGMA foreign_keys=ON")
-        try:
-            yield db
-            # Only the import-owned connection labels this original commit site.
-            if import_commit and db.in_transaction:
-                with span("import.commit"):
+        with self._connection_slot():
+            # Maintenance must fail fast; ordinary queries retain existing
+            # contention handling for concurrently generated caches.
+            timeout = 0 if self._storage_gate.owner is not None else 30
+            db = sqlite3.connect(str(self.path), timeout=timeout)
+            try:
+                db.row_factory = sqlite3.Row
+                register_metric_sql(db)
+                db.execute("PRAGMA foreign_keys=ON")
+                yield db
+                # Only the import-owned connection labels this original commit site.
+                if import_commit and db.in_transaction:
+                    with span("import.commit"):
+                        db.commit()
+                else:
                     db.commit()
-            else:
-                db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
 
     def sessions(self):
         with self.connect() as db:
@@ -317,8 +324,7 @@ class Store(GroupStore):
             return dict(row, summary=json.loads(row["summary"]))
 
     def delete(self, session_id):
-        with self.connect() as db:
-            return db.execute("DELETE FROM sessions WHERE id=?", (session_id,)).rowcount > 0
+        return bool(self.delete_many([session_id])["deleted_ids"])
 
     def import_files(self, sources, title="", *, capture_method="本地导入", device_name="", started_at=None,
                      naming_snapshot=None):
@@ -377,6 +383,7 @@ class Store(GroupStore):
                 existing = db.execute("SELECT id FROM sessions WHERE fingerprint=?", (signature,)).fetchone()
                 total["duplicate"] = bool(existing)
                 if existing:
+                    self._register_session_logs(db, existing["id"], self._stream_log_paths(sources))
                     return {"id": existing["id"], "duplicate": True}
                 session_id = uuid.uuid4().hex
                 summary = {"counts": {k: 0 for k in (QNX_KINDS if is_qnx else ("S", "P", "D", "DE", "DP"))},
@@ -395,6 +402,7 @@ class Store(GroupStore):
                 db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (
                     session_id, "",
                     datetime.now(timezone.utc).isoformat(), signature, "{}"))
+                self._register_session_logs(db, session_id, self._stream_log_paths(sources))
                 last_ts = None
                 boot = None
                 segment = 0
@@ -472,6 +480,102 @@ class Store(GroupStore):
                         parsing.update(records=sum(summary["counts"].values()),
                                        errors=summary["errors"], unknown=summary["unknown"], samples=cycle)
             return {"id": session_id, "duplicate": False}
+
+    def merge_sessions(self, session_ids, name=""):
+        """Copy immutable samples atomically; keep capture boundaries and log owners."""
+        if (not isinstance(session_ids, list) or not 2 <= len(session_ids) <= 1000
+                or any(not isinstance(sid, str) or not sid.strip() or len(sid) > 128 for sid in session_ids)
+                or len(set(session_ids)) != len(session_ids)):
+            raise ValueError("请选择 2 至 1000 个不同的会话")
+        if not isinstance(name, str) or len(name) > 120:
+            raise ValueError("合并会话名称最多 120 个字符")
+        with self.connect(import_commit=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            sources, origins, devices, formats = [], set(), set(), set()
+            for sid in session_ids:
+                row = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+                if row is None:
+                    raise KeyError(sid)
+                summary = json.loads(row["summary"])
+                lineage = set(summary.get("merge_origins") or [row["fingerprint"]])
+                if origins & lineage:
+                    raise ValueError("所选会话包含重复来源，请勿同时选择合并会话及其原始会话")
+                origins.update(lineage)
+                formats.add(summary.get("source_format", "sysmonitor"))
+                device = summary.get("device_name")
+                if device and device != "未知设备":
+                    devices.add(device)
+                bounds = db.execute("""SELECT MIN(ts),MAX(ts),COUNT(*),
+                    SUM(segment IS NULL OR cycle IS NULL) FROM records WHERE session=?""", (sid,)).fetchone()
+                if not bounds[2] or bounds[3]:
+                    raise ValueError("所选会话缺少有效记录或采集周期，不能合并")
+                sources.append((row, summary, bounds[0], bounds[1]))
+            if len(formats) != 1:
+                raise ValueError("不能混合 sysmonitor、Top、QNX 会话，请选择相同日志格式")
+            if len(devices) > 1:
+                raise ValueError("所选会话来自不同设备，不能合并分析")
+            sources.sort(key=lambda item: (item[2] is None, item[2] or 0, item[0]["created"], item[0]["id"]))
+            sid = uuid.uuid4().hex
+            title = safe_filename(name.strip() or "合并会话_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+            db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (
+                sid, title, datetime.now(timezone.utc).isoformat(), "merge:" + sid, "{}"))
+            summary = dict(counts={}, errors=0, unknown=0, issues=[], events=[], event_count=0,
+                           files=[], segments=0, cycles=0, orphan_cycles=0, duplicate_files=0,
+                           source_format=next(iter(formats)), capture_method="会话合并",
+                           device_name=next(iter(devices), "未知设备"), merge_origins=sorted(origins),
+                           merge_sources=[], merge_policy="保留实测值及采集分段；不插值，不合并重叠时间点")
+            for index, (source, info, first, last) in enumerate(sources):
+                source_id = source["id"]
+                prefix = source_id[:8] + "/"
+                segment_offset, cycle_offset = summary["segments"], summary["cycles"]
+                # SQL window ranks remap sparse/restarted IDs without loading samples into RAM.
+                db.execute("""INSERT INTO records
+                    (session,segment,cycle,ts,kind,pid,name,source,line,data)
+                    SELECT ?,? + DENSE_RANK() OVER (ORDER BY segment) - 1,
+                        ? + DENSE_RANK() OVER (ORDER BY segment,cycle),
+                        ts,kind,pid,name,? || COALESCE(source,''),line,data
+                    FROM records WHERE session=? ORDER BY id""",
+                           (sid, segment_offset, cycle_offset, prefix, source_id))
+                summary["segments"] += db.execute(
+                    "SELECT COUNT(DISTINCT segment) FROM records WHERE session=?", (source_id,)).fetchone()[0]
+                summary["cycles"] += db.execute("""SELECT COUNT(*) FROM
+                    (SELECT segment,cycle FROM records WHERE session=? GROUP BY segment,cycle)""",
+                    (source_id,)).fetchone()[0]
+                db.execute("""INSERT OR IGNORE INTO session_logs(session,path)
+                    SELECT ?,path FROM session_logs WHERE session=?""", (sid, source_id))
+                summary["merge_sources"].append(dict(id=source_id, name=source["name"],
+                    first_ts=first, last_ts=last, segment_start=segment_offset,
+                    segment_end=summary["segments"] - 1))
+                self._merge_summary(summary, info, prefix, index, first)
+            summary["counts"] = {row[0]: row[1] for row in db.execute(
+                "SELECT kind,COUNT(*) FROM records WHERE session=? GROUP BY kind", (sid,))}
+            summary["first_ts"], summary["last_ts"] = db.execute(
+                "SELECT MIN(ts),MAX(ts) FROM records WHERE session=?", (sid,)).fetchone()
+            db.execute("UPDATE sessions SET summary=? WHERE id=?", (json.dumps(summary, ensure_ascii=False), sid))
+        return {"id": sid, "source_count": len(sources)}
+
+    @staticmethod
+    def _merge_summary(target, source, prefix, index, first_ts):
+        for key in ("errors", "unknown", "orphan_cycles", "duplicate_files"):
+            target[key] += source.get(key, 0)
+        target["event_count"] += source.get("event_count", len(source.get("events", [])))
+        target["files"].extend(prefix + name for name in source.get("files", []))
+        if index:
+            target["event_count"] += 1
+            if len(target["events"]) < 100:
+                target["events"].append(dict(source=prefix, line=0, ts=first_ts,
+                                             message="合并会话采集边界（不推断设备重启）"))
+        for key in ("issues", "events"):
+            for item in source.get(key, []):
+                if len(target[key]) >= 100:
+                    break
+                target[key].append(dict(item, source=prefix + item.get("source", "")))
+        for key in ("timestamp_policy", "statistics_policy", "cycle_policy"):
+            if key in source:
+                target[key] = source[key]
+        for zone, count in source.get("timestamp_timezones", {}).items():
+            zones = target.setdefault("timestamp_timezones", {})
+            zones[zone] = zones.get(zone, 0) + count
 
     @staticmethod
     def _insert(db, rows):

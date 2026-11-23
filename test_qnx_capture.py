@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from perf_adb import AdbController, AdbError
 from perf_api import create_app
 from perf_qnx_capture import QnxCapture, validate_target
+from perf_store import Store
 from perf_qnx_convert import convert, has_clock_anchor
 import perf_qnx_device as device
 
@@ -143,6 +144,67 @@ class QnxTests(unittest.TestCase):
         self.assertEqual(self.store.import_files.call_args.kwargs['capture_method'], 'QNX')
         self.assertTrue(self.capture.archive_path(result['capture_id']).is_file())
         self.devices.assert_not_called()
+
+    def test_real_store_owns_complete_capture_directories_on_duplicate(self):
+        self.capture.store = Store(self.root / 'store.sqlite3')
+        self.capture.root = self.root / 'qnx_logs'
+        folders, ids = [], []
+        for _ in range(2):
+            capture_id = self.start()['capture_id']
+            with patch.object(device, 'pull', side_effect=self.pulled):
+                self.capture.pull(capture_id)
+            folder = self.capture.root / capture_id
+            self.assertTrue((folder / 'local.json').is_file())
+            self.assertTrue(self.capture.archive_path(capture_id).is_file())
+            folders.append(str(folder))
+            ids.append(self.capture.import_capture(capture_id)['session_id'])
+        self.assertEqual(ids[0], ids[1])
+        with self.capture.store.connect() as db:
+            rows = db.execute('SELECT path,kind FROM storage_assets').fetchall()
+            self.assertEqual({(r['path'], r['kind']) for r in rows},
+                             {(p, 'directory') for p in folders})
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM session_logs').fetchone()[0], 2)
+        # Emulate a deleted directory without deleting any file.
+        folder.rename(self.root / 'removed-capture')
+        for operation in (self.capture.import_capture, self.capture.status, self.capture.archive_path):
+            with self.assertRaises(AdbError) as caught:
+                operation(capture_id)
+            self.assertEqual(caught.exception.status, 404)
+            self.assertFalse(folder.exists())
+            self.assertFalse(self.import_lock.locked())
+
+    def test_import_missing_directory_does_not_save_or_recreate(self):
+        for succeeds in (False, True):
+            with self.subTest(succeeds=succeeds):
+                capture_id = self.start()['capture_id']
+                with patch.object(device, 'pull', side_effect=self.pulled):
+                    self.capture.pull(capture_id)
+                folder = self.capture.root / capture_id
+                def disappear(*args, **kwargs):
+                    folder.rename(self.root / ('removed-' + capture_id))
+                    if not succeeds:
+                        raise ValueError('parse failed')
+                    return {'id': 'b' * 32, 'duplicate': False}
+                self.store.import_files.side_effect = disappear
+                with patch.object(device, 'atomic_json', wraps=device.atomic_json) as saved:
+                    with self.assertRaises(AdbError) as caught:
+                        self.capture.import_capture(capture_id)
+                    self.assertEqual(caught.exception.status, 404)
+                    saved.assert_not_called()
+                self.assertFalse(folder.exists())
+                self.assertFalse(self.import_lock.locked())
+
+    def test_import_validation_holds_shared_lock_and_releases_on_failure(self):
+        capture_id = self.start()['capture_id']
+        original = self.capture._load
+        def load(identity):
+            self.assertTrue(self.import_lock.locked())
+            return original(identity)
+        with patch.object(self.capture, '_load', side_effect=load):
+            with self.assertRaises(AdbError) as caught:
+                self.capture.import_capture(capture_id)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertFalse(self.import_lock.locked())
 
     def test_import_lock_is_shared(self):
         result = self.start()

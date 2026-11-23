@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 
-from perf_adb import AdbError
+from perf_adb import AdbController, AdbError
 from perf_diagnostics import span, measured
 from perf_store import capture_naming, safe_filename
 from perf_top_parser import iter_top_records
@@ -21,7 +21,15 @@ MAX_ARCHIVE_BYTES = 1_000_000_000
 CHUNK_BYTES = 64 * 1024
 STOP_TIMEOUT_SECONDS = 20
 STOP_POLL_SECONDS = 0.5
-REMOTE_ROOT = "/data/local/tmp/sysmonitor_top_capture"
+REBOOT_WARNING = ("设备启动标识已变化，Top 任务已异常中断；实际结束时间和采集耗时未知。"
+                  "日志可能包含不完整尾部，拉取时原样保留，请核对分析结果。")
+RECOVERY_WARNING = ("未等待或确认采集停止，已保存读取开始时长度以内的日志副本；"
+                    "这不是最终完整日志，可能含未完成样本或并发写入变化。已有本地归档不会被覆盖。")
+CLEAR_WARNING = ("当前任务曾执行停止未确认的日志清理（也可能仅部分成功）；"
+                 "清理不代表采集已停止，仍可能继续写入。采样次数与字节数是任务记录，不代表现存日志大小；"
+                 "历史任务、任务元数据及占用标记均保留。")
+REMOTE_ROOT = "/storage/emulated/0/Download/sysmonitor_top_capture"
+LEGACY_ROOT = "/data/local/tmp/sysmonitor_top_capture"
 ID_PATTERN = r"[0-9a-f]{32}"
 SERIAL_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,199}"
 
@@ -41,6 +49,8 @@ class TopCapture:
         self._archive_names = {}
         self._device_names = {}
         self._states = {}
+        # A deployment hint only: never substitutes for execution-time guards.
+        self._deployments = set()
         self._state = self._empty()
         self.script = Path(__file__).with_name("device_top_capture.sh")
 
@@ -67,23 +77,62 @@ class TopCapture:
 
     @contextmanager
     def _device(self, serial):
-        # Root once per public operation, under the shared device lock. Internal
-        # stop polling must not restart adbd or reset its confirmation deadline.
+        # Use the current ADB shell identity; never elevate or restart adbd.
+        # Keep the shared lock and the stop-confirmation deadline unchanged.
         with self.adb.device(serial) as device:
             self._device_names[serial] = (device or {}).get("model") or serial
-            try:
-                self.adb.run("-s", serial, "root", timeout=30)
-                self.adb.run("-s", serial, "wait-for-device", timeout=30)
-                if self.adb.shell(serial, "id -u") != "0":
-                    raise AdbError("设备未取得 root 权限，可能不支持 adb root", 403)
-            except AdbError as exc:
-                raise AdbError(
-                    "Top 操作前自动获取 root 权限失败，采集状态未确认；"
-                    "未执行后续任务或日志操作：" + str(exc), exc.status,
-                ) from exc
             yield
 
+    @staticmethod
+    def _deployment_guard(digest):
+        # Error text is only interpreted for this verified Android implementation
+        # and the C locale. Other builds fail closed rather than guessing ENOENT.
+        legacy = [str(p) for p in reversed(Path(LEGACY_ROOT).parents) if str(p) != "/"]
+        legacy.append(LEGACY_ROOT)
+        parents = " ".join(shlex.quote(p) for p in legacy)
+        current = shlex.quote(LEGACY_ROOT + "/current")
+        return (
+            'export LC_ALL=C LANG=C; '
+            'fail() { echo "Top 部署安全校验失败，采集状态未确认：$*" >&2; exit 1; }; '
+            'version=$(/system/bin/toybox --version 2>&1) '
+            '&& [ "$version" = "toybox 0.8.9-android" ] || '
+            'fail "未验证的 toybox 实现"; '
+            'absent() { '
+            'entry=$(/system/bin/toybox ls -ld "$1" 2>&1); rc=$?; '
+            'if [ "$rc" = 0 ]; then '
+            '[ ! -L "$1" ] || fail "路径是软链：$1"; return 1; fi; '
+            '[ "$rc" = 1 ] && [ "$entry" = "ls: $1: No such file or directory" ] '
+            '|| fail "路径无法确认：$1 ($entry)"; return 0; }; '
+            'legacy_safe() { '
+            f'for parent in {parents}; do '
+            'if absent "$parent"; then return 0; fi; '
+            '[ -d "$parent" ] && [ -x "$parent" ] || fail "旧路径不可搜索或不是目录"; '
+            'done; '
+            f'absent {current} || fail "旧目录存在 current，请人工确认并备份；未执行旧脚本或修改旧目录"; '
+            '}; legacy_safe; '
+            'probe=$(printf abc | /system/bin/toybox sha256sum 2>/dev/null) '
+            '|| fail "SHA256 工具不可用"; '
+            '[ "$probe" = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -" ] '
+            '|| fail "SHA256 工具输出无效"; '
+            'verify_script() { '
+            '[ ! -L "$1" ] && [ -f "$1" ] && [ -r "$1" ] '
+            '|| fail "控制脚本不是可读普通文件"; '
+            'actual=$(/system/bin/toybox sha256sum < "$1" 2>/dev/null) '
+            '|| fail "控制脚本 SHA256 读取失败"; '
+            f'[ "$actual" = "{digest}  -" ] || fail "控制脚本 SHA256 不匹配，未覆盖缓存"; '
+            '}; '
+        )
+
     def _command(self, serial, action, *args, output=None, deadline=None):
+        try:
+            return self._checked_command(serial, action, *args, output=output, deadline=deadline)
+        except Exception:
+            # Never replay an action after an ambiguous transport/action failure.
+            # The next explicit request may recheck deployment from scratch.
+            self._deployments = {key for key in self._deployments if key[0] != serial}
+            raise
+
+    def _checked_command(self, serial, action, *args, output=None, deadline=None):
         def remaining(limit):
             if deadline is None:
                 return limit
@@ -94,9 +143,9 @@ class TopCapture:
 
         def shell(command):
             if deadline is None:
-                return self.adb.shell(serial, command)
-            return self.adb.run("-s", serial, "shell", "-T", "sh -c " + shlex.quote(command),
-                                timeout=remaining(10))
+                return self.adb.shell(serial, command, via_stdin=True)
+            return self.adb.run("-s", serial, "shell", "-T", "sh -s",
+                                input_data=AdbController.shell_input(command), timeout=remaining(10))
 
         # Normalize checkout/editor line endings before hashing AND uploading.
         # Android sh treats CR in CRLF as part of tokens (e.g. "077\r").
@@ -104,9 +153,18 @@ class TopCapture:
         script_bytes = self.script.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         digest = hashlib.sha256(script_bytes).hexdigest()
         remote = REMOTE_ROOT + "/control-" + digest + ".sh"
-        check = (f'[ ! -L {REMOTE_ROOT} ] && mkdir -p {REMOTE_ROOT} && '
-                 f'if [ -f {remote} ] && [ ! -L {remote} ]; then echo ready; fi')
-        if shell(check) != "ready":
+        guard = self._deployment_guard(digest)
+        root, quoted_remote = shlex.quote(REMOTE_ROOT), shlex.quote(remote)
+        directory = (f"[ ! -L {root} ] && ([ -d {root} ] || (umask 077; mkdir -p {root})) && "
+                     f"[ -d {root} ] && [ -r {root} ] && [ -w {root} ] && [ -x {root} ] "
+                     '|| fail "共享目录不可访问"; ')
+        check = (guard + directory + f"if absent {quoted_remote}; then echo missing; "
+                 f"else verify_script {quoted_remote}; echo ready; fi")
+        deployment = (serial, remote)
+        cached = "ready" if deployment in self._deployments else shell(check)
+        if cached not in {"ready", "missing"}:
+            raise AdbError("Top 部署检查响应无效，采集状态未确认", 502)
+        if cached == "missing":
             staging = remote + "." + uuid.uuid4().hex
             with tempfile.TemporaryDirectory(prefix="jdperf-top-script-") as temporary:
                 local = Path(temporary) / "control.sh"
@@ -114,30 +172,57 @@ class TopCapture:
                 # adb opens the file so Windows file sharing rules are respected.
                 local.write_bytes(script_bytes)
                 self.adb.run("-s", serial, "push", str(local), staging, timeout=remaining(30))
-            shell(f"chmod 600 {staging} && mv {staging} {remote}")
-        command = "sh " + shlex.quote(remote) + " " + " ".join(
+            quoted_staging = shlex.quote(staging)
+            # Never replace an unexpected cache entry, including one appearing
+            # during upload. Shared storage still has unavoidable TOCTOU windows.
+            shell(guard + directory + f'verify_script {quoted_staging}; '
+                  f'if absent {quoted_remote}; then '
+                  f'chmod 600 {quoted_staging} && mv -n {quoted_staging} {quoted_remote} '
+                  '|| fail "控制脚本发布失败"; '
+                  f'else verify_script {quoted_remote}; fi; '
+                  f'verify_script {quoted_remote}')
+        # Guard and hash verification run in the same shell as execution, also
+        # for streamed pull and deadline-bound stop/status commands.
+        command = guard + directory + f'verify_script {quoted_remote}; sh ' + quoted_remote + " " + " ".join(
             shlex.quote(str(value)) for value in (action, *args))
         if output is not None:
-            return self.adb.run("-s", serial, "shell", "-T", "sh -c " + shlex.quote(command),
-                                timeout=600, output=output)
-        return shell(command)
+            result = self.adb.run("-s", serial, "shell", "-T", "sh -s",
+                                  input_data=AdbController.shell_input(command),
+                                  timeout=remaining(600 if deadline is None else 10), output=output)
+        else:
+            result = shell(command)
+        self._deployments.add(deployment)
+        return result
 
     def _decode(self, serial, raw):
         if raw == "idle":
             return dict(self._empty(serial), connected=True)
         fields = raw.splitlines()
+        control_busy = bool(fields and fields[-1] == "control_busy")
+        if control_busy:
+            fields.pop()
+        busy_error = ("已读取设备状态快照，但设备控制锁仍被占用或因中断残留；"
+                      "不能据此确认控制操作已结束。未自动移除锁、停止采集或清理日志；"
+                      "若持续出现，需核查锁的持有者，不能直接删锁。")
+        clear_unconfirmed = bool(fields and fields[-1] == "clear_unconfirmed")
+        if clear_unconfirmed:
+            fields.pop()
         if fields and fields[0] == "corrupt":
             if (len(fields) != 4 or not re.fullmatch(ID_PATTERN, fields[1])
                     or fields[2] not in {"inactive", "unconfirmed"}
                     or fields[3] not in {"present", "cleaned"}):
                 raise AdbError("设备 Top 损坏状态协议无效，未执行任务操作", 502)
-            inactive = fields[2] == "inactive"
+            inactive = fields[2] == "inactive" and not control_busy
             return dict(self._empty(serial), id=fields[1], status="corrupt",
                         state_corrupt=True, running=not inactive, connected=inactive,
                         count=None, target_count=None, interval=None, bytes=None,
                         error="state_corrupt", remote_cleaned=fields[3] == "cleaned",
-                        connection_error=None if inactive else
-                        "采集锁占用或无法确认；禁止新采集，可重试停止或清理。未确认停止不会清理日志。")
+                        warning=CLEAR_WARNING if clear_unconfirmed else None,
+                        connection_error=busy_error if control_busy else (None if inactive else
+                        "采集进程仍在运行或身份无法确认；禁止新采集，可重试停止。未确认停止不会清理日志。"))
+        rebooted = bool(fields and fields[-1] == "rebooted")
+        if rebooted:
+            fields.pop()
         unconfirmed = bool(fields and fields[-1] == "unconfirmed")
         if unconfirmed:
             fields.pop()
@@ -188,12 +273,20 @@ class TopCapture:
                 raise ValueError()
         except (ValueError, AdbError) as exc:
             raise AdbError("设备 Top 状态无效，未执行任务操作", 502) from exc
+        if rebooted:
+            if status not in {"starting", "running"} or unconfirmed or ended_at is not None:
+                raise AdbError("设备 Top 重启状态协议无效，未执行任务操作", 502)
+            status, error = "error", "device_rebooted"
+            ended_at = elapsed_seconds = None
         return dict(self._empty(serial), id=identity, status=status,
-                    running=unconfirmed or status in {"starting", "running"}, count=count,
+                    warning=self._merge_warnings(REBOOT_WARNING if rebooted else None,
+                                              CLEAR_WARNING if clear_unconfirmed else None),
+                    running=control_busy or unconfirmed or status in {"starting", "running"}, count=count,
                     target_count=target, interval=interval, bytes=size, title=title,
-                    connected=not unconfirmed, error=None if error == "none" else error,
-                    connection_error=("无法确认旧任务已停止；请重试停止或查询状态，未拉取日志。"
-                                      if unconfirmed else None),
+                    connected=not (control_busy or unconfirmed), error=None if error == "none" else error,
+                    connection_error=busy_error if control_busy else (
+                        "无法确认采集任务已停止；请重试停止或查询状态，未拉取日志。"
+                        if unconfirmed else None),
                     started_at=started_at, ended_at=ended_at, elapsed_seconds=elapsed_seconds,
                     remote_cleaned=remote_cleaned,
                     remote_path=None if remote_cleaned else f"{REMOTE_ROOT}/{identity}/{archive_name}")
@@ -229,6 +322,11 @@ class TopCapture:
             f"拉取前={before} 字节，拉取后={after} 字节。"
             "本地归档已保留，可继续分析或下载；数据可能不完整，请留意分析结果。")
 
+    @staticmethod
+    def _merge_warnings(*warnings):
+        return "\n".join(dict.fromkeys(line for warning in warnings if warning
+                                      for line in warning.splitlines())) or None
+
     def _saved_warning(self, path, size):
         marker = path.with_suffix(".warning.json")
         if marker.is_symlink() or not marker.is_file():
@@ -236,11 +334,20 @@ class TopCapture:
         try:
             with marker.open("rb") as stream:
                 data = json.loads(stream.read(1024))
-            if (not isinstance(data, dict) or set(data) != {"size", "before", "after"}
-                    or any(type(value) is not int or not 0 <= value <= MAX_ARCHIVE_BYTES
-                           for value in data.values()) or data["size"] != size):
+            if (not isinstance(data, dict)
+                    or not {"size", "before", "after"} <= set(data)
+                    or not set(data) <= {"size", "before", "after", "reason", "recovery", "cleared"}
+                    or any(key in data and data[key] is not True for key in ("recovery", "cleared"))
+                    or ("reason" in data and data["reason"] != "device_rebooted")
+                    or any(type(data[key]) is not int or not 0 <= data[key] <= MAX_ARCHIVE_BYTES
+                           for key in ("size", "before", "after")) or data["size"] != size):
                 return None
-            return self._size_warning(size, data["before"], data["after"])
+            mismatch = size != data["before"] or size != data["after"]
+            return self._merge_warnings(
+                REBOOT_WARNING if data.get("reason") == "device_rebooted" else None,
+                RECOVERY_WARNING if data.get("recovery") else None,
+                CLEAR_WARNING if data.get("cleared") else None,
+                self._size_warning(size, data["before"], data["after"]) if mismatch else None)
         except (OSError, ValueError):
             return None
 
@@ -248,16 +355,19 @@ class TopCapture:
         state = self._decode(serial, self._command(serial, "status", deadline=deadline))
         old = self._states.get(serial, {})
         if old.get("id") == state["id"] and state["id"]:
-            for key in ("archive", "session_id", "duplicate", "importing", "warning"):
+            for key in ("archive", "session_id", "duplicate", "importing"):
                 state[key] = old[key]
+            state["warning"] = self._merge_warnings(state["warning"], old["warning"])
             if old["status"] in {"imported", "importing"}:
                 state["status"] = old["status"]
         if state["id"]:
             path = self._local_path(state)
-            if not state["running"] and path.is_file() and not path.is_symlink():
+            if path.is_file() and not path.is_symlink():
                 size = path.stat().st_size
                 saved_warning = self._saved_warning(path, size)
                 if (0 < size <= MAX_ARCHIVE_BYTES
+                        and (not state["running"] or state["state_corrupt"]
+                             or RECOVERY_WARNING in (saved_warning or "") or state["id"] in self._archives)
                         and (size == state["bytes"] or saved_warning or state["state_corrupt"]
                              or state["id"] in self._archives)):
                     if (path.parent.is_symlink() or path.resolve().parent not in
@@ -266,11 +376,13 @@ class TopCapture:
                     self._archive_naming(path, state)
                     self._archives[state["id"]] = path
                     state["archive"] = "/api/top/archive?capture_id=" + state["id"]
-                    state["warning"] = state["warning"] or saved_warning
-                    if state["state_corrupt"] and not state["warning"]:
-                        state["warning"] = "设备状态损坏，无法核对日志完整性；已有本地归档已保留，可下载或导入分析。"
-                    elif size != state["bytes"] and not state["warning"]:
-                        state["warning"] = (
+                    state["warning"] = self._merge_warnings(state["warning"], saved_warning)
+                    if state["state_corrupt"]:
+                        state["warning"] = self._merge_warnings(
+                            state["warning"],
+                            "设备状态损坏，无法核对日志完整性；已有本地归档已保留，可下载或导入分析。")
+                    elif size != state["bytes"] and "Top 归档字节数不一致：" not in (state["warning"] or ""):
+                        state["warning"] = self._merge_warnings(state["warning"],
                             f"Top 归档字节数不一致：本地实际={size} 字节，"
                             f"设备记录={state['bytes']} 字节。"
                             "本地归档已保留，可继续分析或下载；数据可能不完整，请留意分析结果。")
@@ -338,8 +450,8 @@ class TopCapture:
         return state
 
     @measured("top.stop")
-    def _stop_confirmed(self, serial, capture_id):
-        # Send the marker before status: a legacy recovery scan may itself fail.
+    def _stop_confirmed(self, serial, capture_id, *, reject_corrupt=False):
+        # Request stop before status; a damaged status must not hide stop retry.
         # The device validates identity; never signal a guessed process/PID.
         cached = self._states.get(serial)
         if cached and cached.get("id") and cached["id"] != capture_id:
@@ -351,6 +463,8 @@ class TopCapture:
                 state = self._query(serial, deadline=deadline)
                 if state["id"] != capture_id:
                     raise AdbError("Top 任务已切换，请刷新状态后重试", 409)
+                if reject_corrupt and state["state_corrupt"]:
+                    raise AdbError("Top 状态损坏，无法确认停止；禁止拉取设备日志。本地归档不受影响。", 409)
                 if not state["running"]:
                     return state
                 remaining = deadline - time.monotonic()
@@ -374,29 +488,39 @@ class TopCapture:
             with self._device(serial):
                 return self._stop_confirmed(serial, capture_id)
 
-    def clear(self, serial, capture_id):
+    def clear(self, serial, capture_id, *, allow_unconfirmed=False):
+        if type(allow_unconfirmed) is not bool:
+            raise ValueError("恢复操作必须显式传入布尔确认参数")
         self._serial(serial)
         self._identity(capture_id)
         with self._lock:
             self._available()
             with self._device(serial):
-                self._stop_confirmed(serial, capture_id)
-                self._command(serial, "clear", capture_id)
-                return self._query(serial)
+                if allow_unconfirmed:
+                    state = self._current(serial, capture_id)
+                    if state["state_corrupt"]:
+                        raise AdbError("Top 状态损坏，拒绝自动清理；请保留数据人工检查", 409)
+                else:
+                    self._stop_confirmed(serial, capture_id)
+                self._command(serial, "clear-live" if allow_unconfirmed else "clear", capture_id)
+                return self._current(serial, capture_id)
 
     @measured("top.pull")
-    def pull(self, serial, capture_id):
+    def pull(self, serial, capture_id, *, allow_unconfirmed=False):
+        if type(allow_unconfirmed) is not bool:
+            raise ValueError("恢复操作必须显式传入布尔确认参数")
         self._serial(serial)
         self._identity(capture_id)
         with self._lock:
             self._available()
             with self._device(serial):
-                state = self._stop_confirmed(serial, capture_id)
+                state = (self._current(serial, capture_id) if allow_unconfirmed else
+                         self._stop_confirmed(serial, capture_id, reject_corrupt=True))
                 if state["remote_cleaned"]:
                     raise AdbError("设备 Top 日志已清理，本地已拉取的归档不受影响", 409)
                 if state.get("state_corrupt"):
-                    raise AdbError("Top 状态损坏，无法确认完整样本；请安全清理后重新采集。本地归档不受影响。", 409)
-                if state["bytes"] == 0:
+                    raise AdbError("Top 状态损坏，无法确认完整样本；请保留设备数据人工检查，不自动清理或恢复。本地归档不受影响。", 409)
+                if not allow_unconfirmed and state["bytes"] == 0 and state["error"] != "device_rebooted":
                     raise AdbError("设备没有完整的 Top 样本", 404)
                 self.archive_root.mkdir(parents=True, exist_ok=True)
                 path = self._local_path(state)
@@ -409,7 +533,8 @@ class TopCapture:
                 # Anonymous staging is never exposed through the archive API.
                 with tempfile.TemporaryFile(dir=self.archive_root) as staging:
                     with span("top.transfer", files=0, bytes=0) as transfer:
-                        self._command(serial, "pull", capture_id, output=staging)
+                        self._command(serial, "pull-live" if allow_unconfirmed else "pull",
+                                      capture_id, output=staging)
                         # A child's writes need not advance the parent's stream position.
                         # Measure bytes on disk, including any buffered test/wrapper writes.
                         staging.flush()
@@ -418,7 +543,7 @@ class TopCapture:
                         if size > MAX_ARCHIVE_BYTES:
                             raise AdbError("Top 原始归档超过 1GB（1000000000 字节）", 413)
                         after = self._current(serial, capture_id)
-                        if after["running"] or after["remote_cleaned"]:
+                        if (after["running"] and not allow_unconfirmed) or after["remote_cleaned"] or after["state_corrupt"]:
                             # Only validated protocol fields and the on-disk size: never
                             # expose archive contents, host paths or command output.
                             raise AdbError(
@@ -431,9 +556,20 @@ class TopCapture:
                                 "请保留设备日志，并反馈此完整错误信息。", 502)
                         if size == 0:
                             raise AdbError("拉取到的 Top 日志为空，未发布本地文件，请重试拉取", 502)
-                        warning = None
+                        rebooted = any(s["error"] == "device_rebooted" for s in (state, after))
+                        diagnostics = {"size": size, "before": state["bytes"], "after": after["bytes"]}
+                        warning = REBOOT_WARNING if rebooted else None
+                        if rebooted:
+                            diagnostics["reason"] = "device_rebooted"
+                        if allow_unconfirmed:
+                            diagnostics["recovery"] = True
+                            warning = self._merge_warnings(warning, RECOVERY_WARNING)
+                        if any(CLEAR_WARNING in (s["warning"] or "") for s in (state, after)):
+                            diagnostics["cleared"] = True
+                            warning = self._merge_warnings(warning, CLEAR_WARNING)
                         if size != state["bytes"] or size != after["bytes"]:
-                            warning = self._size_warning(size, state["bytes"], after["bytes"])
+                            warning = self._merge_warnings(
+                                warning, self._size_warning(size, state["bytes"], after["bytes"]))
                     with span("top.archive", files=1, bytes=size):
                         os.fsync(staging.fileno())
                         staging.seek(0)
@@ -459,8 +595,7 @@ class TopCapture:
                                 else:
                                     with marker.open("x", encoding="utf-8") as metadata:
                                         marker_created = True
-                                        json.dump({"size": size, "before": state["bytes"],
-                                                   "after": after["bytes"]}, metadata)
+                                        json.dump(diagnostics, metadata)
                                         metadata.flush()
                                         os.fsync(metadata.fileno())
                             try:
@@ -477,7 +612,7 @@ class TopCapture:
                 self._archives[capture_id] = path
                 self._archive_naming(path, state)
                 self._state["archive"] = "/api/top/archive?capture_id=" + capture_id
-                self._state["warning"] = warning
+                self._state["warning"] = self._merge_warnings(self._state["warning"], warning)
                 return dict(self._state)
 
     def close(self):
@@ -569,7 +704,8 @@ class TopCapture:
         capture_id = self._state["id"] if capture_id is None else capture_id
         if capture_id is not None:
             self._identity(capture_id)
-        if capture_id == self._state["id"] and self._state["running"]:
+        if (capture_id == self._state["id"] and self._state["running"]
+                and capture_id not in self._archives):
             raise AdbError("Top 采集尚未结束，请停止后拉取", 409)
         path = self._archives.get(capture_id)
         if (path is None or path.is_symlink() or not path.is_file()
@@ -583,21 +719,37 @@ class TopCapture:
     def import_capture(self, capture_id=None):
         with self._lock:
             self._available()
-            if self._busy():
-                raise AdbError("Top 任务运行、停止或导入中，请稍后重试", 409)
+            if self._state["running"] and self._state["id"] not in self._archives:
+                raise AdbError("Top 任务运行或停止未确认，且没有可用本地归档", 409)
             if capture_id is not None and capture_id != self._state["id"]:
                 raise AdbError("Top 任务已切换，请刷新状态后重试", 409)
-            path = self._archive_path_locked(capture_id)
-            if self._state["session_id"] is not None:
-                return {"id": self._state["session_id"], "duplicate": True}
-            naming = self._archive_naming(path, self._state)
             if not self.import_lock.acquire(blocking=False):
                 raise AdbError("已有导入正在进行，请稍后重试", 409)
+            try:
+                # Deletion shares this lock: validate both archive and cached
+                # session before trusting a previous import result.
+                path = self._archive_path_locked(capture_id)
+                session_id = self._state["session_id"]
+                if session_id is not None:
+                    try:
+                        self.store.session(session_id)
+                    except KeyError:
+                        self._state.update(session_id=None, duplicate=False)
+                        session_id = None
+                naming = self._archive_naming(path, self._state)
+            except BaseException:
+                self.import_lock.release()
+                raise
+            if session_id is not None:
+                self.import_lock.release()
+                return {"id": session_id, "duplicate": True}
             serial = self._state["serial"]
             self._import_done.clear()
             self._state.update(importing=True, status="importing", error=self._capture_error)
         try:
             with path.open("rb") as stream:
+                if path.parent == self.archive_root / self._state["id"]:
+                    stream._capture_log_directory = path.parent
                 # Legacy source labels retain their historical mtime-based name;
                 # display/download names always come from the immutable snapshot.
                 source_name = (path.name if re.fullmatch(r"Top[0-9]{14}\.txt", path.name)

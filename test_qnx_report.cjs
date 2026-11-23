@@ -148,3 +148,92 @@ for (const options of [option, extremeOption]) {
   } finally { real.dispose(); }
 }
 console.log('QNX chart offline checks passed: data gaps, time, tooltip, zoom, lifecycle, fallback, ECharts SSR');
+
+// Shared standard/compact report regressions; keep cycle identity even within one second.
+{
+  class ReportNode {
+    constructor() { this.children=[]; this.style={}; this.dataset={}; }
+    append(...nodes) { this.children.push(...nodes); }
+    querySelector() { return this.children[0]; }
+    querySelectorAll() { return []; }
+    getClientRects() { return []; }
+  }
+  const payload = {session:{summary:{source_format:'top'}},processes:[],
+    full_cycle_schema:[],cycle_axis_schema:[]};
+  const context = {window:{},document:{
+    getElementById:() => ({textContent:JSON.stringify(payload)}),
+    createElement:() => new ReportNode(),documentElement:{classList:{add(){}}}}};
+  let source = fs.readFileSync(require.resolve('./report_assets/report.js'),'utf8');
+  source = source.slice(0,source.indexOf('  function setupFocusTable'));
+  vm.runInNewContext(source + '\nwindow.api = {data,valid,fmt,scaleMetric,metric,exactStats,processLabel,el,draw,instances,lineSeries,fullTimeLabel,timeLabel,overlayStream,overlayTooltip};})();',context);
+  const api = context.window.api, node = new ReportNode();
+  const ts = new Date(2026,10,18,12,34,56,123).getTime();
+  const points = [41,42,43].map((cycle,i) => ({segment:0,cycle,ts:ts+i*100,cpu1c:i,pids:[1]}));
+  const series = api.lineSeries(points,'cpu1c','CPU','red');
+  const snapshot = JSON.stringify(series);
+  api.draw(node,{series});
+  const opt = api.instances.get(node).option;
+  assert.equal(JSON.stringify(series),snapshot);
+  assert.equal(series.flatMap(s=>s.data).length,3);
+  assert.equal(opt.xAxis.type,'value');
+  assert.match(opt.xAxis.name,/真实时间.*周期等距/);
+  for (const cycle of [41,42,43]) {
+    assert.equal(opt.xAxis.axisLabel.formatter(cycle),'12:34:56');
+    assert.equal(opt.dataZoom.find(z => z.type === 'slider').labelFormatter(cycle),'12:34:56');
+    assert.equal(opt.xAxis.axisPointer.label.formatter({value:cycle}),'2026-11-18 12:34:56 · 周期 '+cycle);
+  }
+  for (const cycle of [40,41.5,44]) assert.equal(opt.xAxis.axisLabel.formatter(cycle),'');
+  assert.equal(opt.dataZoom.length,1);
+  assert.equal(opt.dataZoom[0].type,'slider');
+  assert.equal(opt.dataZoom[0].filterMode,'none');
+  const tip = opt.tooltip.formatter([{axisValue:42,seriesName:'CPU',data:[41,999,0]}]);
+  assert.match(tip,/CPU：1.00/);
+  assert.match(tip,/2026-11-18 12:34:56/);
+  assert(!tip.includes('.223'));
+  const overlay = api.overlayTooltip([{name:'CPU',field:'cpu1c',divisor:1,
+    stream:api.overlayStream(points,['cpu1c'])}],'%',node);
+  const shown = overlay.formatter([{axisValue:42}]);
+  assert.equal(shown.children[0].textContent,'2026-11-18 12:34:56 · 周期 42');
+  assert.equal(shown.children[1].children[0].children[2].textContent,'1.00 %');
+  api.draw(node,{series:[{name:'a',data:[[41,1,ts]]},{name:'b',data:[[41,2,ts+100]]}]});
+  assert.equal(api.instances.get(node).option.xAxis.axisLabel.formatter(41),'');
+  assert.match(api.instances.get(node).option.xAxis.axisPointer.label.formatter({value:41}),/不唯一/);
+  api.draw(node,{series:[],xAxis:{type:'category',data:['a']},dataZoom:[]});
+  assert.equal(api.instances.get(node).option.xAxis.type,'category');
+  assert.equal(api.instances.get(node).option.tooltip.formatter,undefined);
+  let compact = fs.readFileSync(require.resolve('./report_assets/report_compact.js'),'utf8');
+  compact = compact.slice(0,compact.indexOf("  plot('system-cpu'"));
+  vm.runInNewContext(compact+'\nreturn {curves,sampleTooltip}; };',context);
+  const process = {id:'proc',segment:0,chart_samples:points.map(p=>[p.cycle,p.ts,p.cpu1c,1024,p.pids])};
+  const system = {id:'sys',segment:0,metrics:{},chart_samples:[[41,ts,10,1]]};
+  api.data.processes = [process];
+  const c = context.window.setupCompactReport(system,api);
+  assert.equal(JSON.stringify(c.curves(process,'cpu1c','CPU','red').flatMap(s=>s.data)),
+    JSON.stringify(series.flatMap(s=>s.data)));
+  const ct = c.sampleTooltip([{item:process,name:'CPU',color:'red'}],2,'%',node);
+  assert.equal(ct.formatter([{axisValue:42}]).children[0].textContent,shown.children[0].textContent);
+  assert.equal(ct.formatter([{axisValue:42}]).children[1].children[0].children[2].textContent,'1.00 %');
+  assert.equal(ct.formatter([{axisValue:40}]).children[1].children.length,0);
+  const duplicate = {...process,chart_samples:[process.chart_samples[0],process.chart_samples[0]]};
+  api.data.processes = [duplicate];
+  const d = context.window.setupCompactReport(system,api);
+  assert.equal(d.sampleTooltip([{item:duplicate,name:'CPU'}],2,'%',node)
+    .formatter([{axisValue:41}]).children[1].children.length,0);
+  // Verify the real bundled chart retains points and slider zoom, not only mocked options.
+  const real = echarts.init(null,null,{renderer:'svg',ssr:true,width:1000,height:360});
+  try {
+    real.setOption(opt);
+    assert(real.renderToSVGString().includes('12:34:56'));
+    assert.equal(real.getModel().getSeriesByIndex(0).getData().count(),3);
+    real.dispatchAction({type:'dataZoom',start:20,end:80});
+    assert.equal(real.getOption().dataZoom.find(z => z.type === 'slider').start,20);
+    assert.equal(real.getOption().dataZoom.some(z => z.type === 'inside'),false);
+  } finally { real.dispose(); }
+  for (const [file,cls] of [['report.css','overlay'],['report_compact.css','compact']]) {
+    const css = fs.readFileSync(require.resolve('./report_assets/'+file),'utf8');
+    const rule = css.match(new RegExp('\\.'+cls+'-tooltip-list\\{([^}]+)\\}'))[1];
+    assert(rule.includes('overflow:auto'));
+    assert(rule.includes('overscroll-behavior:auto'));
+  }
+  console.log('Standard/compact checks passed: real-second labels, exact cycles, tooltips, wheel policy, slider, ECharts SSR');
+}

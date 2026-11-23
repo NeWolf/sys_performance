@@ -1,6 +1,13 @@
 'use strict';
 window.setupCompactReport = function(system, shared) {
   const {data, valid, fmt, scaleMetric, metric, exactStats, processLabel, el, draw, setupTable} = shared;
+  const topCycles = data.session?.summary?.source_format === 'top';
+  const fullTimeLabel = shared.fullTimeLabel || (value => {
+    const date = new Date(value);
+    if (!valid(value) || !Number.isFinite(date.getTime())) return '—';
+    const pad = n => String(n).padStart(2,'0');
+    return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  });
   // Use the report's exact decimal helpers; a floating-point fallback changes results.
   if (![scaleMetric,metric,exactStats,processLabel].every(fn => typeof fn === 'function')) {
     throw new Error('简洁报告需要共享的真实十进制计算、统计及PID helpers');
@@ -18,10 +25,12 @@ window.setupCompactReport = function(system, shared) {
       yAxis:{type:'value',name:unit,min:0,axisLabel:{formatter:fmt,color:'#576a87'},splitLine:{lineStyle:{color:'#e6eaf0'}}},
       title:series.length ? undefined : {text:'暂无有效数据',left:'center',top:'center',textStyle:{color:'#65748a',fontSize:14}}});
   }
-  const sampleIndex = new Map();
+  const sampleIndex = new Map(), cycleIndex = new Map();
   for (const item of [system,...processes]) {
-    const times = new Map();
+    const times = new Map(), byCycle = new Map();
+    cycleIndex.set(item.id,byCycle);
     for (const row of item.chart_samples) {
+      if (Number.isInteger(row[0])) byCycle.set(row[0],byCycle.has(row[0]) ? null : row);
       if (!valid(row[1])) continue;
       if (!times.has(row[1])) times.set(row[1],new Map());
       const cycles = times.get(row[1]);
@@ -44,26 +53,33 @@ window.setupCompactReport = function(system, shared) {
         return [Math.max(gap,Math.min(x,width - size.contentSize[0] - gap))-bounds.left,y-bounds.top];
       },
       formatter(params) {
-        const ts = Number(params[0]?.axisValue);
-        if (!valid(ts)) return '';
+        const axis = Number(params[0]?.axisValue);
+        if (!valid(axis)) return '';
+        const times = new Set(topCycles ? entries.map(e =>cycleIndex.get(e.item.id).get(axis)?.[1]).filter(valid) : []);
+        const ts = topCycles ? (times.size === 1 ? [...times][0] : null) : axis;
         const cycles = new Set();
         for (const item of cycleItems) {
           sampleIndex.get(item.id).get(ts)?.forEach((_,cycle) => cycles.add(cycle));
         }
-        const cycle = cycles.size === 1 ? [...cycles][0] : null;
+        const cycle = topCycles ? axis : cycles.size === 1 ? [...cycles][0] : null;
         const box = el('div',null,'compact-tooltip');
-        box.append(el('strong',new Date(ts).toLocaleString()+'.'+String(new Date(ts).getMilliseconds()).padStart(3,'0')+
-          ' · 周期 '+(cycle ?? '不明确'),'compact-tooltip-heading'));
+        box.append(el('strong',(valid(ts) ? fullTimeLabel(ts) : '原始时间不唯一或缺失')+
+          (cycle == null ? '' : ' · 周期 '+cycle),'compact-tooltip-heading'));
         const list = el('div',null,'compact-tooltip-list');
-        for (const entry of entries) {
-          const row = cycle === null ? null : sampleIndex.get(entry.item.id).get(ts)?.get(cycle);
-          const value = row && valid(row[column]) ? scaleMetric(row[column],1,entry.divisor || 1) : null;
+        const visible = entries.map((entry,n) => {
+          const ownCycles = sampleIndex.get(entry.item.id).get(ts);
+          const row = topCycles ? cycleIndex.get(entry.item.id).get(axis)
+            : ownCycles?.size === 1 ? [...ownCycles.values()][0] : null;
+          return {entry,n,row,value:row && valid(row[column]) && (!topCycles || valid(row[1]))
+            ? scaleMetric(row[column],1,entry.divisor || 1) : null};
+        }).filter(item => valid(item.value)).sort((a,b) => b.value-a.value || a.n-b.n);
+        for (const {entry,value,row} of visible) {
           const line = el('div',null,'compact-tooltip-row'+(entry.item.id === system.id ? ' is-reference' : ''));
           const dot = el('i',null,'compact-tooltip-dot');
           dot.style.backgroundColor = entry.color;
           line.append(dot,el('span',entry.name,'compact-tooltip-name'),
-            el('b',valid(value) ? fmt(value)+' '+unit : '缺失或冲突',
-              'compact-tooltip-value'+(valid(value) ? '' : ' is-missing')));
+            el('b',fmt(value)+' '+unit,'compact-tooltip-value'));
+          if (topCycles && times.size !== 1) line.append(el('span','原始时间 ' + fullTimeLabel(row[1])));
           list.append(line);
         }
         box.append(list);
@@ -81,13 +97,22 @@ window.setupCompactReport = function(system, shared) {
     const series = [];
     let previous = null, group = null;
     for (const row of item.chart_samples) {
-      if (!valid(row[1]) || !valid(row[column])) { previous = null; group = null; continue; }
-      if (!previous || row[0] !== previous[0]+1 || row[1] <= previous[1]) {
+      if (!valid(row[1]) || !valid(row[column]) || (topCycles && !Number.isInteger(row[0]))) {
+        previous = null; group = null; continue;
+      }
+      const pidBoundary = topCycles && item !== system && (!Array.isArray(row[4]) ||
+        !Array.isArray(previous?.[4]) || !row[4].length || !previous[4].length ||
+        row[4].some(pid => pid == null) || previous[4].some(pid => pid == null) ||
+        JSON.stringify([...row[4]].sort()) !== JSON.stringify([...previous[4]].sort()));
+      const duplicateBoundary = topCycles && (cycleIndex.get(item.id).get(row[0]) === null ||
+        (previous && cycleIndex.get(item.id).get(previous[0]) === null));
+      if (!previous || row[0] !== previous[0]+1 || (topCycles ? row[1] < previous[1] : row[1] <= previous[1]) || pidBoundary || duplicateBoundary) {
         group = {name,type:'line',data:[],showSymbol:true,symbolSize:3,connectNulls:false,
           lineStyle:{width:1,color},itemStyle:{color},emphasis:{focus:'series'},animation:false};
         series.push(group);
       }
-      group.data.push([row[1],scaleMetric(row[column],1,divisor),row[0]]);
+      group.data.push(topCycles ? [row[0],scaleMetric(row[column],1,divisor),row[1]]
+        : [row[1],scaleMetric(row[column],1,divisor),row[0]]);
       previous = row;
     }
     if (references && series.length) {
@@ -121,14 +146,15 @@ window.setupCompactReport = function(system, shared) {
     const count = el('span',null,'legend-count'), list = el('div',null,'legend-list');
     const boxes = [];
     function refresh() {
+      selected.add(system.id);
       boxes.forEach(({box,entry}) => { box.checked = selected.has(entry.item.id); });
       count.textContent = '已选 '+selected.size+' / '+entries.length+' 条';
       plot(role,entries.filter(e => selected.has(e.item.id)).flatMap(e =>
         curves(e.item,e.field,e.name,e.color,e.divisor)),unit,
-        role === 'combined-cpu' ? cpuTooltip(eligible,node(role),entries) :
+        role === 'combined-cpu' ? cpuTooltip(eligible,node(role),entries.filter(e => selected.has(e.item.id))) :
           sampleTooltip(entries.filter(e => selected.has(e.item.id)),3,'MB',node(role)));
     }
-    [['全显',entries.length],['全隐',0],['仅前 15 + 整机',16]].forEach(([label,size]) => {
+    [['全显',entries.length],['仅整机',1],['仅前 15 + 整机',16]].forEach(([label,size]) => {
       const button = el('button',label); button.type = 'button';
       button.addEventListener('click',() => {
         selected.clear(); entries.slice(0,size).forEach(e => selected.add(e.item.id)); refresh();
@@ -137,7 +163,7 @@ window.setupCompactReport = function(system, shared) {
     });
     for (const entry of entries) {
       const label = el('label'), box = el('input'), text = el('span',entry.name);
-      box.type = 'checkbox'; text.style.color = entry.color;
+      box.type = 'checkbox'; box.disabled = entry.item.id === system.id; text.style.color = entry.color;
       box.addEventListener('change',() => {
         if (box.checked) selected.add(entry.item.id); else selected.delete(entry.item.id);
         refresh();

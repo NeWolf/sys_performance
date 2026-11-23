@@ -36,6 +36,7 @@
     return holder.data;
   }
   const data = readReportData();
+  const topCycles = data.session?.summary?.source_format === 'top';
   document.documentElement.classList.add('js-enabled');
   const valid = v => typeof v === 'number' && Number.isFinite(v);
   // Decimal fractions avoid binary floating-point ties, including negative HALF_UP.
@@ -85,15 +86,15 @@
     if (pids.length <= 3) return pids.join(', ') || '—';
     return 'PID变化' + (Number.isInteger(p.pid_changes) ? p.pid_changes : '未知') + '次';
   }
-  const processLabel = p => p.name + ' · ' + (new Set(p.pids || []).size > 3 ? '' : 'PID ') + pidLabel(p);
-  function metric(p, field, key, active=false) {
-    const source = active ? p.active : p;
-    return roundMetric((field === 'rss_kb' || field === 'rss_mb' ? source?.display_metrics?.rss_mb : source?.metrics?.[field])?.[key]);
+  const processLabel = p => p.memberIds ? p.name : p.name + ' · ' + (new Set(p.pids || []).size > 3 ? '' : 'PID ') + pidLabel(p);
+  function metric(p, field, key) {
+    return roundMetric((field === 'rss_kb' || field === 'rss_mb' ? p?.display_metrics?.rss_mb : p?.metrics?.[field])?.[key]);
   }
   const fields = data.process_fields;
   const index = Object.fromEntries(data.full_cycle_schema.map((f, i) => [f, i]));
   const axisIndex = Object.fromEntries(data.cycle_axis_schema.map((f, i) => [f, i]));
   const io = ['rd_kb', 'wr_kb', 'rchar_kb', 'wchar_kb'];
+  const ioColors = ['#ff6b6b','#fbbf24','#34d399','#38bdf8'];
   const labels = {cpu1c:'CPU', cpu_total:'CPU 总占用', cpu_idle:'空闲', cpu_user:'用户态占用', cpu_sys:'内核态占用', cpu_irq:'irq+softirq 占用', cpu_iow:'iowait 占用', rss_kb:'内存', rd_kb:'物理读', wr_kb:'物理写', rchar_kb:'逻辑读', wchar_kb:'逻辑写', mem_used_mb:'已使用内存', mem_free_mb:'空闲内存', mem_avail_mb:'空闲内存', mem_total_mb:'总内存', mem_percent:'内存使用率'};
   const fullTimeLabel = value => {
     const date = new Date(value);
@@ -118,11 +119,26 @@
   }
   function markRuns(points, fs) {
     const runs = Object.fromEntries(fs.map(f => [f, 0]));
+    const seen = new Set(), duplicates = new Set();
+    if (topCycles) for (const p of points) {
+      const key = JSON.stringify([p.segment,p.cycle]);
+      if (seen.has(key)) duplicates.add(key);
+      seen.add(key);
+    }
     let prev = null;
     for (const p of points) {
+      if (topCycles) p._cycleConflict = duplicates.has(JSON.stringify([p.segment,p.cycle]));
       for (const f of fs) {
         if (!prev || p.segment !== prev.segment || p.cycle !== prev.cycle + 1 ||
-            !valid(p.ts) || !valid(prev.ts) || p.ts <= prev.ts || !valid(p[f]) || !valid(prev[f])) runs[f]++;
+            !valid(p.ts) || !valid(prev.ts) || (topCycles ? p.ts < prev.ts : p.ts <= prev.ts) ||
+            (topCycles && (duplicates.has(JSON.stringify([p.segment,p.cycle])) ||
+              duplicates.has(JSON.stringify([prev.segment,prev.cycle])) ||
+              !Number.isInteger(p.cycle) || !Number.isInteger(prev.cycle) ||
+              (Object.hasOwn(p,'pids') && (!Array.isArray(p.pids) || !Array.isArray(prev.pids) ||
+                !p.pids.length || !prev.pids.length || p.pids.some(pid => pid == null) ||
+                prev.pids.some(pid => pid == null) ||
+                JSON.stringify([...p.pids].sort()) !== JSON.stringify([...prev.pids].sort()))))) ||
+            !valid(p[f]) || !valid(prev[f])) runs[f]++;
         p['_run_' + f] = runs[f];
       }
       prev = p;
@@ -130,8 +146,11 @@
     return points;
   }
   function fullPoints(p) {
+    // Copy aggregate points: cumulative IO and run marking must not mutate the saved group.
+    if (p.memberIds) return p.series.points.map(point => ({...point}));
     return p.full_cycles.map(row => ({segment:p.segment,
       cycle:row[index.cycle], ts:row[index.ts],
+      ...(topCycles ? {pids:row[index.pids]} : {}),
       ...Object.fromEntries(fields.map(f => [f,roundMetric(row[index[f]])])),
       rss_mb:scaleMetric(row[index.rss_kb],1,1024)
     }));
@@ -151,19 +170,27 @@
         _run_rss_mb:p._run_rss_mb ?? p._run_rss_kb}));
       field = 'rss_mb'; divisor = 1;
     }
+    // Full Top samples must not inherit time-mode runs from Python sampling.
+    if (topCycles) points = markRuns(points.map(p => ({...p})),[field]);
+    const cycleConflicts = topCycles ? points.filter(p => p._cycleConflict).map(p => p.cycle) : [];
     const groups = [];
     let previous = null, group = null;
     for (const p of (full ? points : sample(points))) {
       const run = p['_run_' + field];
       const connected = previous && p.segment === previous.segment && run != null &&
-        run === previous['_run_' + field] && valid(p.ts) && valid(previous.ts) && p.ts > previous.ts;
-      if (!valid(p[field]) || !valid(p.ts)) { previous = null; group = null; continue; }
+        run === previous['_run_' + field] && valid(p.ts) && valid(previous.ts) &&
+        (topCycles ? p.ts >= previous.ts : p.ts > previous.ts);
+      if (!valid(p[field]) || !valid(p.ts) || (topCycles && !Number.isInteger(p.cycle))) {
+        previous = null; group = null; continue;
+      }
       if (!group || !connected) {
         group = {name, type:'line', data:[], showSymbol:true, symbolSize:3, connectNulls:false,
-          yAxisIndex, lineStyle:{width:1, color}, itemStyle:{color}, emphasis:{focus:'series'}, animation:false};
+          yAxisIndex, lineStyle:{width:1, color}, itemStyle:{color}, emphasis:{focus:'series'}, animation:false,
+          ...(topCycles ? {cycleConflicts} : {})};
         groups.push(group);
       }
-      group.data.push(full ? [p.ts, scaleMetric(p[field],1,divisor), p.cycle] : [p.ts, scaleMetric(p[field],1,divisor)]);
+      group.data.push(topCycles? [p.cycle, scaleMetric(p[field],1,divisor), p.ts]
+        : full ? [p.ts, scaleMetric(p[field],1,divisor), p.cycle] : [p.ts, scaleMetric(p[field],1,divisor)]);
       previous = p;
     }
     return groups;
@@ -233,14 +260,51 @@
   }
   function draw(node, option) {
     if (!node) return;
+    const cycleAxis = topCycles && !option.xAxis;
+    const cycleSamples = new Map(), cycleTimes = new Map();
+    if (cycleAxis) for (const series of option.series || []) {
+      if (!cycleSamples.has(series.name)) cycleSamples.set(series.name,new Map());
+      const samples = cycleSamples.get(series.name);
+      for (const cycle of series.cycleConflicts || []) samples.set(cycle,null);
+      for (const point of series.data || []) {
+        if (!Number.isInteger(point?.[0])) continue;
+        samples.set(point[0],samples.has(point[0]) ? null : point);
+        const ts = valid(point[2]) ? point[2] : null;
+        cycleTimes.set(point[0],cycleTimes.has(point[0]) && cycleTimes.get(point[0]) !== ts ? null : ts);
+      }
+    }
+    // Coordinates remain exact cycles: never interpolate timestamps or merge same-second samples.
+    const cycleTimeLabel = value => {
+      const ts = cycleTimes.get(Number(value));
+      return valid(ts) ? timeLabel(ts) : '';
+    };
+    const cyclePointerLabel = value => {
+      const cycle = Number(value), ts = cycleTimes.get(cycle);
+      return Number.isInteger(cycle) ? (valid(ts) ? fullTimeLabel(ts) : '原始时间不唯一或缺失') + ' · 周期 ' + fmtCount(cycle) : '';
+    };
     option = {backgroundColor:'transparent', color:palette, textStyle:{color:'#cbd5e1'}, animation:false,
-      tooltip:{trigger:'axis', renderMode:'richText', confine:true},
+      tooltip:{trigger:'axis', renderMode:'richText', confine:true,
+        ...(cycleAxis ? {formatter:params => {
+          const cycle = Number(params[0]?.axisValue);
+          if (!Number.isInteger(cycle)) return '';
+          const names = [...new Set(params.map(p => p.seriesName))];
+          return ['周期 ' + fmtCount(cycle), ...names.flatMap(name => {
+            const point = cycleSamples.get(name)?.get(cycle);
+            return point && valid(point[1]) && valid(point[2]) ? [name + '：' + fmt(point[1]) +
+              ' · 原始时间 ' + fullTimeLabel(point[2])] : [];
+          })].join('\n');
+        }} : {})},
       legend:{type:'scroll', top:0, textStyle:{color:'#cbd5e1'}, pageTextStyle:{color:'#cbd5e1'}},
       grid:{left:65,right:45,top:65,bottom:65,containLabel:true},
-      xAxis:{type:'time', axisLabel:{formatter:timeLabel,hideOverlap:true},
-        axisPointer:{label:{formatter:params => fullTimeLabel(params.value)}}, splitLine:{show:false}},
+      xAxis:topCycles ? {type:'value',name:'真实时间（本机，按周期等距）',nameLocation:'middle',nameGap:30,minInterval:1,scale:true,
+        axisLabel:{formatter:cycleTimeLabel,hideOverlap:true},
+        axisPointer:{label:{formatter:params => cyclePointerLabel(params.value)}},splitLine:{show:false}}
+        : {type:'time', axisLabel:{formatter:timeLabel,hideOverlap:true},
+          axisPointer:{label:{formatter:params => fullTimeLabel(params.value)}}, splitLine:{show:false}},
       yAxis:{type:'value', splitLine:{lineStyle:{color:'rgba(148,163,184,.12)'}}},
-      dataZoom:[{type:'inside',filterMode:'none'}, {type:'slider',bottom:8,height:18,borderColor:'#475569',textStyle:{color:'#94a3b8'},labelFormatter:timeLabel}],
+      // An inside controller still cancels canvas wheel events with wheel zoom disabled.
+      // Keep only the slider so native page/table scrolling remains available everywhere.
+      dataZoom:[{type:'slider',filterMode:'none',bottom:8,height:18,borderColor:'#475569',textStyle:{color:'#94a3b8'},labelFormatter:cycleAxis ? cycleTimeLabel : timeLabel}],
       ...option};
     const axes = axis => (Array.isArray(axis) ? axis : [axis]).filter(Boolean);
     for (const axis of [...axes(option.xAxis),...axes(option.yAxis)]) {
@@ -294,7 +358,7 @@
       else if (f === 'rss_kb') series.push(...lineSeries(systemPoints(system), 'mem_used_mb',
         '系统 · 已使用内存', '#ff6b6b'));
       else if (io.includes(f)) series.push(...lineSeries(ioPoints, f,
-        '已采集进程 IO 合计 · ' + labels[f], ['#ff6b6b','#fbbf24','#34d399','#38bdf8'][io.indexOf(f)]));
+        '已采集进程 IO 合计 · ' + labels[f], ioColors[io.indexOf(f)]));
     }
     series.forEach(s => { s.lineStyle.width = 1.5; s.lineStyle.type = 'dashed'; s.z = 5; });
     return series;
@@ -312,18 +376,19 @@
   }
   // Index exact samples once per selected stream; duplicates remain conflicts.
   function overlayStream(points, fs) {
-    const samples = new Map(), cycles = new Map();
+    const samples = new Map(), cycles = new Map(), byCycle = new Map();
     for (const p of points) {
+      if (Number.isInteger(p.cycle)) byCycle.set(p.cycle, byCycle.has(p.cycle) ? null : p);
       if (!valid(p.ts)) continue;
       if (!cycles.has(p.ts)) cycles.set(p.ts, new Set());
       cycles.get(p.ts).add(p.cycle);
       const key = JSON.stringify([p.cycle, p.ts]);
       samples.set(key, samples.has(key) ? null : p);
     }
-    return {points:markRuns(points, fs), samples, cycles};
+    return {points:markRuns(points, fs), samples, cycles, byCycle};
   }
   function overlayTooltip(entries, unit, node) {
-    return {trigger:'axis', renderMode:'html', confine:false, appendToBody:true, enterable:true,
+    return {trigger:'axis', renderMode:'html', confine:false, appendToBody:true,enterable:true, displayTransition:false, transitionDuration:0,
       backgroundColor:'#ffffff', borderColor:'#dce3ed', borderWidth:1, padding:0,
       textStyle:{color:'#243247',fontSize:12},
       extraCssText:'border-radius:12px;box-shadow:0 12px 36px #24324726;white-space:normal;',
@@ -336,22 +401,31 @@
         return [Math.max(gap, Math.min(x, width - size.contentSize[0] - gap)) - bounds.left, y - bounds.top];
       },
       formatter(params) {
-        const ts = Number(params[0]?.axisValue), cycles = new Set();
+        const axis = Number(params[0]?.axisValue), cycles = new Set();
+        if (!valid(axis)) return '';
+        const times = new Set(topCycles ? entries.map(entry => entry.stream.byCycle.get(axis)?.ts).filter(valid) : []);
+        const ts = topCycles ? (times.size === 1 ? [...times][0] : null) : axis;
         for (const entry of entries) for (const cycle of entry.stream.cycles.get(ts) || []) cycles.add(cycle);
-        const cycle = cycles.size === 1 ? [...cycles][0] : null;
+        const cycle = topCycles ? axis : cycles.size === 1 ? [...cycles][0] : null;
         const box = el('div', null, 'overlay-tooltip');
-        const millis = valid(ts) ? '.' + String(new Date(ts).getMilliseconds()).padStart(3,'0') : '';
-        box.append(el('strong', fullTimeLabel(ts) + millis + ' · 周期 ' + (cycle ?? '冲突'), 'overlay-tooltip-heading'));
+        box.append(el('strong', (valid(ts) ? fullTimeLabel(ts) : '原始时间不唯一或缺失') +
+          (cycle == null ? '' : ' · 周期 ' + cycle), 'overlay-tooltip-heading'));
         const list = el('div', null, 'overlay-tooltip-list');
-        entries.forEach((entry, n) => {
-          const point = cycle == null ? null : entry.stream.samples.get(JSON.stringify([cycle, ts]));
-          const value = point?.[entry.field];
+        const visible = entries.map((entry, n) => {
+          const ownCycles = entry.stream.cycles.get(ts);
+          const ownCycle = ownCycles?.size === 1 ? [...ownCycles][0] : null;
+          const point = topCycles ? entry.stream.byCycle.get(axis)
+            : ownCycle == null ? null : entry.stream.samples.get(JSON.stringify([ownCycle, ts]));
+          const raw = point?.[entry.field];
+          return {entry, n, point, value:valid(raw) && (!topCycles || valid(point.ts)) ? scaleMetric(raw,1,entry.divisor) : null};
+        }).filter(item => valid(item.value)).sort((a,b) => b.value - a.value || a.n - b.n);
+        visible.forEach(({entry, n, value, point}) => {
           const row = el('div', null, 'overlay-tooltip-row' + (entry.reference ? ' is-reference' : ''));
           const dot = el('i', null, 'overlay-tooltip-dot');
-          dot.style.backgroundColor = entry.reference ? '#ff6b6b' : palette[n % palette.length];
+          dot.style.backgroundColor = entry.color || (entry.reference ? '#ff6b6b' : palette[n % palette.length]);
           row.append(dot, el('span', entry.name + '：', 'overlay-tooltip-name'),
-            el('b', valid(value) ? unitText(scaleMetric(value,1,entry.divisor),unit) : '缺失或冲突',
-              'overlay-tooltip-value' + (valid(value) ? '' : ' is-missing')));
+            el('b', unitText(value,unit), 'overlay-tooltip-value'));
+          if (topCycles && times.size !== 1) row.append(el('span', '原始时间 ' + fullTimeLabel(point.ts)));
           list.append(row);
         });
         box.append(list);
@@ -363,7 +437,7 @@
           if (row.classList.contains('is-reference')) row.style.backgroundColor = '#f4f7fb';
         });
         box.querySelectorAll('.overlay-tooltip-value').forEach(value => {
-          value.style.color = value.classList.contains('is-missing') ? '#65748a' : '#243247';
+          value.style.color = '#243247';
         });
         return box;
       }};
@@ -371,7 +445,7 @@
   function plotOverlay(node, entries, unit) {
     const series = entries.flatMap((entry, n) => {
       const curves = lineSeries(entry.stream.points, entry.field, entry.name,
-        entry.reference ? '#ff6b6b' : palette[n % palette.length], entry.divisor, 0, true);
+        entry.color || (entry.reference ? '#ff6b6b' : palette[n % palette.length]), entry.divisor, 0, true);
       if (entry.reference) curves.forEach(s => { s.lineStyle.type = 'dashed'; s.lineStyle.width = 1.5; s.z = 5; });
       return curves;
     });
@@ -379,16 +453,16 @@
       yAxis:{type:'value',name:unit,splitLine:{lineStyle:{color:'#334155'}}},
       title:series.length ? undefined : {text:'暂无有效曲线 / 请先选择进程',left:'center',top:'center',textStyle:{color:'#94a3b8',fontSize:14}}});
   }
-  function rank(ps, field, key, active=false) {
-    const value = p => metric(p,field,key,active);
+  function rank(ps, field, key) {
+    const value = p => metric(p,field,key);
     return ps.filter(p => valid(value(p))).sort((a,b) => value(b)-value(a) || a.name.localeCompare(b.name)).slice(0,30);
   }
-  function bars(node, ps, field, key, active=false) {
-    const ranked = rank(ps,field,key,active);
+  function bars(node, ps, field, key) {
+    const ranked = rank(ps,field,key);
     draw(node, {tooltip:{trigger:'axis',renderMode:'richText',confine:true}, legend:{show:false},
       xAxis:{type:'value',name:field === 'rss_kb' ? 'MB' : '%'},
       yAxis:{type:'category',inverse:true,data:ranked.map(processLabel),axisLabel:{width:250,overflow:'truncate'}},
-      series:[{type:'bar',barMaxWidth:18,data:ranked.map((p,i) => ({value:metric(p,field,key,active),itemStyle:{color:palette[i%palette.length]}}))}],
+      series:[{type:'bar',barMaxWidth:18,data:ranked.map((p,i) => ({value:metric(p,field,key),itemStyle:{color:palette[i%palette.length]}}))}],
       dataZoom:[],grid:{left:20,right:65,top:30,bottom:35,containLabel:true}});
   }
   function exactStats(points, f) {
@@ -406,14 +480,10 @@
     const points = p.full_cycles ? fullPoints(p) : (p.chart_samples || []).map(row => ({
       cpu1c:roundMetric(row[2]), rss_mb:scaleMetric(row[3],1,1024)
     }));
-    const active = points.filter(point => valid(point.cpu1c) && point.cpu1c > 0);
-    for (const [source, samples] of [[p,points],[p.active,active]]) {
-      if (!source) continue;
-      source.display_metrics = {...source.display_metrics,
-        rss_mb:source.display_metrics?.rss_mb || exactStats(samples,'rss_mb')};
-      for (const field of (p.full_cycles ? fields : ['cpu1c'])) {
-        if (source.metrics?.[field]) source.metrics[field] = exactStats(samples,field);
-      }
+    p.display_metrics = {...p.display_metrics,
+      rss_mb:p.display_metrics?.rss_mb || exactStats(points,'rss_mb')};
+    for (const field of (p.full_cycles ? fields : ['cpu1c'])) {
+      if (p.metrics?.[field]) p.metrics[field] = exactStats(points,field);
     }
   }
   function mergeFull(system, members) {
@@ -431,6 +501,10 @@
       const rows = maps.map(map => map.get(cycle));
       const aligned = valid(ts) && rows.every(row => row && valid(row[index.ts]) && row[index.ts] === ts);
       const p = {segment:system.segment, cycle, ts:aligned ? ts : null};
+      if (topCycles) p.pids = rows.flatMap((row,i) => {
+        const pids = row?.[index.pids];
+        return Array.isArray(pids) && pids.length ? pids.map(pid => pid == null ? null : i + ':' + pid) : [null];
+      });
       const mergeFields = [...new Set([...fields,'rss_mb'])];
       for (const f of mergeFields) {
         const values = rows.map(row => !aligned ? null : f === 'rss_mb'
@@ -441,11 +515,9 @@
     });
     const mergeFields = [...new Set([...fields,'rss_mb'])];
     markRuns(points, mergeFields);
-    const active = points.filter(p => valid(p.cpu1c) && p.cpu1c > 0);
-    return {points, active, metrics:Object.fromEntries(mergeFields.map(f => [f,exactStats(points,f)])),
-      activeMetrics:Object.fromEntries(mergeFields.map(f => [f,exactStats(active,f)]))};
+    return {points, metrics:Object.fromEntries(mergeFields.map(f => [f,exactStats(points,f)]))};
   }
-  function mergeTable(result, cycles, active=false) {
+  function mergeTable(result, cycles) {
     const container = el('div');
     for (const group of [['cpu1c'], ['rss_kb'], io]) {
       const wrap = el('div', null, 'scroll'), table = el('table'), head = el('thead'), body = el('tbody');
@@ -455,7 +527,7 @@
       if (isIO) headers.push('有效累计');
       headers.forEach(t => tr.append(el('th',t))); head.append(tr);
       for (const f of group) {
-        const m = (active ? result.activeMetrics : result.metrics)[f === 'rss_kb' ? 'rss_mb' : f];
+        const m = result.metrics[f === 'rss_kb' ? 'rss_mb' : f];
         const row = el('tr');
         const values = [scaleMetric(m.count,100,cycles),
           ...['min','avg','p95','p99','max'].map(k => roundMetric(m[k]))];
@@ -555,15 +627,14 @@
       Array.from(row.cells).forEach((cell,i) => {
         const header = headers[i] || '';
         if (header === 'PID变化') { writeValue(cell,p.pid_changes,true); return; }
-        if (header === '活跃周期') { writeValue(cell,p.active?.metrics?.cpu1c?.count,true); return; }
-        const field = /内存/.test(header) ? 'rss_kb' : /活跃|CPU/.test(header) ? 'cpu1c'
+        const field = /内存/.test(header) ? 'rss_kb' : /CPU/.test(header) ? 'cpu1c'
           : /累计读|物理读/.test(header) ? 'rd_kb' : /累计写|物理写/.test(header) ? 'wr_kb'
           : /逻辑读/.test(header) ? 'rchar_kb' : /逻辑写/.test(header) ? 'wchar_kb' : null;
         const key = /有效周期/.test(header) ? 'count' : /P99/i.test(header) ? 'p99'
           : /P95/i.test(header) ? 'p95' : /峰值/.test(header) ? 'max'
           : /均值/.test(header) ? 'avg' : /累计/.test(header) ? 'total' : null;
         if (!field || !key) return;
-        let value = metric(p,field,key,/活跃/.test(header));
+        let value = metric(p,field,key);
         if (/KDMIPS/.test(header)) value = scaleMetric(value,28.75,100);
         if (io.includes(field) && key !== 'count') cell.dataset.ioUnit = key === 'total' ? 'total' : 'cycle';
         writeValue(cell,value,key === 'count');
@@ -578,7 +649,7 @@
       if (!raw || !valid(value)) return;
       const header = headers[cell.cellIndex] || '';
       if (/^(PID|序号|记录ID|周期|行号)$/.test(header)) return;
-      const integer = /有效样本|有效周期|活跃周期|PID变化|样本数|记录数/.test(header);
+      const integer = /有效样本|有效周期|PID变化|样本数|记录数/.test(header);
       const rounded = integer ? value : roundMetric(value);
       cell.dataset.sort = String(rounded);
       const ioValue = cell.dataset.ioKb === undefined ? rounded : cell.dataset.ioKb === '' ? null : Number(cell.dataset.ioKb);
@@ -648,7 +719,7 @@
   }
   function setupSegment(system) {
     if (document.body?.dataset?.reportStyle === 'compact' && typeof window.setupCompactReport === 'function') {
-      window.setupCompactReport(system, {data, valid, fmt, fmtCount, roundMetric, scaleMetric,
+      window.setupCompactReport(system, {data, valid, fmt, fmtCount, roundMetric, scaleMetric, fullTimeLabel,
         sum, exactStats, metric, pidLabel,processLabel, el, lineSeries, draw, setupTable});
       return;
     }
@@ -656,11 +727,11 @@
     const ps = data.processes.filter(p => p.segment === system.segment);
     const byId = new Map(ps.map(p => [p.id,p]));
     const node = role => document.getElementById(system.id + '-' + role);
-    const overlay = new Set(), selected = new Set();
+    const overlay = new Set(), selected = new Set(), mergedGroups = new Map();
     const ioFull = collectedIO(system, ps, true);
     const ioReference = sample(ioFull);
     const systemStream = overlayStream(systemPoints(system),
-      ['cpu_single_core', 'mem_used_mb']);
+      ['cpu_single_core', 'cpu_irq', 'mem_used_mb']);
     const ioStream = overlayStream(ioFull, io), processStreams = new Map();
     function plotCompared(role, members, fs, unit) {
       if (!role.startsWith('overlay-')) {
@@ -668,13 +739,17 @@
         return;
       }
       const entries = fs.map(f => ({reference:true, divisor:1,
+        color:io.includes(f) ? ioColors[io.indexOf(f)] : '#ff6b6b',
         stream:io.includes(f) ? ioStream : systemStream,
         field:f === 'cpu1c' ? 'cpu_single_core' : f === 'rss_kb' ? 'mem_used_mb' : f,
         name:f === 'cpu1c' ? '系统 CPU · 单核口径' : f === 'rss_kb' ? '系统 · 已使用内存' : '已采集进程 IO 合计 · ' + labels[f]}));
+      if (role === 'overlay-cpu') entries.push({reference:true, divisor:1,
+        stream:systemStream, field:'cpu_irq', color:'#fbbf24',
+        name:'系统中断 · irq+softirq · 单核口径'});
       for (const p of members) {
-        if (!processStreams.has(p.id)) processStreams.set(p.id, overlayStream(fullPoints(p), ['cpu1c','rss_kb',...io]));
-        for (const f of fs) entries.push({stream:processStreams.get(p.id), field:f,
-          divisor:f === 'rss_kb' ? 1024 : 1, name:processLabel(p) + ' · ' + labels[f]});
+        if (!processStreams.has(p.id)) processStreams.set(p.id, overlayStream(fullPoints(p), ['cpu1c','rss_kb','rss_mb',...io]));
+        for (const f of fs) entries.push({stream:processStreams.get(p.id), field:p.memberIds && f === 'rss_kb' ? 'rss_mb' : f,
+          divisor:f === 'rss_kb' && !p.memberIds ? 1024 : 1, name:processLabel(p) + ' · ' + labels[f]});
       }
       plotOverlay(node(role), entries, unit);
     }
@@ -711,7 +786,7 @@
     allTable?.querySelector('.select-top15')?.addEventListener('click', () => {
       const visible = new Set(Array.from(allTable.querySelectorAll('tr[data-process]'))
         .filter(row => !row.hidden).map(row => row.dataset.process));
-      rank(ps.filter(p => visible.has(p.id)), 'cpu1c', 'avg', true).slice(0,15)
+      rank(ps.filter(p => visible.has(p.id)), 'cpu1c', 'avg').slice(0,15)
         .forEach(p => overlay.add(p.id));
       refreshOverlay();
     });
@@ -736,7 +811,7 @@
     draw(node('exceed'), {tooltip:{trigger:'axis',valueFormatter:fmtCount},legend:{show:false},dataZoom:[],xAxis:{type:'category',data:thresholds.map(t => '> '+fmt(t.threshold)+'%')},
       title:thresholds.length ? undefined : {text:'暂无有效系统CPU样本',left:'center',top:'center',textStyle:{color:'#94a3b8',fontSize:14}},
       yAxis:{type:'value',name:'有效样本数',minInterval:1},series:[{type:'bar',barMaxWidth:90,data:thresholds.map((t,i) => ({value:t.count,itemStyle:{color:['#fbbf24','#fb923c','#fb7185'][i]}})),label:{show:true,formatter:params => fmtCount(params.value),position:'top',color:'#e2e8f0'}}]});
-    bars(node('active-top'),ps,'cpu1c','avg',true);
+    bars(node('cpu-top'),ps,'cpu1c','avg');
     bars(node('rss-top'),ps,'rss_kb','avg');
     plot(node('peak-top'),rank(ps,'cpu1c','max'),['cpu1c'],{unit:'%',fieldLabels:{cpu1c:'CPU'}});
     refreshOverlay();
@@ -744,8 +819,11 @@
     const mergeSystemToggle = root.querySelector('.merge-show-system-processes');
     const candidates = root.querySelector('.candidate-list'), chosenList = root.querySelector('.selected-list');
     const status = root.querySelector('.merge-status'), resultNode = root.querySelector('.merge-result');
-    const apply = root.querySelector('.merge-apply');
+    const apply = root.querySelector('.merge-apply'), addOverlay = root.querySelector('.merge-add-overlay');
+    let pendingAggregate = null;
     function clearResult() {
+      pendingAggregate = null;
+      addOverlay.disabled = true;
       resultNode.replaceChildren();
       for (const [role,fs,unit] of [['cpu',['cpu1c'],'%'],['rss',['rss_kb'],'MB'],['io',io,'KB/周期']]) {
         plotCompared('merge-'+role,[],fs,unit);
@@ -793,31 +871,107 @@
     mergeSystemToggle.addEventListener('change',filterCandidates);
     filterCandidates();
     root.querySelector('.merge-clear').addEventListener('click',() => { selected.clear(); refreshSelection(); });
+    addOverlay.addEventListener('click',() => {
+      if (!pendingAggregate || pendingAggregate.memberIds.length < 2) return;
+      const key = JSON.stringify(pendingAggregate.memberIds);
+      if (!mergedGroups.has(key)) {
+        const group = {...pendingAggregate, id:Symbol(key)};
+        mergedGroups.set(key,group); byId.set(group.id,group);
+      }
+      const group = mergedGroups.get(key), alreadySelected = overlay.has(group.id);
+      overlay.add(group.id); refreshOverlay();
+      status.textContent = (alreadySelected ? '该合并组已在全进程曲线中：' : '已添加到上方全进程曲线：') +
+        group.name + '。可与其他进程或合并组对比，点击全进程图表上方标签移除。';
+    });
     apply.addEventListener('click',() => {
-      const members = [...selected].map(id => byId.get(id));
+      const members = [...selected].sort().map(id => byId.get(id));
       if (!members.length) return;
       const version = selectionVersion;
+      clearResult();
       apply.disabled = true; status.textContent = '正在按全部周期对齐并计算…';
       setTimeout(() => {
         if (version !== selectionVersion) return;
         try {
           const result = mergeFull(system,members), sampled = sample(result.points);
-          const aggregate = {name:'合并（'+members.length+'个名称）', series:{points:sampled}};
-          resultNode.replaceChildren(el('h4','全量合并统计'),mergeTable(result,system.cycles),
-            el('h4','合并后有效CPU > 0 的活跃统计'),mergeTable(result,system.cycles,true));
+          const aggregate = {name:'合并（'+members.length+'个进程）：'+members.map(p => p.name).join(' + '),
+            segment:system.segment, memberIds:members.map(p => p.id), series:{points:sampled}};
+          resultNode.replaceChildren(el('h4','全量有效周期合并统计'),mergeTable(result,system.cycles));
           const complete = result.points.filter(p => fields.every(f => valid(p[f]))).length;
-          status.textContent = '已对齐 '+system.cycles+' 个周期；七字段完整 '+complete+'；活跃 '+result.active.length+'。图表和统计均保留全量点。';
+          status.textContent = '已对齐 '+system.cycles+' 个周期；七字段完整 '+complete+'；CPU有效周期 '+result.metrics.cpu1c.count+'。图表和统计均保留全量点。';
           plotCompared('merge-cpu',[aggregate],['cpu1c'],'%');
           plotCompared('merge-rss',[aggregate],['rss_kb'],'MB');
           plotCompared('merge-io',[aggregate],io,'KB/周期');
+          pendingAggregate = aggregate;
+          addOverlay.disabled = members.length < 2;
+          status.textContent += members.length < 2 ? ' 至少合并两个进程后可添加到全进程曲线。' : ' 可点击“添加到全进程曲线”进行叠加对比。';
         } catch (error) { status.textContent = '合并失败：'+error.message; }
         finally { apply.disabled = selected.size === 0; }
       },0);
     });
     refreshSelection();
   }
+  function setupChartFullscreen() {
+    let active = null;
+    function resizeChart(node) {
+      const state = instances.get(node);
+      if (!state) return;
+      if (state.chart) {
+        state.chart.dispatchAction({type:'hideTip'});
+        state.chart.resize();
+      } else activate(node,state);
+    }
+    function leave() {
+      if (!active) return;
+      const {shell,node,button,anchor,overflow,focus,scrollX,scrollY} = active;
+      active = null;
+      anchor.replaceWith(shell);
+      shell.classList.remove('is-fullscreen');
+      shell.removeAttribute('role'); shell.removeAttribute('aria-modal');
+      button.textContent = '全屏查看'; button.setAttribute('aria-expanded','false');
+      document.body.style.overflow = overflow;
+      if (focus?.isConnected) focus.focus({preventScroll:true});
+      window.scrollTo({left:scrollX,top:scrollY,behavior:'instant'});
+      requestAnimationFrame(() => resizeChart(node));
+    }
+    document.querySelectorAll('.overview > .chart,[data-chart^="overlay-"],.combination > .chart').forEach(node => {
+      const shell = el('div',null,'chart-shell');
+      const toolbar = el('div',null,'chart-toolbar');
+      const title = node.getAttribute('aria-label') || '全进程图表';
+      const button = el('button','全屏查看');
+      button.type = 'button'; button.setAttribute('aria-expanded','false');
+      button.setAttribute('aria-controls',node.id);
+      shell.setAttribute('aria-label',title);
+      toolbar.append(el('span',title),button);
+      node.before(shell); shell.append(toolbar,node);
+      button.addEventListener('click',() => {
+        if (active?.shell === shell) { leave(); return; }
+        leave();
+        const anchor = el('div',null,'chart-placeholder');
+        anchor.style.height = shell.getBoundingClientRect().height + 'px';
+        anchor.setAttribute('aria-hidden','true');
+        active = {shell,node,button,anchor,overflow:document.body.style.overflow,
+          focus:document.activeElement,scrollX:window.scrollX,scrollY:window.scrollY};
+        shell.before(anchor); document.body.append(shell);
+        shell.classList.add('is-fullscreen');
+        shell.setAttribute('role','dialog'); shell.setAttribute('aria-modal','true');
+        button.textContent = '退出全屏（Esc）'; button.setAttribute('aria-expanded','true');
+        document.body.style.overflow = 'hidden';
+        button.focus({preventScroll:true});
+        requestAnimationFrame(() => resizeChart(node));
+      });
+    });
+    document.addEventListener('keydown',event => {
+      if (!active) return;
+      if (event.key === 'Escape') { event.preventDefault(); leave(); }
+      else if (event.key === 'Tab') {
+        event.preventDefault(); active.button.focus({preventScroll:true});
+      }
+    });
+    window.addEventListener('beforeprint',leave);
+  }
   data.processes.forEach(prepareMetrics);
   data.systems.forEach(setupSegment);
+  setupChartFullscreen();
   document.querySelectorAll('.pid-monitor').forEach(setupPidMonitor);
   function resizeVisible(root=document) {
     instances.forEach((state, node) => {

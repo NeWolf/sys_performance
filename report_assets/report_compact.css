@@ -1,4 +1,5 @@
 *{box-sizing:border-box}
+.chart-shell{min-width:0}.combination .chart-shell>.chart{height:420px}.chart-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px}.chart-toolbar>span{display:none}.chart-toolbar>button{margin-left:auto}.chart-shell.is-fullscreen{position:fixed;inset:0;z-index:999;display:flex;flex-direction:column;padding:16px;background:#fff}.is-fullscreen>.chart-toolbar{flex-shrink:0}.is-fullscreen>.chart-toolbar>span{display:block;min-width:0;overflow-wrap:anywhere}.chart-shell.is-fullscreen>.chart{flex:1;min-height:0;height:0;margin:8px 0 0;width:100%}@media print{.chart-toolbar{display:none!important}}
 :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#243247;background:#f5f6f8;font-size:14px}
 body{margin:0}header{background:#202c40;color:#fff;padding:28px max(24px,calc((100vw - 1452px)/2))}h1{font-size:24px;margin:0 0 12px;overflow-wrap:anywhere}header p{color:#c5d4e8;margin:0}
 main{max-width:1500px;margin:auto;padding:24px}h2{font-size:19px}h3{font-size:16px}.segment{margin-bottom:36px}.panel{background:#fff;border:1px solid #e6eaf0;border-radius:12px;padding:24px;margin:20px 0;box-shadow:0 2px 8px #24324705}
@@ -10,7 +11,7 @@ input,button{font:inherit}input[type=search]{border:1px solid #cbd5e1;border-rad
 nav{display:flex;gap:18px;flex-wrap:wrap}a{color:#2462b9}summary{cursor:pointer;font-weight:600}dt{font-weight:600;margin-top:16px}dd{margin:6px 0;line-height:1.8;overflow-wrap:anywhere}footer{text-align:center;color:#65748a;padding:18px}.js-only{display:none}.js-enabled .js-only{display:block}[hidden]{display:none!important}
 .compact-tooltip{display:flex;flex-direction:column;width:min(560px,calc(100vw - 28px));max-height:calc(100vh - 28px);color:#243247;font-size:12px;line-height:1.6;white-space:normal}
 .compact-tooltip-heading{flex-shrink:0;padding:12px 14px;border-bottom:1px solid #e6eaf0;overflow-wrap:anywhere}
-.compact-tooltip-list{min-height:0;overflow:auto;overscroll-behavior:contain;padding:4px 14px 10px;scrollbar-width:thin;scrollbar-color:#bcc8d8 #f5f6f8}
+.compact-tooltip-list{min-height:0;overflow:auto;overscroll-behavior:auto;padding:4px 14px 10px;scrollbar-width:thin;scrollbar-color:#bcc8d8 #f5f6f8}
 .compact-tooltip-row{display:grid;grid-template-columns:8px minmax(0,1fr) max-content;gap:10px;align-items:start;padding:6px 0;border-bottom:1px solid #eef1f5}
 .compact-tooltip-row:last-child{border-bottom:0}.compact-tooltip-row.is-reference{font-weight:600}
 .compact-tooltip-dot{width:8px;height:8px;border-radius:50%;margin-top:6px}.compact-tooltip-name{min-width:0;overflow-wrap:anywhere}

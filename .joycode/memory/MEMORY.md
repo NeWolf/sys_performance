@@ -9,3 +9,5 @@
 - [准入报告允许重复生成与重复发布](feedback_admission_repeat.md) — 同一份性能数据不限制生成/发布次数，只保留同草稿并发与幂等保护
 
 - [报告悬浮卡片随进程内容自适应高度](feedback_tooltip_content_height.md) — 用户要求悬浮信息完整展示，卡片随内容增高，避免固定高度截断进程信息
+
+- [离线报告仅按实测有效值统一统计](feedback_measured_statistics.md) — 用户要求关注进程与全进程等视图同口径，缺失不补零，实测零值保留

@@ -23,8 +23,8 @@ const kdmips = (value: ProcessRow['cpu_p95']) => n(scaleMetric(value, 28.75, 100
 const identity = (row: ProcessRow) => JSON.stringify([row.segment, row.name])
 const pidLabel = (row: ProcessRow) => formatPid(row.pids, row.pid_changes)
 
-export function Processes({ id, segment, onSegment, disabled, members = [], memberSegment, onToggle, segments, visible = true }: {
-  id: string; segment: number; onSegment: (value: number) => void; disabled: boolean
+export function Processes({ id, segment, onSegment, disabled, members = [], memberSegment, onToggle, segments, visible = true, sourceFormat }: {
+  sourceFormat?: string; id: string; segment: number; onSegment: (value: number) => void; disabled: boolean
   members?: { pid: number; name: string }[]; memberSegment?: number
   onToggle?: (row: ProcessRow) => void; segments?: Overview['segments']; visible?: boolean
 }) {
@@ -92,12 +92,12 @@ export function Processes({ id, segment, onSegment, disabled, members = [], memb
         <button disabled={pagingDisabled || !resource.data || page + 1 >= pageCount} onClick={() => setPage(pageCount - 1)}>末页</button>
       </div></div>
     </section>
-    {active ? <ProcessDetail key={identity(active)} id={id} process={active} disabled={disabled} onClose={() => setSelected(null)} />
+    {active ? <ProcessDetail sourceFormat={sourceFormat} key={identity(active)} id={id} process={active} disabled={disabled} onClose={() => setSelected(null)} />
       : <div className="process-empty">{selected ? '已切换时间段，请在排行中重新选择该段进程。' : '选择进程名称，查看 CPU、RSS、周期 I/O 与 dmabuf 细节。'}</div>}
   </>
 }
 
-function ProcessDetail({ id, process, disabled, onClose }: { id: string; process: ProcessRow; disabled: boolean; onClose: () => void }) {
+function ProcessDetail({ id, process, disabled, onClose, sourceFormat }: { sourceFormat?: string; id: string; process: ProcessRow; disabled: boolean; onClose: () => void }) {
   const [revision, setRevision] = useState(0)
   const filters = { name: process.name }
   const resource = useResource<SeriesData>(seriesPath(id, 'P', process.segment, filters), revision)
@@ -118,16 +118,16 @@ function ProcessDetail({ id, process, disabled, onClose }: { id: string; process
       <ul>{rawCommands.slice(0, 20).map((command) => <li className="wrap-text" key={command}>{command}</li>)}</ul>
     </details>}
     {resource.error && <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试进程趋势</button>}
-    {referenceData && <p className="chart-caption">参照范围：时间段 {process.segment} · {referenceData.sampled ? '周期合计后降采样' : '全部周期'} · 展示 {n(referenceData.points.length, 0)} / {n(referenceData.total, 0)} 个周期；参照与进程样本按各自时间戳绘制，不跨段连接。</p>}
+    {referenceData && <p className="chart-caption">参照范围：时间段 {process.segment} · {referenceData.sampled ? '周期合计后降采样' : '全部周期'} · 展示 {n(referenceData.points.length, 0)} / {n(referenceData.total, 0)} 个周期；参照与进程样本{sourceFormat === 'top' ? '按所选横轴使用各自实际周期或原始时间绘制' : '按各自时间戳绘制'}，不跨段连接。</p>}
     {references.loading && <p role="status">正在读取系统与 IO 合计参照，进程趋势不受影响…</p>}
     {references.error && <p role="alert" className="error">参照读取失败：{references.error} <button disabled={disabled} onClick={() => setRevision((value) => value + 1)}>重试参照</button></p>}
     <div className="chart-grid">
-      <SeriesChart title="进程与整机 CPU" unit="%" metrics={cpuMetrics} {...resource} references={cpuReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note={`默认对比单核 CPU。${referenceData?.cpu_reference_note ?? '整机满载值以参照数据识别结果为准。'}进程使用 cpu1c，缺失不回退。点击图例可隐藏参照。`} />
-      <SeriesChart title="进程 RSS 与系统已使用内存" unit="KB" metrics={rssMetrics} {...resource} references={memoryReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note="系统已使用内存＝总内存−MemAvailable，统一换算容量后与 RSS 对比；缺失不补零。" />
-      <SeriesChart title="I/O 周期增量" unit="KB / 周期" metrics={ioMetrics} {...resource} references={ioReferences} mode="scatter" note="原始读写增量，不再次差分；参照按同周期全部已采集 P 进程分别汇总物理读、物理写，不受排行搜索或分页影响。仅汇总有效值，可能不完整；无有效值时断开，零值可能源于权限限制。" />
-      <Trend path={seriesPath(id, 'DP', process.segment, filters)} title="进程 dmabuf" unit="KB" metrics={dmaMetrics} mode="scatter" note="仅展示实际记录，不以零补齐缺失周期。" />
+      <SeriesChart sourceFormat={sourceFormat} title="进程与整机 CPU" unit="%" metrics={cpuMetrics} {...resource} references={cpuReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note={`默认对比单核 CPU。${referenceData?.cpu_reference_note ?? '整机满载值以参照数据识别结果为准。'}进程使用 cpu1c，缺失不回退。点击图例可隐藏参照。`} />
+      <SeriesChart sourceFormat={sourceFormat} title="进程 RSS 与系统已使用内存" unit="KB" metrics={rssMetrics} {...resource} references={memoryReferences} mode={process.concurrent_pids ? 'scatter' : 'line'} note="系统已使用内存＝总内存−MemAvailable，统一换算容量后与 RSS 对比；缺失不补零。" />
+      <SeriesChart sourceFormat={sourceFormat} title="I/O 周期增量" unit="KB / 周期" metrics={ioMetrics} {...resource} references={ioReferences} mode="scatter" note="原始读写增量，不再次差分；参照按同周期全部已采集 P 进程分别汇总物理读、物理写，不受排行搜索或分页影响。仅汇总有效值，可能不完整；无有效值时断开，零值可能源于权限限制。" />
+      <Trend sourceFormat={sourceFormat} path={seriesPath(id, 'DP', process.segment, filters)} title="进程 dmabuf" unit="KB" metrics={dmaMetrics} mode="scatter" note="仅展示实际记录，不以零补齐缺失周期。" />
     </div>
-    <StatisticsPanel title="选中进程 · P 全字段统计" path={statisticsPath(id, 'P', process.segment, filters)} trendPath={seriesPath(id, 'P', process.segment, filters)} disabled={disabled} />
-    <StatisticsPanel title="选中进程 · DP 全字段统计" path={statisticsPath(id, 'DP', process.segment, filters)} trendPath={seriesPath(id, 'DP', process.segment, filters)} disabled={disabled} />
+    <StatisticsPanel sourceFormat={sourceFormat} title="选中进程 · P 全字段统计" path={statisticsPath(id, 'P', process.segment, filters)} trendPath={seriesPath(id, 'P', process.segment, filters)} disabled={disabled} />
+    <StatisticsPanel sourceFormat={sourceFormat} title="选中进程 · DP 全字段统计" path={statisticsPath(id, 'DP', process.segment, filters)} trendPath={seriesPath(id, 'DP', process.segment, filters)} disabled={disabled} />
   </section>
 }

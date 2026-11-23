@@ -5,6 +5,8 @@ import { api, apiResponse, errorMessage, formatTime, sessionPath } from './api'
 import type { Overview } from './api'
 import { useDirty, useEditGuard } from './Editing'
 import './AdmissionReport.css'
+import { canGenerateDates, ReportDates, selectedSegments } from './ReportDates'
+import type { ReportDateScope } from './ReportDates'
 
 type Scene = 'background' | 'foreground' | 'unknown'
 type Placement = 'personal' | 'child' | 'sibling'
@@ -82,7 +84,11 @@ async function admissionPost(path: string, body: object, signal: AbortSignal, be
   throw new Error(message)
 }
 
-export function AdmissionReport({ id, name, segments, disabled }: { id: string; name: string; segments: Overview['segments']; disabled: boolean }) {
+export function AdmissionReport({ id, name, segments, disabled, reportDates }: { id: string; name: string; segments: Overview['segments']; disabled: boolean; reportDates: ReportDateScope }) {
+  const [dates, setDates] = useState<string[] | null>(null)
+  const selectedDates = dates ?? reportDates.selected
+  const dateReady = canGenerateDates(reportDates.data, selectedDates)
+  const visibleSegments = selectedSegments(reportDates.data, selectedDates, segments)
   const path = `${sessionPath(id)}/admission/drafts`
   const storageKey = `admission-recovery:${id}`
   const [initialRecovery] = useState(() => readRecovery(storageKey))
@@ -293,6 +299,7 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
   function show() {
     if (disabled || guard.busy) return
     setTitle([...`${name}性能准入报告`].slice(0, 200).join('')); setScenes({}); setFactor(''); setDirty(false)
+    setDates(reportDates.data ? [...reportDates.selected] : null)
     resetPublish(); setOpen(true); setListed(false); refresh()
   }
   function close() {
@@ -317,13 +324,14 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
 
   function generate(event: FormEvent) {
     event.preventDefault()
-    if (busy || guard.busy || blocked || !listed) return
+    if (busy || guard.busy || blocked || !listed || !dateReady || !visibleSegments.length) return
     const number = factor.trim() === '' ? null : Number(factor)
     if (!title.trim() || [...title].length > 200 || title.includes('\0') || (number !== null && (!Number.isFinite(number) || number <= 0))) {
       setError('请填写不含空字符且不超过200字符的标题；系数只能留空或填写正有限数。'); return
     }
     // Scenes are optional: unselected segments follow the 关注进程 scene labels.
-    const chosen = Object.fromEntries(Object.entries(scenes).filter(([, value]) => value))
+    const chosen = Object.fromEntries(visibleSegments.filter((item) => scenes[item.segment]).map((item) => [item.segment, scenes[item.segment]]))
+    const dateBody = reportDates.data?.dates.length ? { dates: [...selectedDates] } : {}
     void run(async (signal) => {
       assertWrite()
       const revision = storageRevision.current
@@ -331,7 +339,7 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
       remember(draftId, {}, true) // Persist before POST so a refresh cannot lose an ambiguous request.
       setSelected(draftId); resetPublish(); setDirty(false)
       try {
-        const result = await admissionPost(path, { draft_id: draftId, title: title.trim(), factor: number, ...(Object.keys(chosen).length ? { scenes: chosen } : {}) }, signal, () => assertWrite(revision))
+        const result = await admissionPost(path, { draft_id: draftId, title: title.trim(), factor: number, ...dateBody, ...(Object.keys(chosen).length ? { scenes: chosen } : {}) }, signal, () => assertWrite(revision))
         signal.throwIfAborted(); accept(result, draftId)
       } catch (failure) {
         signal.throwIfAborted()
@@ -402,16 +410,18 @@ export function AdmissionReport({ id, name, segments, disabled }: { id: string; 
               <label>报告标题<input required value={title} onChange={(event) => { setTitle([...event.target.value].slice(0, 200).join('')); setDirty(true) }} /><small>最多200字符。</small></label>
               <label>单核 KDMIPS 系数（可选）<input inputMode="decimal" value={factor} onChange={(event) => { setFactor(event.target.value); setDirty(true) }} placeholder="留空沿用离线报告默认 28.75" /><small>必须为正有限数。留空则与离线报告使用同一默认系数，K 列不会留空。</small></label>
             </div>
+            <ReportDates scope={{ ...reportDates, selected: selectedDates, canGenerate: dateReady, onChange: (next) => { setDates(next); setDirty(true) } }} />
+            <p className="muted">日期与场景配置仅用于新草稿，不会改变已建草稿的预览或发布内容。</p>
             <div className="admission-table-scroll" tabIndex={0} role="region" aria-label="时间段场景配置">
               <table><thead><tr><th>时间段</th><th>起止时间</th><th>记录数</th><th>场景（可选，默认按关注进程标注）</th></tr></thead><tbody>
-                {segments.map((item) => <tr key={item.segment}><td>{item.segment}</td><td>{formatTime(item.start)} → {formatTime(item.end)}</td><td>{item.records}</td><td>
+                {visibleSegments.map((item) => <tr key={item.segment}><td>{item.segment}</td><td>{formatTime(item.start)} → {formatTime(item.end)}</td><td>{item.records}</td><td>
                   <select aria-label={`时间段 ${item.segment} 的场景`} value={scenes[item.segment] || ''} onChange={(event) => { setScenes({ ...scenes, [item.segment]: event.target.value as Scene | '' }); setDirty(true) }}>
                     <option value="">自动：按关注进程标注</option><option value="background">后台稳态</option><option value="foreground">前台交互</option><option value="unknown">未知 / 未分类</option>
                   </select>
                 </td></tr>)}
               </tbody></table>
             </div>
-            <div className="actions config-actions"><button className="primary" type="submit" disabled={blocked || !listed || !segments.length}>仅生成本地草稿</button><span>{dirty ? '配置已修改，尚未用于新草稿（非错误提示）' : '未选择场景的时间段按关注进程的前台/后台标注统计'}</span></div>
+            <div className="actions config-actions"><button className="primary" type="submit" disabled={blocked || !listed || !dateReady || !visibleSegments.length}>仅生成本地草稿</button><span>{dirty ? '配置已修改，尚未用于新草稿（非错误提示）' : '未选择场景的时间段按关注进程的前台/后台标注统计'}</span></div>
           </fieldset>
         </form>
         <section className="admission-section" aria-label="已建草稿">
